@@ -70,6 +70,16 @@ func DojoDir() string {
 	return filepath.Join(home, ".dojo")
 }
 
+// MCPConfigPath returns ~/.dojo/mcp.json.
+func MCPConfigPath() string {
+	return filepath.Join(DojoDir(), "mcp.json")
+}
+
+// DispositionsDir returns ~/.dojo/dispositions/.
+func DispositionsDir() string {
+	return filepath.Join(DojoDir(), "dispositions")
+}
+
 func settingsPath() string {
 	return filepath.Join(DojoDir(), "settings.json")
 }

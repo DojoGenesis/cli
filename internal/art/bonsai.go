@@ -2,7 +2,6 @@
 package art
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -282,5 +281,3 @@ func LargeBonsaiString() string {
 	return Indent(LargeBonsai(), "  ")
 }
 
-// init is intentionally omitted — styles are package-level vars.
-var _ = fmt.Sprintf // ensure fmt is used

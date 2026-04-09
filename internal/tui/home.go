@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/DojoGenesis/dojo-cli/internal/art"
 	"github.com/DojoGenesis/dojo-cli/internal/client"
 	"github.com/DojoGenesis/dojo-cli/internal/config"
 )
@@ -166,6 +167,9 @@ func (m HomeModel) View() string {
 	}
 
 	var inner strings.Builder
+
+	// ── Bonsai ──
+	inner.WriteString(art.MediumBonsaiString())
 
 	// ── Title ──
 	inner.WriteString(styleHomeHeader.Render("  Dojo Workspace") + "\n")

@@ -393,6 +393,12 @@ func newReadline(turns int) (*readline.Instance, error) {
 			readline.PcItem("providers"),
 			readline.PcItem("set"),
 		),
+		readline.PcItem("/init",
+			readline.PcItem("--force"),
+			readline.PcItem("--gateway"),
+			readline.PcItem("--plugins-source"),
+			readline.PcItem("--skip-seeds"),
+		),
 		readline.PcItem("/practice"),
 		readline.PcItem("/projects",
 			readline.PcItem("ls"),
@@ -439,6 +445,16 @@ func printWelcome(cfg *config.Config, session string) {
 
 	// Hint line: cloud-gray
 	gcolor.HEX("#94a3b8").Println("  type /help for commands, /health to check the gateway")
+
+	// First-run: suggest /init if workspace is empty
+	if _, err := os.Stat(config.SettingsPath()); os.IsNotExist(err) {
+		st, _ := state.Load()
+		if !st.SetupComplete {
+			fmt.Println()
+			gcolor.HEX("#e8b04a").Println("  First run detected — workspace is empty.")
+			gcolor.HEX("#94a3b8").Println("  Run /init to set up plugins, dispositions, and starter seeds.")
+		}
+	}
 
 	// JetBrains Mono one-time tip
 	home, _ := os.UserHomeDir()

@@ -14,6 +14,7 @@ import (
 // State persists across REPL sessions at ~/.dojo/state.json.
 type State struct {
 	LastSessionID string           `json:"last_session_id,omitempty"`
+	SetupComplete bool             `json:"setup_complete,omitempty"`
 	Agents        map[string]Agent `json:"agents,omitempty"` // keyed by agent_id
 }
 

@@ -12,6 +12,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/DojoGenesis/dojo-cli/internal/art"
+	"github.com/DojoGenesis/dojo-cli/internal/bootstrap"
 	"github.com/DojoGenesis/dojo-cli/internal/client"
 	"github.com/DojoGenesis/dojo-cli/internal/config"
 	"github.com/DojoGenesis/dojo-cli/internal/hooks"
@@ -114,6 +116,7 @@ func (r *Registry) register() {
 	r.add(r.appsCmd())
 	r.add(r.workflowCmd())
 	r.add(r.docCmd())
+	r.add(r.initCmd())
 }
 
 // ─── /help ────────────────────────────────────────────────────────────────────
@@ -171,6 +174,7 @@ func (r *Registry) helpCmd() Command {
 				{"/pilot", "live SSE event stream (Ctrl+C to stop)"},
 				{"/hooks ls", "list loaded hook rules from plugins"},
 				{"/hooks fire <event>", "manually fire a hook event (for testing)"},
+				{"/init", "set up workspace with plugins, dispositions, seeds"},
 				{"/settings", "show config file path and active settings"},
 				{"/settings providers", "show provider configuration"},
 				{"/practice", "daily reflection prompts (rotates by day of week)"},
@@ -1497,7 +1501,9 @@ func (r *Registry) practiceCmd() Command {
 				}
 			}
 
-			fmt.Println()
+			// Bonsai sigil — contemplative anchor for practice
+			fmt.Print(art.LargeBonsaiString())
+
 			// Header: date in warm-amber, day in golden-orange
 			color.New(color.Bold).Print(gcolor.HEX("#e8b04a").Sprint("  Practice — " + now.Format("2006-01-02")))
 			fmt.Print("  ")
@@ -1821,6 +1827,43 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// ─── /init ────────────────────────────────────────────────────────────────────
+
+func (r *Registry) initCmd() Command {
+	return Command{
+		Name:    "init",
+		Aliases: []string{"setup", "bootstrap"},
+		Usage:   "/init [--force] [--gateway <url>] [--plugins-source <path>]",
+		Short:   "Initialize Dojo workspace with plugins, dispositions, and seeds",
+		Run: func(ctx context.Context, args []string) error {
+			opts := bootstrap.Options{
+				GatewayURL: r.cfg.Gateway.URL,
+			}
+			for i := 0; i < len(args); i++ {
+				switch args[i] {
+				case "--force":
+					opts.Force = true
+				case "--gateway":
+					if i+1 < len(args) {
+						i++
+						opts.GatewayURL = args[i]
+					}
+				case "--plugins-source":
+					if i+1 < len(args) {
+						i++
+						opts.PluginsSource = args[i]
+					}
+				case "--skip-seeds":
+					opts.SkipSeeds = true
+				}
+			}
+
+			_, err := bootstrap.Run(ctx, opts, r.gw, os.Stdout)
+			return err
+		},
+	}
 }
 
 // fmtAgo formats an RFC3339 timestamp as a human-readable "X ago" string.
