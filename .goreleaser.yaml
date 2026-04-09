@@ -1,0 +1,49 @@
+version: 2
+
+project_name: dojo
+
+builds:
+  - main: ./cmd/dojo
+    binary: dojo
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    flags:
+      - -trimpath
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+
+brews:
+  - repository:
+      owner: DojoGenesis
+      name: homebrew-tap
+    homepage: https://github.com/DojoGenesis/dojo-cli
+    description: "Self-hosted agentic AI CLI powered by the Dojo Genesis gateway"
+    license: MIT
+    install: |
+      bin.install "dojo"
+    test: |
+      system "#{bin}/dojo", "--version"

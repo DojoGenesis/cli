@@ -1,22 +1,37 @@
-BIN := dojo
-PKG := github.com/DojoGenesis/dojo-cli/cmd/dojo
+BINARY   := dojo
+MODULE   := github.com/DojoGenesis/dojo-cli
+VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+LDFLAGS  := -s -w -X main.version=$(VERSION)
+GOFLAGS  := -trimpath
 
-.PHONY: build run clean test tidy
+# NOTE: cmd/dojo/main.go declares `const version = "0.1.0"`.
+# Go's -X ldflags only patches `var` symbols, not `const`.
+# A separate agent is responsible for changing `const version` to `var version`.
+# Until that change lands, the VERSION override via -ldflags will have no effect
+# and the binary will always report "0.1.0".
+
+.PHONY: build install test vet clean fmt lint
 
 build:
-	go build -o $(BIN) $(PKG)
+	go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/dojo
 
-run: build
-	./$(BIN)
-
-clean:
-	rm -f $(BIN)
+install:
+	go install $(GOFLAGS) -ldflags '$(LDFLAGS)' ./cmd/dojo
 
 test:
-	go test ./...
+	go test ./... -count=1 -race
 
-tidy:
-	go mod tidy
+vet:
+	go vet ./...
 
-install: build
-	cp $(BIN) /usr/local/bin/$(BIN)
+clean:
+	rm -f $(BINARY)
+
+fmt:
+	gofmt -s -w .
+
+lint:
+	@which golangci-lint > /dev/null 2>&1 || echo "Install golangci-lint: https://golangci-lint.run/usage/install/"
+	golangci-lint run
+
+all: vet test build

@@ -16,6 +16,7 @@ import (
 	"github.com/DojoGenesis/dojo-cli/internal/config"
 	"github.com/DojoGenesis/dojo-cli/internal/hooks"
 	"github.com/DojoGenesis/dojo-cli/internal/plugins"
+	"github.com/DojoGenesis/dojo-cli/internal/state"
 	"github.com/DojoGenesis/dojo-cli/internal/tui"
 	"github.com/fatih/color"
 	gcolor "github.com/gookit/color"
@@ -199,31 +200,52 @@ func (r *Registry) homeCmd() Command {
 	return Command{
 		Name:    "home",
 		Aliases: []string{"ws", "workspace"},
-		Usage:   "/home",
+		Usage:   "/home [plain]",
 		Short:   "Workspace state overview",
 		Run: func(ctx context.Context, args []string) error {
-			h, err := r.gw.Health(ctx)
-			if err != nil {
-				return fmt.Errorf("gateway unreachable: %w", err)
+			// /home plain — text-only fallback
+			if len(args) > 0 && args[0] == "plain" {
+				return r.homePlain(ctx)
 			}
-			agents, _ := r.gw.Agents(ctx)
-			seeds, _ := r.gw.Seeds(ctx)
 
-			fmt.Println()
-			// Section header: warm-amber + bold
-			color.New(color.Bold).Print(gcolor.HEX("#e8b04a").Sprint("  Dojo Workspace"))
-			fmt.Println()
-			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  " + r.cfg.Gateway.URL))
-			fmt.Println()
-
-			fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("gateway"), colorStatus(h.Status))
-			fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("agents"), color.WhiteString("%d", len(agents)))
-			fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("seeds"), color.WhiteString("%d", len(seeds)))
-			fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("plugins"), color.WhiteString("%d", len(r.plgs)))
-			fmt.Println()
-			return nil
+			// Default: Bubbletea TUI panel
+			model := tui.NewHomeModel(r.cfg, r.gw, *r.session, len(r.plgs))
+			p := tea.NewProgram(model, tea.WithAltScreen())
+			_, err := p.Run()
+			return err
 		},
 	}
+}
+
+func (r *Registry) homePlain(ctx context.Context) error {
+	h, err := r.gw.Health(ctx)
+	if err != nil {
+		return fmt.Errorf("gateway unreachable: %w", err)
+	}
+	agents, agentErr := r.gw.Agents(ctx)
+	seeds, seedErr := r.gw.Seeds(ctx)
+
+	fmt.Println()
+	color.New(color.Bold).Print(gcolor.HEX("#e8b04a").Sprint("  Dojo Workspace"))
+	fmt.Println()
+	fmt.Println(gcolor.HEX("#94a3b8").Sprint("  " + r.cfg.Gateway.URL))
+	fmt.Println()
+
+	fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("gateway"), colorStatus(h.Status))
+	if agentErr != nil {
+		fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("agents"), gcolor.HEX("#e63946").Sprint("unavailable"))
+	} else {
+		fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("agents"), color.WhiteString("%d", len(agents)))
+	}
+	if seedErr != nil {
+		fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("seeds"), gcolor.HEX("#e63946").Sprint("unavailable"))
+	} else {
+		fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("seeds"), color.WhiteString("%d", len(seeds)))
+	}
+	fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("plugins"), color.WhiteString("%d", len(r.plgs)))
+	fmt.Printf("  %-18s %s\n", gcolor.HEX("#f4a261").Sprint("session"), gcolor.HEX("#e8b04a").Sprint(*r.session))
+	fmt.Println()
+	return nil
 }
 
 // ─── /model ──────────────────────────────────────────────────────────────────
@@ -402,6 +424,15 @@ func (r *Registry) agentCmd() Command {
 				fmt.Println()
 
 				color.New(color.Bold).Print(gcolor.HEX("#e8b04a").Sprint("  dojo  "))
+
+				// Persist agent to local state.
+				if st, loadErr := state.Load(); loadErr == nil {
+					st.AddAgent(agentResp.AgentID, mode)
+					if saveErr := st.Save(); saveErr != nil {
+						fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  [warn] could not save state: %v", saveErr))
+					}
+				}
+
 				return r.streamAgentChat(ctx, agentResp.AgentID, message)
 
 			case "chat":
@@ -413,7 +444,17 @@ func (r *Registry) agentCmd() Command {
 				message := strings.Join(args[2:], " ")
 				fmt.Println()
 				color.New(color.Bold).Print(gcolor.HEX("#e8b04a").Sprint("  dojo  "))
-				return r.streamAgentChat(ctx, agentID, message)
+				chatErr := r.streamAgentChat(ctx, agentID, message)
+
+				// Update last_used for this agent.
+				if st, loadErr := state.Load(); loadErr == nil {
+					st.TouchAgent(agentID)
+					if saveErr := st.Save(); saveErr != nil {
+						fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  [warn] could not save state: %v", saveErr))
+					}
+				}
+
+				return chatErr
 
 			default: // ls
 				agents, err := r.gw.Agents(ctx)
@@ -424,8 +465,6 @@ func (r *Registry) agentCmd() Command {
 				color.New(color.Bold).Print(gcolor.HEX("#e8b04a").Sprintf("  Agents (%d)\n\n", len(agents)))
 				if len(agents) == 0 {
 					fmt.Println(gcolor.HEX("#94a3b8").Sprint("  No agents registered. Start the gateway with agent configs."))
-					fmt.Println()
-					return nil
 				}
 				for _, a := range agents {
 					status := colorStatus(a.Status)
@@ -435,6 +474,27 @@ func (r *Registry) agentCmd() Command {
 					)
 					if a.Disposition != nil {
 						fmt.Println(gcolor.HEX("#94a3b8").Sprintf("    tone=%s pacing=%s", a.Disposition.Tone, a.Disposition.Pacing))
+					}
+				}
+
+				// Show recently used local agents from state.
+				if st, loadErr := state.Load(); loadErr == nil {
+					recent := st.RecentAgents(5)
+					if len(recent) > 0 {
+						fmt.Println()
+						fmt.Println(gcolor.HEX("#94a3b8").Sprint("  ──── [recent] ────"))
+						for _, a := range recent {
+							shortID := a.AgentID
+							if len(shortID) > 8 {
+								shortID = shortID[:8]
+							}
+							lastUsedAgo := fmtAgo(a.LastUsed)
+							fmt.Printf("  %s  %-12s  %s\n",
+								gcolor.HEX("#f4a261").Sprint(shortID),
+								gcolor.HEX("#e8b04a").Sprint(a.Mode),
+								gcolor.HEX("#94a3b8").Sprintf("last used: %s", lastUsedAgo),
+							)
+						}
 					}
 				}
 				fmt.Println()
@@ -891,111 +951,45 @@ func (r *Registry) sessionCmd() Command {
 
 // ─── /run ─────────────────────────────────────────────────────────────────────
 
-const (
-	runMaxPollDuration  = 5 * time.Minute
-	runMaxConsecErrors  = 10
-)
-
 func (r *Registry) runCmd() Command {
 	return Command{
 		Name:  "run",
 		Usage: "/run <task description>",
-		Short: "Submit a multi-step orchestration plan and watch it execute",
+		Short: "Send a multi-step task to the gateway and stream the response",
 		Run: func(ctx context.Context, args []string) error {
 			if len(args) == 0 {
 				return fmt.Errorf("usage: /run <task description>")
 			}
 			task := strings.Join(args, " ")
-			planID := fmt.Sprintf("plan-%d", time.Now().UnixMilli())
 
-			req := client.OrchestrateRequest{
-				Plan: client.ExecutionPlan{
-					ID:   planID,
-					Name: task,
-					DAG: []client.ToolInvocation{
-						{
-							ID:        "step1",
-							ToolName:  "orchestrate",
-							Input:     map[string]any{"message": task},
-							DependsOn: []string{},
-						},
-					},
-				},
-				UserID: "", // guest
+			// MVP approach: send the task through ChatStream and let the
+			// gateway's intent classifier route complex multi-step tasks to
+			// its orchestration path internally. This is simpler and more
+			// reliable than constructing a DAG client-side.
+			req := client.ChatRequest{
+				Message:   task,
+				Model:     r.cfg.Defaults.Model,
+				SessionID: *r.session,
+				Stream:    true,
 			}
 
 			fmt.Println()
-			fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  Submitting plan: %s", truncate(task, 60)))
-
-			status, err := r.gw.Orchestrate(ctx, req)
-			if err != nil {
-				return fmt.Errorf("orchestration failed: %w", err)
-			}
-
-			if status.ExecutionID == "" {
-				return fmt.Errorf("gateway returned empty execution ID")
-			}
-
-			printKV("execution_id", status.ExecutionID)
-			printKV("status", colorStatus(status.Status))
+			fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  Running: %s", truncate(task, 60)))
 			fmt.Println()
 
-			// Poll every second until completed/failed, with timeout and error limit.
-			seen := map[string]string{} // node id → last printed status
-			ticker := time.NewTicker(time.Second)
-			defer ticker.Stop()
-			deadline := time.After(runMaxPollDuration)
-			consecErrors := 0
+			color.New(color.Bold).Print(gcolor.HEX("#e8b04a").Sprint("  dojo  "))
 
-			for {
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-deadline:
-					return fmt.Errorf("orchestration timed out after %s", runMaxPollDuration)
-				case <-ticker.C:
-					dag, err := r.gw.OrchestrationDAG(ctx, status.ExecutionID)
-					if err != nil {
-						consecErrors++
-						fmt.Println(gcolor.HEX("#e63946").Sprint("  poll error: " + err.Error()))
-						if consecErrors >= runMaxConsecErrors {
-							return fmt.Errorf("too many consecutive poll errors (%d)", consecErrors)
-						}
-						continue
-					}
-					consecErrors = 0
-
-					for _, node := range dag.Nodes {
-						id, _ := node["id"].(string)
-						st, _ := node["status"].(string)
-						if id == "" || seen[id] == st {
-							continue
-						}
-						seen[id] = st
-
-						icon := "○"
-						switch st {
-						case "completed":
-							icon = gcolor.HEX("#7fb88c").Sprint("✓")
-						case "running":
-							icon = gcolor.HEX("#e8b04a").Sprint("⟳")
-						case "failed":
-							icon = gcolor.HEX("#e63946").Sprint("✗")
-						}
-
-						line := fmt.Sprintf("  [%s %s] %s", icon, gcolor.HEX("#f4a261").Sprint(id), colorStatus(st))
-						if out, _ := node["output"].(string); out != "" {
-							line += "  " + gcolor.HEX("#94a3b8").Sprint(truncate(out, 60))
-						}
-						fmt.Println(line)
-					}
-
-					if dag.Status == "completed" || dag.Status == "failed" {
-						fmt.Printf("\n  %s\n\n", colorStatus(dag.Status))
-						return nil
-					}
+			var fullText strings.Builder
+			err := r.gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
+				if text := agentExtractText(chunk.Data); text != "" {
+					fmt.Print(text)
+					fullText.WriteString(text)
 				}
-			}
+			})
+
+			fmt.Println()
+			fmt.Println()
+			return err
 		},
 	}
 }
@@ -1153,4 +1147,23 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// fmtAgo formats an RFC3339 timestamp as a human-readable "X ago" string.
+func fmtAgo(ts string) string {
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil || ts == "" {
+		return "unknown"
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
 }
