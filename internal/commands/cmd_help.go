@@ -72,6 +72,7 @@ func (r *Registry) helpCmd() Command {
 				{"Orchestration", []struct{ cmd, desc string }{
 					{"/run <task>", "submit multi-step orchestration plan"},
 					{"/workflow <name> [json]", "execute a workflow"},
+					{"/warroom [topic]", "split-panel debate: Scout vs Challenger"},
 					{"/pilot", "live SSE event stream (Ctrl+C to stop)"},
 					{"/apps", "list running MCP apps"},
 					{"/apps launch <name>", "launch an MCP app"},

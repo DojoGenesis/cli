@@ -122,6 +122,7 @@ func (r *Registry) register() {
 	r.add(r.telemetryCmd())
 	r.add(r.senseiCmd())
 	r.add(r.cardCmd())
+	r.add(r.warroomCmd())
 }
 
 // fmtAgo formats an RFC3339 timestamp as a human-readable "X ago" string.
