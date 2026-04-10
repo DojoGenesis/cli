@@ -148,7 +148,9 @@ func RenderEventPanel(events []ParsedEvent, scroll, width, height int, focused b
 
 // RenderContextPanel renders the context panel (top-right of the layout).
 // Shows: active specialist, disposition, provider/model, project, session ID.
-func RenderContextPanel(ctx PilotContext, width, height int, focused bool) string {
+// When a DAG orchestration is active, the DAG node status is rendered below
+// the session metadata.
+func RenderContextPanel(ctx PilotContext, dag *DAGState, width, height int, focused bool) string {
 	innerW := width - 2
 	if innerW < 10 {
 		innerW = 10
@@ -188,6 +190,22 @@ func RenderContextPanel(ctx PilotContext, width, height int, focused bool) strin
 		sb.WriteString(" " + label + stylePanelValue.Render(skillStr) + "\n")
 	}
 
+	// DAG orchestration panel — rendered when an orchestration plan is active.
+	if dag != nil && dag.Active {
+		sb.WriteString("\n")
+		// Budget remaining height for the DAG sub-panel.
+		usedLines := 1 + len(lines) // title + metadata lines
+		if len(ctx.Skills) > 0 {
+			usedLines++
+		}
+		usedLines++ // blank separator line
+		dagHeight := innerH - usedLines
+		if dagHeight < 3 {
+			dagHeight = 3
+		}
+		sb.WriteString(dag.Render(innerW, dagHeight))
+	}
+
 	// Pad remaining.
 	content := strings.TrimRight(sb.String(), "\n")
 
@@ -203,8 +221,9 @@ func RenderContextPanel(ctx PilotContext, width, height int, focused bool) strin
 }
 
 // RenderStatsPanel renders the stats panel (bottom-right of the layout).
-// Shows: event counts by category, error count, cost, tokens, elapsed.
-func RenderStatsPanel(stats PilotStats, width, height int, focused bool) string {
+// Shows: event counts by category, error count, cost, tokens, elapsed,
+// and garden/memory context when loaded.
+func RenderStatsPanel(stats PilotStats, garden GardenContext, width, height int, focused bool) string {
 	innerW := width - 2
 	if innerW < 10 {
 		innerW = 10
@@ -257,7 +276,36 @@ func RenderStatsPanel(stats PilotStats, width, height int, focused bool) string 
 	elapsed := stats.Elapsed.Truncate(time.Second)
 	sb.WriteString(" " + stylePanelLabel.Render(padRight("Elapsed:", 14)) + stylePanelValue.Render(elapsed.String()) + "\n")
 
+	// ── Garden section (compact, 5-6 lines) ──
+	if garden.Loaded {
+		sb.WriteString("\n")
+		sb.WriteString(" " + stylePanelTitle.Render("Garden") + "\n")
+		sb.WriteString(" " + stylePanelLabel.Render(padRight("Seeds:", 14)) + stylePanelValue.Render(fmt.Sprintf("%d", garden.TotalSeeds)) + "\n")
+
+		// Top 3 seeds by usage.
+		top := 3
+		if len(garden.TopSeeds) < top {
+			top = len(garden.TopSeeds)
+		}
+		for i := 0; i < top; i++ {
+			s := garden.TopSeeds[i]
+			name := s.Name
+			if len(name) > innerW-20 {
+				name = name[:innerW-21] + "…"
+			}
+			sb.WriteString(" " + stylePanelLabel.Render(padRight(fmt.Sprintf("  #%d:", i+1), 14)) +
+				styleDim.Render(fmt.Sprintf("%s (%d)", name, s.UsageCount)) + "\n")
+		}
+
+		// Last memory retrieval.
+		if garden.LastRetrieval > 0 {
+			sb.WriteString(" " + stylePanelLabel.Render(padRight("Retrieved:", 14)) +
+				styleAccent.Render(fmt.Sprintf("%d memories", garden.LastRetrieval)) + "\n")
+		}
+	}
+
 	_ = innerW // used implicitly via padRight widths
+	_ = tokenLine
 
 	content := strings.TrimRight(sb.String(), "\n")
 

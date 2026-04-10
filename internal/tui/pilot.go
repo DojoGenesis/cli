@@ -91,6 +91,9 @@ type sseErrorMsg struct{ err error }
 // sseDoneMsg signals that the SSE stream has closed cleanly.
 type sseDoneMsg struct{}
 
+// gardenLoadedMsg delivers the garden context fetched at startup.
+type gardenLoadedMsg GardenContext
+
 // ─── Model ───────────────────────────────────────────────────────────────────
 
 // PilotModel is the Bubbletea model for the live Pilot event-stream dashboard.
@@ -127,6 +130,12 @@ type PilotModel struct {
 	focusPanel PanelFocus
 	pilotCtx   PilotContext
 	stats      PilotStats
+
+	// DAG orchestration state — rendered in the context panel when active.
+	dagState *DAGState
+
+	// Garden/memory context — fetched at startup, updated by memory_retrieved events.
+	garden GardenContext
 }
 
 // NewPilotModel constructs a PilotModel ready to be passed to tea.NewProgram.
@@ -147,16 +156,20 @@ func NewPilotModel(gw *client.Client, clientID string) PilotModel {
 	// Initialise the telemetry sink. It is always created so that events are
 	// buffered; Start() launches the background flush goroutine.
 	m.sink = telemetry.New(clientID)
+	m.dagState = NewDAGState()
 	return m
 }
 
-// Init starts the SSE listener goroutine and the telemetry sink, then
-// returns the driving Cmd.
+// Init starts the SSE listener goroutine, fetches garden context, and starts
+// the telemetry sink, then returns the driving Cmds.
 func (m PilotModel) Init() tea.Cmd {
 	if m.sink != nil {
 		m.sink.Start(m.ctx)
 	}
-	return m.listenSSE()
+	fetchGarden := func() tea.Msg {
+		return gardenLoadedMsg(FetchGardenContext(m.gw))
+	}
+	return tea.Batch(m.listenSSE(), fetchGarden)
 }
 
 // listenSSE returns a Cmd that launches a goroutine to read the SSE stream.
@@ -293,17 +306,15 @@ func (m PilotModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// --- Context: extract from intent_classified events ---
+		// --- Context: map intent to specialist via client-side registry ---
 		if entry.EventType == "intent_classified" {
-			if intent, ok := entry.Parsed["intent"].(string); ok {
-				m.pilotCtx.Specialist = intent
-			}
-			if disp, ok := entry.Parsed["disposition"].(string); ok {
-				m.pilotCtx.Disposition = disp
-			}
-			if plugin, ok := entry.Parsed["plugin"].(string); ok {
-				m.pilotCtx.Plugin = plugin
-			}
+			intent := getStr(entry.Parsed, "intent")
+			confidence := getFloat(entry.Parsed, "confidence")
+			spec := LookupSpecialist(intent, confidence)
+			m.pilotCtx.Specialist = spec.Name
+			m.pilotCtx.Disposition = spec.Disposition
+			m.pilotCtx.Plugin = spec.Plugin
+			m.pilotCtx.Skills = spec.Skills
 			if sessionID, ok := entry.Parsed["session_id"].(string); ok {
 				m.pilotCtx.SessionID = sessionID
 			}
@@ -333,6 +344,16 @@ func (m PilotModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// --- DAG: route orchestration events to the DAG state machine ---
+		if strings.HasPrefix(entry.EventType, "orchestration_") && m.dagState != nil {
+			m.dagState.HandleEvent(entry.EventType, entry.Parsed)
+		}
+
+		// --- Garden: update memory retrieval stats ---
+		if entry.EventType == "memory_retrieved" {
+			m.garden.HandleMemoryRetrieved(entry.Parsed)
+		}
+
 		// Sync cost/token stats.
 		m.stats.TotalCostUSD = m.totalCostUSD
 		m.stats.TotalTokensIn = m.totalTokensIn
@@ -354,6 +375,10 @@ func (m PilotModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Schedule the next read.
 		return m, m.listenSSE()
+
+	case gardenLoadedMsg:
+		m.garden = GardenContext(msg)
+		return m, nil
 
 	case sseErrorMsg:
 		m.connected = false
@@ -414,8 +439,8 @@ func (m PilotModel) View() string {
 
 	// Render each panel.
 	eventPanel := RenderEventPanel(m.events, m.scroll, leftW, panelHeight, m.focusPanel == FocusEventLog)
-	contextPanel := RenderContextPanel(m.pilotCtx, rightW, ctxH, m.focusPanel == FocusContext)
-	statsPanel := RenderStatsPanel(statsSnap, rightW, statsH, m.focusPanel == FocusStats)
+	contextPanel := RenderContextPanel(m.pilotCtx, m.dagState, rightW, ctxH, m.focusPanel == FocusContext)
+	statsPanel := RenderStatsPanel(statsSnap, m.garden, rightW, statsH, m.focusPanel == FocusStats)
 
 	// Stack context + stats vertically on the right.
 	rightSide := lipgloss.JoinVertical(lipgloss.Left, contextPanel, statsPanel)

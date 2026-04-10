@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -85,21 +84,10 @@ func main() {
 			Stream:    true,
 		}
 		err = gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
-			data := strings.TrimSpace(chunk.Data)
-			if data == "" || data == "[DONE]" {
-				return
+			ev := repl.ClassifyChunk(chunk)
+			if out := ev.Render(*flagNoColor); out != "" {
+				fmt.Print(out)
 			}
-			var m map[string]any
-			if json.Unmarshal([]byte(data), &m) == nil {
-				for _, key := range []string{"text", "content"} {
-					if v, ok := m[key].(string); ok {
-						fmt.Print(v)
-						return
-					}
-				}
-				return
-			}
-			fmt.Print(data)
 		})
 		fmt.Println()
 		if err != nil {
