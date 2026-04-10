@@ -4,6 +4,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ const (
 	colorRed       = "#ef4444" // disconnected indicator
 	colorBorder    = "#334155" // panel borders
 	colorSubtle    = "#64748b" // secondary labels
+	colorYellow    = "#eab308" // cost warning
 )
 
 // ─── Styles ──────────────────────────────────────────────────────────────────
@@ -57,12 +59,30 @@ var (
 	styleBorder = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color(colorBorder))
+
+	styleCostGreen = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(colorGreen)).
+			Bold(true)
+
+	styleCostYellow = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(colorYellow)).
+			Bold(true)
+
+	styleCostRed = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(colorRed)).
+			Bold(true)
+
+	styleAccent = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(colorInfoSteel))
+
+	styleDim = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(colorCloudGray))
 )
 
 // ─── Messages ────────────────────────────────────────────────────────────────
 
 // sseEventMsg carries a single parsed SSE event to Bubbletea.
-type sseEventMsg eventEntry
+type sseEventMsg struct{ parsed ParsedEvent }
 
 // sseErrorMsg carries a connection error to Bubbletea.
 type sseErrorMsg struct{ err error }
@@ -72,20 +92,13 @@ type sseDoneMsg struct{}
 
 // ─── Model ───────────────────────────────────────────────────────────────────
 
-// eventEntry is a single recorded SSE event with its receive timestamp.
-type eventEntry struct {
-	time  time.Time
-	event string
-	data  string
-}
-
 // PilotModel is the Bubbletea model for the live Pilot event-stream dashboard.
 // It connects to the gateway's /events SSE endpoint and renders a scrollable
 // log of incoming events with connection status and elapsed-time tracking.
 type PilotModel struct {
 	gw        *client.Client
 	clientID  string
-	events    []eventEntry
+	events    []ParsedEvent
 	scroll    int
 	width     int
 	height    int
@@ -95,6 +108,15 @@ type PilotModel struct {
 	err       error
 	ctx       context.Context
 	cancel    context.CancelFunc
+
+	// Cost tracking (from "complete" events with usage data)
+	totalTokensIn  int64
+	totalTokensOut int64
+	totalCostUSD   float64
+	lastProvider   string
+	lastModel      string
+	costRateIn     float64 // per-token input rate (USD)
+	costRateOut    float64 // per-token output rate (USD)
 }
 
 // NewPilotModel constructs a PilotModel ready to be passed to tea.NewProgram.
@@ -103,12 +125,14 @@ type PilotModel struct {
 func NewPilotModel(gw *client.Client, clientID string) PilotModel {
 	ctx, cancel := context.WithCancel(context.Background())
 	return PilotModel{
-		gw:        gw,
-		clientID:  clientID,
-		events:    make([]eventEntry, 0, 50),
-		startTime: time.Now(),
-		ctx:       ctx,
-		cancel:    cancel,
+		gw:          gw,
+		clientID:    clientID,
+		events:      make([]ParsedEvent, 0, 50),
+		startTime:   time.Now(),
+		ctx:         ctx,
+		cancel:      cancel,
+		costRateIn:  0.000003,  // default: sonnet input rate
+		costRateOut: 0.000015,  // default: sonnet output rate
 	}
 }
 
@@ -125,11 +149,7 @@ func (m PilotModel) listenSSE() tea.Cmd {
 		ch := make(chan tea.Msg, 1)
 		go func() {
 			err := m.gw.PilotStream(m.ctx, m.clientID, func(chunk client.SSEChunk) {
-				ch <- sseEventMsg(eventEntry{
-					time:  time.Now(),
-					event: chunk.Event,
-					data:  chunk.Data,
-				})
+				ch <- sseEventMsg{parsed: ParseSSEEvent(chunk)}
 			})
 			if err != nil && m.ctx.Err() == nil {
 				ch <- sseErrorMsg{err: err}
@@ -179,7 +199,7 @@ func (m PilotModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case sseEventMsg:
-		entry := eventEntry(msg)
+		entry := msg.parsed
 		m.events = append(m.events, entry)
 		// Cap at last 50 events.
 		if len(m.events) > 50 {
@@ -187,6 +207,43 @@ func (m PilotModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.count++
 		m.connected = true
+
+		// --- Cost tracking: accumulate tokens from "complete" events ---
+		if entry.EventType == "complete" {
+			if usage, ok := entry.Parsed["usage"].(map[string]interface{}); ok {
+				if tin, ok := usage["tokens_in"].(float64); ok {
+					m.totalTokensIn += int64(tin)
+					m.totalCostUSD += tin * m.costRateIn
+				}
+				if tout, ok := usage["tokens_out"].(float64); ok {
+					m.totalTokensOut += int64(tout)
+					m.totalCostUSD += tout * m.costRateOut
+				}
+			}
+		}
+
+		// --- Cost tracking: adjust rates on provider/model selection ---
+		if entry.EventType == "provider_selected" {
+			if p, ok := entry.Parsed["provider"].(string); ok {
+				m.lastProvider = p
+			}
+			if model, ok := entry.Parsed["model"].(string); ok {
+				m.lastModel = model
+				lower := strings.ToLower(model)
+				switch {
+				case strings.Contains(lower, "haiku"):
+					m.costRateIn = 0.0000008
+					m.costRateOut = 0.000004
+				case strings.Contains(lower, "opus"):
+					m.costRateIn = 0.000015
+					m.costRateOut = 0.000075
+				default: // sonnet and anything else
+					m.costRateIn = 0.000003
+					m.costRateOut = 0.000015
+				}
+			}
+		}
+
 		// Auto-scroll to bottom when user is at (or near) bottom.
 		maxScroll := len(m.events) - m.visibleLines()
 		if maxScroll < 0 {
@@ -245,19 +302,30 @@ func (m PilotModel) View() string {
 	}
 
 	for _, e := range visible {
-		ts := styleTimestamp.Render(e.time.Format("15:04:05"))
-		evType := styleEventType.Render(padRight(e.event, 16))
-		// Truncate data preview to terminal width minus fixed prefix width (28 chars).
-		preview := e.data
+		ts := styleTimestamp.Render(e.Time)
+		evType := styleEventType.Render(padRight(e.EventType, 16))
+		// Truncate summary to terminal width minus fixed prefix width (28 chars).
+		summary := e.Summary
 		maxData := m.width - 28
 		if maxData < 10 {
 			maxData = 10
 		}
-		if len(preview) > maxData {
-			preview = preview[:maxData-1] + "…"
+		if len(summary) > maxData {
+			summary = summary[:maxData-1] + "…"
 		}
-		data := styleEventData.Render(preview)
-		sb.WriteString(fmt.Sprintf("  %s  %s  %s\n", ts, evType, data))
+		// Color-code by severity.
+		var styledSummary string
+		switch e.Severity {
+		case SeverityError:
+			styledSummary = styleStatusErr.Render(summary)
+		case SeverityWarning:
+			styledSummary = styleCostYellow.Render(summary)
+		case SeveritySuccess:
+			styledSummary = styleStatusOK.Render(summary)
+		default:
+			styledSummary = styleDim.Render(summary)
+		}
+		sb.WriteString(fmt.Sprintf("  %s  %s  %s\n", ts, evType, styledSummary))
 	}
 
 	// Pad remaining lines so the status bar stays at the bottom.
@@ -286,15 +354,62 @@ func (m PilotModel) View() string {
 	}
 
 	elapsed := time.Since(m.startTime).Truncate(time.Second)
-	statusRight := styleSubtle.Render(fmt.Sprintf("events: %d   elapsed: %s   q/esc quit", m.count, elapsed))
 	statusLeft := fmt.Sprintf("  %s  %s", statusDot, connLabel)
+	statusMid := styleSubtle.Render(fmt.Sprintf("%d events | %s", m.count, elapsed))
 
-	// Right-pad so the right portion aligns to the terminal edge.
-	gap := m.width - lipgloss.Width(statusLeft) - lipgloss.Width(statusRight)
-	if gap < 1 {
-		gap = 1
+	// Build cost segment for the right side.
+	var costSegment string
+	if m.totalTokensIn > 0 || m.totalTokensOut > 0 {
+		// Cost string with color based on spend.
+		costStr := fmt.Sprintf("$%.4f", m.totalCostUSD)
+		var styledCost string
+		switch {
+		case m.totalCostUSD >= 1.0:
+			styledCost = styleCostRed.Render(costStr)
+		case m.totalCostUSD >= 0.10:
+			styledCost = styleCostYellow.Render(costStr)
+		default:
+			styledCost = styleCostGreen.Render(costStr)
+		}
+
+		totalTokens := m.totalTokensIn + m.totalTokensOut
+		tokenStr := styleDim.Render(formatTokens(totalTokens) + " tokens")
+
+		// Provider/model label (truncated if too long).
+		var modelLabel string
+		if m.lastProvider != "" && m.lastModel != "" {
+			ml := m.lastProvider + "/" + m.lastModel
+			if len(ml) > 24 {
+				ml = ml[:23] + "…"
+			}
+			modelLabel = styleAccent.Render(ml)
+		}
+
+		if modelLabel != "" {
+			costSegment = styledCost + styleDim.Render(" | ") + tokenStr + styleDim.Render(" | ") + modelLabel
+		} else {
+			costSegment = styledCost + styleDim.Render(" | ") + tokenStr
+		}
 	}
-	sb.WriteString(statusLeft + strings.Repeat(" ", gap) + statusRight + "\n")
+
+	// Compose the full status line.
+	if costSegment != "" {
+		// Three-part layout: left | mid ... cost right
+		leftAndMid := statusLeft + styleDim.Render(" | ") + statusMid
+		gap := m.width - lipgloss.Width(leftAndMid) - lipgloss.Width(costSegment) - 1
+		if gap < 1 {
+			gap = 1
+		}
+		sb.WriteString(leftAndMid + strings.Repeat(" ", gap) + costSegment + "\n")
+	} else {
+		// No cost data yet — original layout.
+		statusRight := styleSubtle.Render(fmt.Sprintf("events: %d   elapsed: %s   q/esc quit", m.count, elapsed))
+		gap := m.width - lipgloss.Width(statusLeft) - lipgloss.Width(statusRight)
+		if gap < 1 {
+			gap = 1
+		}
+		sb.WriteString(statusLeft + strings.Repeat(" ", gap) + statusRight + "\n")
+	}
 
 	return sb.String()
 }
@@ -316,4 +431,22 @@ func padRight(s string, w int) string {
 		return s[:w]
 	}
 	return s + strings.Repeat(" ", w-len(s))
+}
+
+// formatTokens returns a human-readable token count with K/M suffix.
+func formatTokens(n int64) string {
+	if n >= 1_000_000 {
+		v := float64(n) / 1_000_000
+		// Use 1 decimal place, strip trailing zero.
+		s := fmt.Sprintf("%.1f", math.Round(v*10)/10)
+		s = strings.TrimSuffix(s, ".0")
+		return s + "M"
+	}
+	if n >= 1_000 {
+		v := float64(n) / 1_000
+		s := fmt.Sprintf("%.1f", math.Round(v*10)/10)
+		s = strings.TrimSuffix(s, ".0")
+		return s + "K"
+	}
+	return fmt.Sprintf("%d", n)
 }
