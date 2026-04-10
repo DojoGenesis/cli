@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -92,6 +94,27 @@ func (r *Registry) runCmd() Command {
 				return fmt.Errorf("usage: /run <task description>")
 			}
 			task := strings.Join(args, " ")
+
+			// Guard: reject bare command names that look like misrouted slash commands.
+			// If the task is a single token that matches a registered command (or
+			// alias), the user almost certainly meant "/run" + a command name by
+			// mistake (e.g. "/run pilot" instead of "/pilot"). Sending it to
+			// /v1/chat would produce confusing results and expose command names to
+			// the intent classifier.
+			taskLower := strings.ToLower(strings.TrimSpace(task))
+			if !strings.ContainsRune(taskLower, ' ') {
+				if _, isCmd := r.cmds[taskLower]; isCmd {
+					return fmt.Errorf("/%s is a dojo command, not a task — did you mean /%s?", taskLower, taskLower)
+				}
+				// Also check aliases.
+				for _, cmd := range r.cmds {
+					for _, alias := range cmd.Aliases {
+						if alias == taskLower {
+							return fmt.Errorf("/%s is a dojo command, not a task — did you mean /%s?", taskLower, cmd.Name)
+						}
+					}
+				}
+			}
 
 			// Try client-side DAG template matching first.
 			if tmpl := orchestration.MatchTemplate(task); tmpl != nil {
@@ -347,7 +370,7 @@ func (r *Registry) skillCmd() Command {
 	return Command{
 		Name:    "skill",
 		Aliases: []string{"skills"},
-		Usage:   "/skill [ls [filter]|get <name>|inspect <hash>|tags]",
+		Usage:   "/skill [ls [filter]|search <query>|get <name>|inspect <hash>|tags|package-all <dir>]",
 		Short:   "List, fetch, or inspect skills from CAS",
 		Run: func(ctx context.Context, args []string) error {
 			sub := "ls"
@@ -356,6 +379,48 @@ func (r *Registry) skillCmd() Command {
 			}
 
 			switch sub {
+			case "search":
+				// /skill search <query>
+				if len(args) < 2 {
+					return fmt.Errorf("usage: /skill search <query>")
+				}
+				query := strings.Join(args[1:], " ")
+				skills, err := r.gw.SearchSkills(ctx, query)
+				if err != nil {
+					return fmt.Errorf("search failed: %w", err)
+				}
+
+				fmt.Println()
+				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Skills matching %q (%d)\n\n", query, len(skills)))
+
+				if len(skills) == 0 {
+					fmt.Println(gcolor.HEX("#94a3b8").Sprint("  No matching skills found."))
+					fmt.Println()
+					return nil
+				}
+
+				for _, s := range skills {
+					name := gcolor.HEX("#f4a261").Sprintf("%-40s", s.Name)
+					cat := ""
+					if s.Category != "" {
+						cat = gcolor.HEX("#94a3b8").Sprintf("[%s]", s.Category)
+					}
+					plugin := ""
+					if s.Plugin != "" {
+						plugin = gcolor.HEX("#64748b").Sprintf(" (%s)", s.Plugin)
+					}
+					fmt.Printf("    %s %s%s\n", name, cat, plugin)
+					if s.Description != "" {
+						desc := s.Description
+						if len(desc) > 100 {
+							desc = desc[:97] + "..."
+						}
+						fmt.Printf("    %s\n", gcolor.HEX("#94a3b8").Sprint("  "+desc))
+					}
+				}
+				fmt.Println()
+				return nil
+
 			case "get":
 				// /skill get <name>
 				if len(args) < 2 {
@@ -420,6 +485,89 @@ func (r *Registry) skillCmd() Command {
 						gcolor.White.Sprintf("%-12s", truncate(t.Version, 12)),
 						gcolor.HEX("#94a3b8").Sprint(truncate(t.Ref, 20)),
 					)
+				}
+				fmt.Println()
+				return nil
+
+			case "package-all":
+				// /skill package-all [dir]
+				// Walk a directory for SKILL.md files, put each into CAS, and create tags.
+				// Default source: $DOJO_SKILLS_PATH or current directory.
+				dir := os.Getenv("DOJO_SKILLS_PATH")
+				if len(args) >= 2 {
+					dir = args[1]
+				}
+				if dir == "" {
+					return fmt.Errorf("usage: /skill package-all <dir>\n  or set DOJO_SKILLS_PATH")
+				}
+
+				// Walk for SKILL.md files.
+				var skills []string
+				err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						return nil // skip inaccessible
+					}
+					if !info.IsDir() && info.Name() == "SKILL.md" {
+						skills = append(skills, path)
+					}
+					return nil
+				})
+				if err != nil {
+					return fmt.Errorf("walking %s: %w", dir, err)
+				}
+
+				if len(skills) == 0 {
+					fmt.Println()
+					fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  No SKILL.md files found in %s", dir))
+					fmt.Println()
+					return nil
+				}
+
+				fmt.Println()
+				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Packaging %d skills from %s\n\n", len(skills), dir))
+
+				var succeeded, failed int
+				for _, path := range skills {
+					// Derive skill name from parent directory.
+					skillName := filepath.Base(filepath.Dir(path))
+
+					content, err := os.ReadFile(path)
+					if err != nil {
+						gcolor.HEX("#ef4444").Printf("  [FAIL] %s: %s\n", skillName, err)
+						failed++
+						continue
+					}
+
+					// Put content into CAS.
+					// Sleep before each API call: gateway allows 300 req/min (5/sec) sustained,
+					// burst 50. Each skill makes 2 calls, so 250ms per call = 4 req/sec total.
+					ref, err := r.gw.CASPutContent(ctx, content)
+					time.Sleep(250 * time.Millisecond)
+					if err != nil {
+						gcolor.HEX("#ef4444").Printf("  [FAIL] %s: CAS put: %s\n", skillName, err)
+						failed++
+						continue
+					}
+
+					// Create tag: name@latest -> ref.
+					if err := r.gw.CASCreateTag(ctx, skillName, "latest", ref); err != nil {
+						gcolor.HEX("#ef4444").Printf("  [FAIL] %s: tag create: %s\n", skillName, err)
+						failed++
+						time.Sleep(250 * time.Millisecond)
+						continue
+					}
+					time.Sleep(250 * time.Millisecond)
+
+					gcolor.HEX("#22c55e").Printf("  [OK]   %s → %s\n", skillName, ref[:12])
+					succeeded++
+				}
+
+				fmt.Println()
+				summary := fmt.Sprintf("  Done: %d succeeded, %d failed", succeeded, failed)
+				if failed > 0 {
+					gcolor.HEX("#eab308").Println(summary)
+				} else {
+					gcolor.HEX("#22c55e").Println(summary)
 				}
 				fmt.Println()
 				return nil

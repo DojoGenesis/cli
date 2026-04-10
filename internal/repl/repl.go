@@ -16,6 +16,7 @@ import (
 	"github.com/DojoGenesis/dojo-cli/internal/client"
 	"github.com/DojoGenesis/dojo-cli/internal/commands"
 	"github.com/DojoGenesis/dojo-cli/internal/config"
+	"github.com/DojoGenesis/dojo-cli/internal/guide"
 	"github.com/DojoGenesis/dojo-cli/internal/hooks"
 	"github.com/DojoGenesis/dojo-cli/internal/plugins"
 	"github.com/DojoGenesis/dojo-cli/internal/providers"
@@ -34,6 +35,7 @@ type REPL struct {
 	session  string // active session ID
 	turns    int    // number of successful chat turns
 	resumed  bool   // true when session was restored via --resume or /session resume
+	plain    bool   // true when --plain or --no-color is set; uses unstyled renderer output
 }
 
 // New creates a REPL bound to the given config and gateway client.
@@ -41,7 +43,9 @@ type REPL struct {
 // If scanning fails a warning is logged and the REPL continues with no hooks.
 // When resume is true, the most recent session ID is restored from state
 // instead of generating a fresh one.
-func New(cfg *config.Config, gw *client.Client, resume bool) *REPL {
+// When plain is true, chat output uses unstyled text (equivalent to --no-color
+// but also strips decorative label prefixes for piped/CI consumers).
+func New(cfg *config.Config, gw *client.Client, resume bool, plain bool) *REPL {
 	plgs, err := plugins.Scan(cfg.Plugins.Path)
 	if err != nil {
 		log.Printf("[repl] warning: plugin scan failed (%s): %v — continuing with no plugins", cfg.Plugins.Path, err)
@@ -56,6 +60,7 @@ func New(cfg *config.Config, gw *client.Client, resume bool) *REPL {
 		gw:       gw,
 		turns:    0,
 		resumed:  false,
+		plain:    plain,
 	}
 
 	if resume {
@@ -260,6 +265,24 @@ func (r *REPL) Run(ctx context.Context) error {
 	// Push local API keys to the gateway so cloud providers get registered.
 	r.syncProviderKeys(ctx)
 
+	// Start persistent background SSE connection for push event delivery.
+	// Reconnects on error and exits cleanly when the REPL context is cancelled.
+	go func() {
+		clientID := fmt.Sprintf("dojo-cli-%d", time.Now().UnixMilli())
+		for ctx.Err() == nil {
+			_ = r.gw.PilotStream(ctx, clientID, func(chunk client.SSEChunk) {
+				// Background events — log at debug level for now.
+				// Future: dispatch to event bus for agent completions, task updates, etc.
+				log.Printf("[repl:sse] event=%q data=%s", chunk.Event, truncateSSE(chunk.Data, 120))
+			})
+			if ctx.Err() != nil {
+				break
+			}
+			// Brief pause before reconnect to avoid tight loop on persistent errors.
+			time.Sleep(2 * time.Second)
+		}
+	}()
+
 	if st, err := state.Load(); err == nil {
 		st.LastSessionID = r.session
 		_ = st.Save()
@@ -313,6 +336,10 @@ func (r *REPL) Run(ctx context.Context) error {
 // handle routes a line to either a slash command or a chat message.
 // For slash commands it fires PreCommand before dispatch and PostCommand after
 // a successful dispatch. Hook errors are logged but not fatal.
+//
+// Safety invariant: only lines that do NOT start with "/" are sent to the
+// gateway as chat messages. Slash-prefixed input is always dispatched locally
+// and never forwarded to /v1/chat, even when the command is unknown.
 func (r *REPL) handle(ctx context.Context, line string) error {
 	if strings.HasPrefix(line, "/") {
 		payload := map[string]any{"command": line}
@@ -376,10 +403,48 @@ func (r *REPL) handle(ctx context.Context, line string) error {
 					}
 				}
 
+				// Guide progress check — advance step if active guide matches this command
+				if res, advanced := guide.AdvanceStep(spiritSt, line); advanced {
+					spirit.AwardXP(&spiritSt.Spirit, res.XP)
+					commands.PrintGuideStepComplete(res)
+
+					if res.GuideComplete {
+						spiritSt.Spirit.TotalGuides++
+						bonusXP := spirit.XPForAction("guide_completed")
+						spirit.AwardXP(&spiritSt.Spirit, bonusXP)
+						commands.PrintGuideCompleteBonus(bonusXP)
+
+						// Check achievements unlocked by guide completion
+						guideAchievements := spirit.CheckAchievements(&spiritSt.Spirit, time.Now())
+						for _, a := range guideAchievements {
+							bUp, nB := spirit.AwardXP(&spiritSt.Spirit, a.XPReward)
+							fmt.Printf("  %s %s %s (+%d XP)\n",
+								gcolor.HEX("#ffd166").Sprint("Achievement:"),
+								gcolor.HEX("#f4a261").Sprint(a.Icon),
+								gcolor.HEX("#e8b04a").Sprint(a.Name),
+								a.XPReward,
+							)
+							if bUp {
+								fmt.Println()
+								fmt.Printf("  %s\n", gcolor.HEX("#ffd166").Sprint("BELT PROMOTION"))
+								fmt.Printf("  You are now: %s\n", gcolor.HEX(nB.Color).Sprintf("%s %s", nB.Name, nB.Title))
+								fmt.Printf("  %s\n", gcolor.HEX("#94a3b8").Sprintf("\"%s\"", spirit.BeltQuote(nB.Rank)))
+								fmt.Println()
+							}
+						}
+					}
+				}
+
 				_ = spiritSt.Save()
 			}
 		}
 		return cmdErr
+	}
+	// Safety guard: never forward slash-prefixed input to /v1/chat.
+	// This should never be reached because HasPrefix("/") is checked above,
+	// but acts as a defence-in-depth barrier against future refactoring.
+	if strings.HasPrefix(line, "/") {
+		return fmt.Errorf("unknown command %s — type /help for a list", strings.Fields(line)[0])
 	}
 	return r.chat(ctx, line)
 }
@@ -401,7 +466,7 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 	var fullText strings.Builder
 	err := r.gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
 		ev := ClassifyChunk(chunk)
-		rendered := ev.Render(false)
+		rendered := ev.Render(r.plain)
 		if rendered != "" {
 			fmt.Print(rendered)
 			fullText.WriteString(ev.Content)
@@ -435,6 +500,14 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 
 	r.turns++
 	return nil
+}
+
+// truncateSSE truncates a string to max characters for log output.
+func truncateSSE(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 // extractText pulls the readable text from an SSE chunk.
@@ -596,6 +669,17 @@ func newReadline(turns int) (*readline.Instance, error) {
 		),
 		readline.PcItem("/sensei"),
 		readline.PcItem("/card"),
+		readline.PcItem("/guide",
+			readline.PcItem("ls"),
+			readline.PcItem("start",
+				readline.PcItem("welcome"),
+				readline.PcItem("spirit"),
+				readline.PcItem("agents"),
+				readline.PcItem("memory"),
+			),
+			readline.PcItem("status"),
+			readline.PcItem("stop"),
+		),
 		readline.PcItem("exit"),
 	)
 

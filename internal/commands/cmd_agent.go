@@ -48,6 +48,9 @@ func (r *Registry) agentCmd() Command {
 				}
 				message := strings.Join(msgArgs, " ")
 
+				// Append explicit completion criteria so agents don't self-terminate prematurely.
+				message = message + "\n\nCompletion requirements: (1) Do not stop after reading files — you must create or modify files to complete the task. (2) After making changes, run `make test` or the relevant test command. (3) Your final response must include the list of files you created or modified. If you cannot complete the task, say why explicitly."
+
 				fmt.Println()
 				fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  Creating agent (mode: %s)...", mode))
 
@@ -263,11 +266,25 @@ func (r *Registry) streamAgentChat(ctx context.Context, agentID, message string)
 	err := r.gw.AgentChatStream(ctx, agentID, req, func(chunk client.SSEChunk) {
 		switch chunk.Event {
 		case "thinking":
-			fmt.Print(gcolor.HEX("#94a3b8").Sprint("\n  [Thinking] " + truncate(chunk.Data, 80)))
-		case "tool_call":
-			fmt.Print(gcolor.HEX("#457b9d").Sprintf("\n  [Tool: %s]", truncate(chunk.Data, 60)))
-		case "tool_result":
+			// Gateway sends: event: thinking / data: {"type":"thinking","data":{"message":"..."},...}
+			msg := agentNestedField(chunk.Data, "message")
+			if msg == "" {
+				msg = truncate(chunk.Data, 80)
+			}
+			fmt.Print(gcolor.HEX("#94a3b8").Sprint("\n  [Thinking] " + msg))
+		case "tool_call", "tool_invoked":
+			name := agentNestedField(chunk.Data, "tool")
+			if name == "" {
+				name = truncate(chunk.Data, 60)
+			}
+			fmt.Print(gcolor.HEX("#457b9d").Sprintf("\n  [Tool: %s]", name))
+		case "tool_result", "tool_completed":
 			// absorbed into the response
+		case "response_chunk":
+			// Gateway sends: event: response_chunk / data: {"type":"response_chunk","data":{"content":"..."},...}
+			if text := agentNestedField(chunk.Data, "content"); text != "" {
+				fmt.Print(text)
+			}
 		default:
 			if text := agentExtractText(chunk.Data); text != "" {
 				fmt.Print(text)
@@ -296,4 +313,17 @@ func agentExtractText(data string) string {
 		return ""
 	}
 	return data
+}
+
+// agentNestedField extracts a string value from the "data" sub-object of a
+// gateway StreamEvent envelope: {"type":"...","data":{"field":"..."},...}.
+func agentNestedField(raw, field string) string {
+	var env struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(raw), &env); err != nil || env.Data == nil {
+		return ""
+	}
+	v, _ := env.Data[field].(string)
+	return v
 }
