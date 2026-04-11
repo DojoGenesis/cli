@@ -1,0 +1,64 @@
+# Dojo CLI
+
+> Self-hosted agentic AI in your terminal — interactive REPL, slash commands, plugin system, hook runner, and SSE streaming against the DojoGenesis Gateway.
+
+## What this is
+
+Dojo CLI is the terminal surface of the Dojo Genesis platform. It connects to a running Gateway instance (default: `http://localhost:7340`) and exposes all eight Gateway surfaces — Garden, Practice, Trail, Partnership, Projects, Pipelines, Piloting, and Home — as keyboard-driven commands. Type messages without `/` to chat; use slash commands for structured operations. Streams responses via SSE. Supports plugins, hooks, ADA dispositions, and session management.
+
+## Key capabilities
+
+- Interactive REPL with SSE streaming chat against any Gateway-registered provider
+- Multi-provider model switching mid-session (`/model set <name>`)
+- Agent dispatch and session management (`/agent dispatch`, `/agent chat`, `/session`)
+- MCP tool listing (`/tools ls`) and hook management (`/hooks ls`, `/hooks fire`)
+- Memory garden access (`/garden ls`, `/garden plant`, `/trail`)
+- Live SSE event dashboard (`/pilot`) for real-time agent observability
+- Plugin system with hook runner — load behavior from `~/.dojo/plugins`
+- Workspace-aware: `/projects ls` shows cwd, plugins, session state
+- ADA disposition presets configurable in `~/.dojo/settings.json`
+- `/run <task>` for multi-step orchestrated pipelines
+- `/practice` for daily structured reflection prompts
+
+## Slash commands
+
+```
+/help         Show available commands
+/health       Gateway health and uptime
+/home         Workspace state overview (TUI)
+/model ls     List providers and models
+/model set    Switch active model
+/tools ls     List MCP tools by namespace
+/agent ls     List registered agents
+/agent dispatch <mode> <msg>   Create agent, stream response
+/agent chat <id> <msg>         Chat with existing agent
+/skill ls     List skills with optional filter
+/session      Show or switch sessions
+/run <task>   Submit task to orchestrator
+/garden ls    List memory seeds
+/garden plant Plant a new seed
+/trail        Memory timeline
+/pilot        Live SSE event dashboard
+/hooks ls     List hook rules
+/practice     Daily reflection prompts
+/settings     Show config and active settings
+```
+
+## Configuration
+
+Settings file: `~/.dojo/settings.json`
+
+```json
+{
+  "gateway": { "url": "http://localhost:7340" },
+  "defaults": { "disposition": "balanced" }
+}
+```
+
+Environment: `DOJO_GATEWAY_URL`, `DOJO_GATEWAY_TOKEN`, `DOJO_PROVIDER`
+
+## Links
+
+- GitHub: https://github.com/DojoGenesis/dojo-cli
+- Gateway: https://github.com/DojoGenesis/gateway
+- Install: `go install github.com/DojoGenesis/dojo-cli/cmd/dojo@latest`
