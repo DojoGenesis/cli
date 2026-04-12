@@ -186,6 +186,11 @@ func (r *REPL) syncProviderKeys(ctx context.Context) {
 			log.Printf("[repl] syncProviderKeys: kimi: %v", err)
 		}
 	}
+	if keys.GeminiKey != "" {
+		if err := r.gw.SetProviderKey(ctx, "google", keys.GeminiKey); err != nil {
+			log.Printf("[repl] syncProviderKeys: google: %v", err)
+		}
+	}
 }
 
 // Run starts the interactive loop. Returns when the user exits.

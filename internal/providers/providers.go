@@ -58,10 +58,22 @@ func init() {
 			EnvKey:      "KIMI_API_KEY",
 			Models: []KnownModel{
 				{ID: "kimi-k2.5", DisplayName: "Kimi K2.5", Notes: "most capable"},
-				{ID: "kimi-k2", DisplayName: "Kimi K2", Notes: "balanced"},
+				{ID: "kimi-k2-turbo-preview", DisplayName: "Kimi K2 Turbo", Notes: "fast"},
+				{ID: "kimi-k2-thinking", DisplayName: "Kimi K2 Thinking", Notes: "reasoning"},
 				{ID: "moonshot-v1-128k", DisplayName: "Moonshot v1 128K", Notes: "long context"},
 				{ID: "moonshot-v1-32k", DisplayName: "Moonshot v1 32K", Notes: "balanced"},
 				{ID: "moonshot-v1-8k", DisplayName: "Moonshot v1 8K", Notes: "fast"},
+			},
+		},
+		{
+			ID:          "google",
+			DisplayName: "Google",
+			EnvKey:      "GOOGLE_API_KEY",
+			Models: []KnownModel{
+				{ID: "gemini-2.0-flash-lite", DisplayName: "Gemini 2.0 Flash Lite", Notes: "free, fast"},
+				{ID: "gemini-2.0-flash", DisplayName: "Gemini 2.0 Flash", Notes: "free, capable"},
+				{ID: "gemini-1.5-flash", DisplayName: "Gemini 1.5 Flash", Notes: "free, 1M context"},
+				{ID: "gemini-1.5-flash-8b", DisplayName: "Gemini 1.5 Flash 8B", Notes: "free, smallest"},
 			},
 		},
 		{
@@ -119,6 +131,7 @@ type APIKeys struct {
 	AnthropicKey string // ANTHROPIC_API_KEY
 	OpenAIKey    string // OPENAI_API_KEY
 	KimiKey      string // KIMI_API_KEY
+	GeminiKey    string // GOOGLE_API_KEY
 }
 
 // LoadAPIKeys reads API key environment variables.
@@ -127,12 +140,13 @@ func LoadAPIKeys() APIKeys {
 		AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
 		OpenAIKey:    os.Getenv("OPENAI_API_KEY"),
 		KimiKey:      os.Getenv("KIMI_API_KEY"),
+		GeminiKey:    os.Getenv("GOOGLE_API_KEY"),
 	}
 }
 
 // HasDirectAccess returns true if at least one direct API key is configured.
 func (k APIKeys) HasDirectAccess() bool {
-	return k.AnthropicKey != "" || k.OpenAIKey != "" || k.KimiKey != ""
+	return k.AnthropicKey != "" || k.OpenAIKey != "" || k.KimiKey != "" || k.GeminiKey != ""
 }
 
 // KeyForProvider returns the API key for the given provider ID, or empty string.
@@ -144,6 +158,8 @@ func (k APIKeys) KeyForProvider(provider string) string {
 		return k.OpenAIKey
 	case "kimi":
 		return k.KimiKey
+	case "google":
+		return k.GeminiKey
 	default:
 		return ""
 	}
@@ -177,7 +193,7 @@ type DirectUsage struct {
 	OutputTokens int
 }
 
-// Chat sends a direct request to Anthropic or OpenAI (not via gateway).
+// Chat sends a direct request to a provider (not via gateway).
 // Uses net/http only — no external SDK.
 func Chat(ctx context.Context, req DirectChatRequest) (*DirectChatResponse, error) {
 	switch req.Provider {
@@ -187,8 +203,10 @@ func Chat(ctx context.Context, req DirectChatRequest) (*DirectChatResponse, erro
 		return chatOpenAICompatible(ctx, req, "https://api.openai.com/v1/chat/completions")
 	case "kimi":
 		return chatOpenAICompatible(ctx, req, "https://api.moonshot.cn/v1/chat/completions")
+	case "google":
+		return chatGoogle(ctx, req)
 	default:
-		return nil, fmt.Errorf("unsupported provider %q: must be \"anthropic\", \"openai\", or \"kimi\"", req.Provider)
+		return nil, fmt.Errorf("unsupported provider %q: must be \"anthropic\", \"openai\", \"kimi\", or \"google\"", req.Provider)
 	}
 }
 
@@ -365,6 +383,118 @@ func chatOpenAICompatible(ctx context.Context, req DirectChatRequest, endpoint s
 		Usage: DirectUsage{
 			InputTokens:  or.Usage.PromptTokens,
 			OutputTokens: or.Usage.CompletionTokens,
+		},
+	}, nil
+}
+
+// ─── Google Gemini ────────────────────────────────────────────────────────────
+
+// geminiAPIRequest is the native Gemini generateContent request body.
+type geminiAPIRequest struct {
+	Contents         []geminiAPIContent      `json:"contents"`
+	GenerationConfig *geminiAPIGenerationCfg `json:"generationConfig,omitempty"`
+	SystemInstruction *geminiAPIContent      `json:"systemInstruction,omitempty"`
+}
+
+type geminiAPIContent struct {
+	Role  string           `json:"role,omitempty"`
+	Parts []geminiAPIPart  `json:"parts"`
+}
+
+type geminiAPIPart struct {
+	Text string `json:"text"`
+}
+
+type geminiAPIGenerationCfg struct {
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+}
+
+type geminiAPIResponse struct {
+	Candidates []struct {
+		Content struct {
+			Parts []geminiAPIPart `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+	UsageMetadata struct {
+		PromptTokenCount     int `json:"promptTokenCount"`
+		CandidatesTokenCount int `json:"candidatesTokenCount"`
+	} `json:"usageMetadata"`
+}
+
+func chatGoogle(ctx context.Context, req DirectChatRequest) (*DirectChatResponse, error) {
+	model := req.Model
+	if model == "" {
+		model = "gemini-2.0-flash"
+	}
+
+	gReq := geminiAPIRequest{}
+
+	for _, m := range req.Messages {
+		if m.Role == "system" {
+			gReq.SystemInstruction = &geminiAPIContent{
+				Parts: []geminiAPIPart{{Text: m.Content}},
+			}
+			continue
+		}
+		role := m.Role
+		if role == "assistant" {
+			role = "model"
+		}
+		gReq.Contents = append(gReq.Contents, geminiAPIContent{
+			Role:  role,
+			Parts: []geminiAPIPart{{Text: m.Content}},
+		})
+	}
+
+	if req.MaxTokens > 0 {
+		gReq.GenerationConfig = &geminiAPIGenerationCfg{MaxOutputTokens: req.MaxTokens}
+	}
+
+	payload, err := json.Marshal(gReq)
+	if err != nil {
+		return nil, fmt.Errorf("google: marshal request: %w", err)
+	}
+
+	url := fmt.Sprintf(
+		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
+		model, req.APIKey,
+	)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("google: build request: %w", err)
+	}
+	httpReq.Header.Set("content-type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("google: http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errBody map[string]interface{}
+		_ = json.NewDecoder(resp.Body).Decode(&errBody)
+		return nil, fmt.Errorf("google: unexpected status %d: %v", resp.StatusCode, errBody)
+	}
+
+	var gResp geminiAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&gResp); err != nil {
+		return nil, fmt.Errorf("google: decode response: %w", err)
+	}
+
+	var text string
+	if len(gResp.Candidates) > 0 && len(gResp.Candidates[0].Content.Parts) > 0 {
+		text = gResp.Candidates[0].Content.Parts[0].Text
+	}
+
+	return &DirectChatResponse{
+		Content: text,
+		Model:   model,
+		Usage: DirectUsage{
+			InputTokens:  gResp.UsageMetadata.PromptTokenCount,
+			OutputTokens: gResp.UsageMetadata.CandidatesTokenCount,
 		},
 	}, nil
 }

@@ -14,6 +14,7 @@ func TestLoadAPIKeys_AllSet(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 	t.Setenv("OPENAI_API_KEY", "sk-openai-test")
 	t.Setenv("KIMI_API_KEY", "kimi-test")
+	t.Setenv("GOOGLE_API_KEY", "google-test")
 
 	keys := providers.LoadAPIKeys()
 
@@ -26,12 +27,16 @@ func TestLoadAPIKeys_AllSet(t *testing.T) {
 	if keys.KimiKey != "kimi-test" {
 		t.Errorf("KimiKey: got %q, want %q", keys.KimiKey, "kimi-test")
 	}
+	if keys.GeminiKey != "google-test" {
+		t.Errorf("GeminiKey: got %q, want %q", keys.GeminiKey, "google-test")
+	}
 }
 
 func TestLoadAPIKeys_NoneSet(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("KIMI_API_KEY", "")
+	t.Setenv("GOOGLE_API_KEY", "")
 
 	keys := providers.LoadAPIKeys()
 
@@ -43,6 +48,9 @@ func TestLoadAPIKeys_NoneSet(t *testing.T) {
 	}
 	if keys.KimiKey != "" {
 		t.Errorf("KimiKey: expected empty, got %q", keys.KimiKey)
+	}
+	if keys.GeminiKey != "" {
+		t.Errorf("GeminiKey: expected empty, got %q", keys.GeminiKey)
 	}
 }
 
@@ -123,6 +131,13 @@ func TestHasDirectAccess_TrueWhenKimiSet(t *testing.T) {
 	}
 }
 
+func TestHasDirectAccess_TrueWhenGoogleSet(t *testing.T) {
+	keys := providers.APIKeys{GeminiKey: "google-x"}
+	if !keys.HasDirectAccess() {
+		t.Error("expected HasDirectAccess() = true when GeminiKey is set")
+	}
+}
+
 func TestHasDirectAccess_TrueWhenAllSet(t *testing.T) {
 	keys := providers.APIKeys{
 		AnthropicKey: "sk-ant-x",
@@ -167,11 +182,19 @@ func TestKeyForProvider_Kimi(t *testing.T) {
 	}
 }
 
+func TestKeyForProvider_Google(t *testing.T) {
+	keys := providers.APIKeys{GeminiKey: "google-key"}
+	got := keys.KeyForProvider("google")
+	if got != "google-key" {
+		t.Errorf("KeyForProvider(%q): got %q, want %q", "google", got, "google-key")
+	}
+}
+
 func TestKeyForProvider_Unknown(t *testing.T) {
 	keys := providers.APIKeys{AnthropicKey: "sk-ant-key", OpenAIKey: "sk-openai-key"}
-	got := keys.KeyForProvider("google")
+	got := keys.KeyForProvider("unknown-provider")
 	if got != "" {
-		t.Errorf("KeyForProvider(%q): got %q, want empty string", "google", got)
+		t.Errorf("KeyForProvider(%q): got %q, want empty string", "unknown-provider", got)
 	}
 }
 
@@ -202,6 +225,10 @@ func TestInferProvider_CatalogExactMatch(t *testing.T) {
 		{"moonshot-v1-128k", "kimi"},
 		{"moonshot-v1-32k", "kimi"},
 		{"moonshot-v1-8k", "kimi"},
+		{"gemini-2.0-flash-lite", "google"},
+		{"gemini-2.0-flash", "google"},
+		{"gemini-1.5-flash", "google"},
+		{"gemini-1.5-flash-8b", "google"},
 		{"llama3", "local"},
 		{"mistral", "local"},
 	}
@@ -270,6 +297,7 @@ func TestCatalog_ContainsExpectedProviders(t *testing.T) {
 		"anthropic": false,
 		"openai":    false,
 		"kimi":      false,
+		"google":    false,
 		"local":     false,
 	}
 	for _, p := range providers.Catalog {
@@ -298,11 +326,12 @@ func TestFormatProviderTable_ContainsProviderNames(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("KIMI_API_KEY", "")
+	t.Setenv("GOOGLE_API_KEY", "")
 
 	keys := providers.APIKeys{}
 	out := providers.FormatProviderTable(keys)
 
-	expectedSubstrings := []string{"Anthropic", "OpenAI", "Kimi", "Local"}
+	expectedSubstrings := []string{"Anthropic", "OpenAI", "Kimi", "Google", "Local"}
 	for _, sub := range expectedSubstrings {
 		if !strings.Contains(out, sub) {
 			t.Errorf("FormatProviderTable output missing %q", sub)
@@ -340,7 +369,7 @@ func TestFormatProviderTable_ContainsModelIDs(t *testing.T) {
 	keys := providers.APIKeys{}
 	out := providers.FormatProviderTable(keys)
 
-	modelIDs := []string{"claude-opus-4-6", "gpt-4o", "kimi-k2.5", "llama3"}
+	modelIDs := []string{"claude-opus-4-6", "gpt-4o", "kimi-k2.5", "gemini-2.0-flash", "llama3"}
 	for _, id := range modelIDs {
 		if !strings.Contains(out, id) {
 			t.Errorf("FormatProviderTable output missing model %q", id)
@@ -366,8 +395,8 @@ func TestFormatProviderTable_LocalHasNoKeyStatus(t *testing.T) {
 func TestChat_UnsupportedProvider(t *testing.T) {
 	// Error path for an unsupported provider — no network call needed.
 	req := providers.DirectChatRequest{
-		Provider: "google",
-		Model:    "gemini-pro",
+		Provider: "totally-unknown",
+		Model:    "some-model",
 		Messages: []providers.DirectMessage{{Role: "user", Content: "hello"}},
 		APIKey:   "fake",
 	}
@@ -378,6 +407,25 @@ func TestChat_UnsupportedProvider(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unsupported provider") {
 		t.Errorf("error message should mention 'unsupported provider'; got: %v", err)
+	}
+}
+
+func TestChat_Google_CancelledContext(t *testing.T) {
+	// Pre-cancelled context exercises the chatGoogle error path.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	req := providers.DirectChatRequest{
+		Provider:  "google",
+		Model:     "gemini-2.0-flash",
+		Messages:  []providers.DirectMessage{{Role: "user", Content: "ping"}},
+		MaxTokens: 16,
+		APIKey:    "google-fake",
+	}
+
+	_, err := providers.Chat(ctx, req)
+	if err == nil {
+		t.Fatal("expected error with cancelled context, got nil")
 	}
 }
 

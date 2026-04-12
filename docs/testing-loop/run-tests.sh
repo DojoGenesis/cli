@@ -28,13 +28,13 @@ locate_dojo() {
     command -v dojo
     return
   fi
-  local local_bin="$WORKSPACE_ROOT/dojo-cli/dojo"
+  local local_bin="$WORKSPACE_ROOT/cli/dojo"
   if [[ -x "$local_bin" ]]; then
     echo "$local_bin"
     return
   fi
-  echo "  [build] dojo not found — building from $WORKSPACE_ROOT/dojo-cli ..." >&2
-  (cd "$WORKSPACE_ROOT/dojo-cli" && go build -o /tmp/dojo-test-runner ./cmd/dojo/) >&2
+  echo "  [build] dojo not found — building from $WORKSPACE_ROOT/cli ..." >&2
+  (cd "$WORKSPACE_ROOT/cli" && go build -o /tmp/dojo-test-runner ./cmd/dojo/) >&2
   echo "/tmp/dojo-test-runner"
 }
 
@@ -92,8 +92,8 @@ declare -a NAMES=(
 )
 
 declare -a MESSAGES=(
-  "list the files in dojo-cli/internal/commands/"
-  "read dojo-cli/internal/client/client.go and tell me what ChatRequest fields exist"
+  "list the files in cli/internal/commands/"
+  "read cli/internal/client/client.go and tell me what ChatRequest fields exist"
   'search the web for "Go context value injection pattern" and give me one key insight'
   'write /tmp/smoke-test.txt with the content "smoke test passed" then read it back and confirm the content'
   "find all files matching *.go in AgenticGatewayByDojoGenesis/tools/ and list their names"

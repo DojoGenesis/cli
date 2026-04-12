@@ -21,7 +21,7 @@ Expected: `list_directory` tool called, returns actual file list.
 Expected: `list_directory` called on `AgenticGatewayByDojoGenesis/tools/`.
 
 ```
-/run how many lines is dojo-cli/internal/repl/repl.go?
+/run how many lines is cli/internal/repl/repl.go?
 ```
 Expected: `read_file` called, agent counts lines or returns line count from tool result.
 
@@ -32,12 +32,12 @@ Expected: `read_file` called, agent counts lines or returns line count from tool
 These directly test that relative paths resolve against the workspace root, not the gateway's CWD.
 
 ```
-/run read the file dojo-cli/internal/commands/cmd_workflow.go and summarize what the /run command does
+/run read the file cli/internal/commands/cmd_workflow.go and summarize what the /run command does
 ```
 Expected: `read_file` succeeds, returns content of that file.
 
 ```
-/run search for all .go files in dojo-cli/internal/commands/
+/run search for all .go files in cli/internal/commands/
 ```
 Expected: `search_files` returns the command files.
 
@@ -61,7 +61,7 @@ Expected: `list_directory` on providers dir, then reads files, lists anthropic/o
 Expected: `write_file` succeeds at `/tmp/dojo-test.txt`.
 
 ```
-/run write a file dojo-cli/scratch/hello.go with a simple Go hello world program, then read it back and confirm it was written correctly
+/run write a file cli/scratch/hello.go with a simple Go hello world program, then read it back and confirm it was written correctly
 ```
 Expected: Two tool calls — `write_file` then `read_file`. Tests multi-step + relative path write.
 
@@ -91,7 +91,7 @@ Expected: Tests that SerpAPI returns richer results than DDG would have.
 These require the agent to call multiple tools in sequence and synthesize results.
 
 ```
-/run find all files named *.go in dojo-cli/internal/providers/ and tell me what each one does
+/run find all files named *.go in cli/internal/providers/ and tell me what each one does
 ```
 Expected: `search_files` or `list_directory`, then `read_file` for each result.
 
@@ -111,7 +111,7 @@ Expected: `search_files` + `read_file` on multiple files, aggregates count.
 
 ```
 /model set gpt-4o
-/run read dojo-cli/go.mod and list all direct dependencies
+/run read cli/go.mod and list all direct dependencies
 ```
 Expected: GPT-4o is used, calls `read_file`, parses go.mod.
 
@@ -142,7 +142,7 @@ Expected: Returns empty or near-empty results (no Rust files), agent reports tha
 ## 8. Context and session continuity
 
 ```
-/run list the files in dojo-cli/internal/tui/
+/run list the files in cli/internal/tui/
 ```
 Then, in the same session:
 ```
@@ -157,8 +157,8 @@ Expected: Agent uses the path from prior turn without re-listing.
 Fast pass across the core fixes in order:
 
 ```
-1. /run list dojo-cli/internal/commands/
-2. /run read dojo-cli/internal/client/client.go and tell me what ChatRequest fields exist
+1. /run list cli/internal/commands/
+2. /run read cli/internal/client/client.go and tell me what ChatRequest fields exist
 3. /run search the web for "Go context value injection pattern" and give me one key insight
 4. /run write /tmp/smoke-test.txt with "smoke test passed" then read it back
 5. /run find all files matching *.go in AgenticGatewayByDojoGenesis/tools/ and list their names
