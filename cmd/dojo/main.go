@@ -133,16 +133,29 @@ _dojo() {
     '/session:session management'
     '/run:orchestration'
     '/garden:memory garden'
-    '/trail:activity log'
+    '/trail:memory timeline'
+    '/snapshot:memory snapshots'
     '/trace:trace info'
     '/pilot:live event stream'
     '/practice:daily reflections'
     '/projects:project info'
+    '/project:project lifecycle management'
     '/hooks:hook management'
     '/settings:show settings'
     '/guide:interactive tutorials'
     '/code:file ops and build tooling'
     '/bloom:bonsai garden meditation'
+    '/apps:app launch and management'
+    '/workflow:workflow operations'
+    '/doc:documentation'
+    '/init:workspace initialization'
+    '/activity:activity log'
+    '/plugin:plugin management'
+    '/disposition:ADA disposition presets'
+    '/telemetry:observability telemetry'
+    '/sensei:koan from the sensei'
+    '/card:dojo profile card'
+    '/warroom:scout vs challenger debate'
   )
   _describe 'command' commands
 }
@@ -150,7 +163,7 @@ compdef _dojo dojo
 `)
 	case "bash":
 		fmt.Print(`_dojo_completions() {
-  COMPREPLY=($(compgen -W "/help /health /home /model /tools /agent /skill /session /run /garden /trail /trace /pilot /practice /projects /hooks /settings /guide /code /bloom exit" -- "${COMP_WORDS[COMP_CWORD]}"))
+  COMPREPLY=($(compgen -W "/help /health /home /model /tools /agent /skill /session /run /garden /trail /snapshot /trace /pilot /practice /projects /project /hooks /settings /guide /code /bloom /apps /workflow /doc /init /activity /plugin /disposition /telemetry /sensei /card /warroom exit" -- "${COMP_WORDS[COMP_CWORD]}"))
 }
 complete -F _dojo_completions dojo
 `)
@@ -165,16 +178,29 @@ complete -c dojo -f -a "/skill" -d "skill operations"
 complete -c dojo -f -a "/session" -d "session management"
 complete -c dojo -f -a "/run" -d "orchestration"
 complete -c dojo -f -a "/garden" -d "memory garden"
-complete -c dojo -f -a "/trail" -d "activity log"
+complete -c dojo -f -a "/trail" -d "memory timeline"
+complete -c dojo -f -a "/snapshot" -d "memory snapshots"
 complete -c dojo -f -a "/trace" -d "trace info"
 complete -c dojo -f -a "/pilot" -d "live event stream"
 complete -c dojo -f -a "/practice" -d "daily reflections"
 complete -c dojo -f -a "/projects" -d "project info"
+complete -c dojo -f -a "/project" -d "project lifecycle management"
 complete -c dojo -f -a "/hooks" -d "hook management"
 complete -c dojo -f -a "/settings" -d "show settings"
 complete -c dojo -f -a "/guide" -d "interactive tutorials"
 complete -c dojo -f -a "/code" -d "file ops and build tooling"
 complete -c dojo -f -a "/bloom" -d "bonsai garden meditation"
+complete -c dojo -f -a "/apps" -d "app launch and management"
+complete -c dojo -f -a "/workflow" -d "workflow operations"
+complete -c dojo -f -a "/doc" -d "documentation"
+complete -c dojo -f -a "/init" -d "workspace initialization"
+complete -c dojo -f -a "/activity" -d "activity log"
+complete -c dojo -f -a "/plugin" -d "plugin management"
+complete -c dojo -f -a "/disposition" -d "ADA disposition presets"
+complete -c dojo -f -a "/telemetry" -d "observability telemetry"
+complete -c dojo -f -a "/sensei" -d "koan from the sensei"
+complete -c dojo -f -a "/card" -d "dojo profile card"
+complete -c dojo -f -a "/warroom" -d "scout vs challenger debate"
 `)
 	default:
 		fmt.Fprintf(os.Stderr, "dojo: unknown shell %q (supported: bash, zsh, fish)\n", shell)
