@@ -40,6 +40,7 @@ brews:
   - repository:
       owner: DojoGenesis
       name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: https://github.com/DojoGenesis/cli
     description: "Self-hosted agentic AI CLI powered by the Dojo Genesis gateway"
     license: MIT
