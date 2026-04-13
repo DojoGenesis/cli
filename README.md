@@ -11,19 +11,17 @@ The gateway does the heavy work: multi-provider model routing, semantic memory, 
 ## Quick Start
 
 ```bash
-# 1. Install
-git clone https://github.com/DojoGenesis/cli && cd cli && make install
+# Install via Homebrew (recommended)
+brew install DojoGenesis/tap/dojo
 
-# 2. Point at your gateway
+# Point at your gateway
 echo '{"gateway":{"url":"http://localhost:7340"}}' > ~/.dojo/settings.json
 
-# 3. Run
+# Run
 dojo
 ```
 
-## Installation
-
-### From source
+### From Source
 
 ```bash
 git clone https://github.com/DojoGenesis/cli
@@ -33,16 +31,10 @@ make install
 
 Requires Go 1.24+. The binary is installed to `$GOPATH/bin/dojo`.
 
-### Pre-built binaries
+### Install Script
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/DojoGenesis/cli/main/scripts/install.sh | bash
-```
-
-### Homebrew (coming soon)
-
-```bash
-brew install DojoGenesis/tap/dojo
 ```
 
 ## Configuration
@@ -77,6 +69,11 @@ Settings are loaded from `~/.dojo/settings.json`. A missing file is not an error
 | `DOJO_PROVIDER`        | `defaults.provider` |
 | `DOJO_TELEMETRY_URL`   | telemetry API base  |
 | `DOJO_SKILLS_PATH`     | default skill dir for `/skill package-all` |
+
+## Requirements
+
+- Go 1.24+ (for building from source)
+- [AgenticGateway](https://github.com/DojoGenesis/gateway) running at `localhost:7340` (default)
 
 ## CLI Flags
 
@@ -273,6 +270,25 @@ Track statuses: `pending`, `in-progress`, `completed`, `blocked`.
 | `/code vet`                     | Run `go vet ./...`                                |
 | `/code gate`                    | Run the full build gate: build + test + vet       |
 
+## Directory Structure
+
+```
+cli/
+├── cmd/           # Cobra command tree
+├── internal/
+│   ├── repl/      # Interactive REPL and TUI panels
+│   ├── client/    # Gateway HTTP + SSE client
+│   ├── plugin/    # Plugin loader and hook runner
+│   ├── skill/     # Skill and CAS commands
+│   └── spirit/    # Belt, XP, achievements, koans
+├── desktop/       # Desktop app (Wails v2 + Svelte 5)
+└── scripts/       # Install and release scripts
+```
+
+## Desktop App
+
+A native desktop variant lives at `cli/desktop/` — built with Wails v2 (Go backend) and Svelte 5 (frontend). It connects to the same gateway and exposes the same chat and piloting surfaces in a windowed app. `go build` is clean; smoke testing against the gateway is in progress.
+
 ## Surfaces
 
 Dojo Genesis organizes work into eight named surfaces. The CLI maps each one to a command or interaction mode, so the mental model carries over from the web shell to the terminal.
@@ -317,37 +333,6 @@ Create and save custom presets with `/disposition create`:
 /disposition create sprint fast shallow assertive high
 ```
 
-## Dojo Spirit
-
-Dojo Spirit is the engagement system built into the CLI. It tracks XP, belt ranks, daily streaks, achievements, and unlockable koans — all stored locally in `~/.dojo/state.json`.
-
-**Belt ladder:**
-
-| Belt   | Title        | XP Required |
-|--------|--------------|-------------|
-| White  | Novice       | 0           |
-| Yellow | Apprentice   | 1,000       |
-| Orange | Initiate     | 3,000       |
-| Green  | Practitioner | 6,000       |
-| Blue   | Adept        | 10,000      |
-| Purple | Sage         | 15,000      |
-| Brown  | Master       | 25,000      |
-| Black  | Grandmaster  | 50,000      |
-
-XP is earned through guided tutorials (`/guide`), daily practice sessions, and regular CLI use. Belt promotions display inline in the REPL. `/card` shows your current rank, XP progress bar, session count, streak, and unlocked achievements. `/sensei` delivers a koan matched to your belt rank.
-
-## Session Management
-
-Sessions scope conversation history on the gateway. Each `dojo` invocation generates a session ID automatically. You can rotate or resume sessions mid-session.
-
-```
-/session                     # show current session ID
-/session new                 # rotate to a fresh session
-/session dojo-cli-20260409   # resume a specific session
-```
-
-Use `--resume` at startup to continue the most recent session automatically.
-
 ## Plugin System
 
 Plugins extend the CLI with hook rules and skills. Place plugin directories under `~/.dojo/plugins/` (or the path configured in `plugins.path`), or use `/plugin install` to clone from a git URL.
@@ -379,6 +364,37 @@ Plugin management commands:
 ```
 
 Plugins are rescanned live after install and remove operations — no restart needed.
+
+## Dojo Spirit
+
+Dojo Spirit is the engagement system built into the CLI. It tracks XP, belt ranks, daily streaks, achievements, and unlockable koans — all stored locally in `~/.dojo/state.json`.
+
+**Belt ladder:**
+
+| Belt   | Title        | XP Required |
+|--------|--------------|-------------|
+| White  | Novice       | 0           |
+| Yellow | Apprentice   | 1,000       |
+| Orange | Initiate     | 3,000       |
+| Green  | Practitioner | 6,000       |
+| Blue   | Adept        | 10,000      |
+| Purple | Sage         | 15,000      |
+| Brown  | Master       | 25,000      |
+| Black  | Grandmaster  | 50,000      |
+
+XP is earned through guided tutorials (`/guide`), daily practice sessions, and regular CLI use. Belt promotions display inline in the REPL. `/card` shows your current rank, XP progress bar, session count, streak, and unlocked achievements. `/sensei` delivers a koan matched to your belt rank.
+
+## Session Management
+
+Sessions scope conversation history on the gateway. Each `dojo` invocation generates a session ID automatically. You can rotate or resume sessions mid-session.
+
+```
+/session                     # show current session ID
+/session new                 # rotate to a fresh session
+/session dojo-cli-20260409   # resume a specific session
+```
+
+Use `--resume` at startup to continue the most recent session automatically.
 
 ## Design
 
