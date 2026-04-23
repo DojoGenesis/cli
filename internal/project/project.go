@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/ioutilx"
 )
 
 // Phase represents the current lifecycle stage of a project.
@@ -149,16 +150,13 @@ func LoadGlobalState() (*GlobalState, error) {
 	return gs, nil
 }
 
-// SaveGlobalState writes the global state to ~/.dojo/projects/global.json.
+// SaveGlobalState writes the global state to ~/.dojo/projects/global.json atomically.
 func SaveGlobalState(gs *GlobalState) error {
-	if err := os.MkdirAll(ProjectsDir(), 0700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(gs, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(globalStatePath(), data, 0600)
+	return ioutilx.AtomicWriteFile(globalStatePath(), data, 0600)
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +180,8 @@ func Load(id string) (*Project, error) {
 	return &p, nil
 }
 
-// Save writes the project state to disk and creates the standard subdirectories.
+// Save writes the project state to disk atomically and creates the standard
+// subdirectories.
 func (p *Project) Save() error {
 	dir := projectDir(p.ID)
 	for _, sub := range []string{"scouts", "specs", "tracks", "prompts", "retros", "artifacts"} {
@@ -195,7 +194,7 @@ func (p *Project) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(projectStatePath(p.ID), data, 0600)
+	return ioutilx.AtomicWriteFile(projectStatePath(p.ID), data, 0600)
 }
 
 // ---------------------------------------------------------------------------

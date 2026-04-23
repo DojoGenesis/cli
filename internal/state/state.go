@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/ioutilx"
 	"github.com/DojoGenesis/cli/internal/spirit"
 )
 
@@ -65,17 +66,13 @@ func Load() (*State, error) {
 	return s, nil
 }
 
-// Save writes the state to ~/.dojo/state.json with 0600 permissions.
+// Save writes the state to ~/.dojo/state.json atomically with 0600 permissions.
 func (s *State) Save() error {
-	dir := config.DojoDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(statePath(), data, 0600)
+	return ioutilx.AtomicWriteFile(statePath(), data, 0600)
 }
 
 // AddAgent records an agent in the state.

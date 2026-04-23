@@ -12,6 +12,7 @@ import (
 
 	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/ioutilx"
 	"github.com/DojoGenesis/cli/internal/state"
 	gcolor "github.com/gookit/color"
 )
@@ -117,7 +118,7 @@ func writeSettings(dojoDir string, opts Options) (bool, error) {
 		},
 	}
 	data, _ := json.MarshalIndent(cfg, "", "  ")
-	return true, os.WriteFile(path, data, 0600)
+	return true, ioutilx.AtomicWriteFile(path, data, 0600)
 }
 
 // firstPartyPlugins is the canonical list of first-party Dojo plugins.
@@ -284,7 +285,7 @@ func writeMCPConfig(dojoDir string, force bool) (bool, error) {
 			return false, nil
 		}
 	}
-	return true, os.WriteFile(path, []byte(mcpConfigJSON), 0644)
+	return true, ioutilx.AtomicWriteFile(path, []byte(mcpConfigJSON), 0644)
 }
 
 // starterSeeds are the five default seeds planted on first bootstrap.

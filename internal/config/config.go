@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/DojoGenesis/cli/internal/ioutilx"
 )
 
 // DefaultGatewayURL is the fallback gateway address used by both config defaults
@@ -163,17 +165,13 @@ func SettingsPath() string {
 	return settingsPath()
 }
 
-// Save writes the current config to ~/.dojo/settings.json.
+// Save writes the current config to ~/.dojo/settings.json atomically.
 func (c *Config) Save() error {
-	dir := DojoDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(settingsPath(), data, 0600)
+	return ioutilx.AtomicWriteFile(settingsPath(), data, 0600)
 }
 
 // DojoDir returns ~/.dojo

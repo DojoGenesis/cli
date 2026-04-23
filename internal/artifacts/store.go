@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/ioutilx"
 )
 
 // ArtifactType identifies the category of a persisted artifact.
@@ -71,7 +72,7 @@ func Save(projectID string, at ArtifactType, filename, content string) (string, 
 		return "", fmt.Errorf("artifacts: create directory %s: %w", dir, err)
 	}
 	path := filepath.Join(dir, filename)
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+	if err := ioutilx.AtomicWriteFile(path, []byte(content), 0600); err != nil {
 		return "", fmt.Errorf("artifacts: write %s: %w", path, err)
 	}
 	return path, nil

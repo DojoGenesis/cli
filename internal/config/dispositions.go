@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/DojoGenesis/cli/internal/ioutilx"
 )
 
 // DispositionPreset defines an ADA disposition configuration.
@@ -53,17 +55,13 @@ func LoadDispositionPresets() ([]DispositionPreset, error) {
 	return mergeBuiltins(presets), nil
 }
 
-// SaveDispositionPreset writes a preset to DispositionsDir()/<name>.json.
+// SaveDispositionPreset writes a preset to DispositionsDir()/<name>.json atomically.
 func SaveDispositionPreset(p DispositionPreset) error {
-	dir := DispositionsDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, p.Name+".json"), data, 0600)
+	return ioutilx.AtomicWriteFile(filepath.Join(DispositionsDir(), p.Name+".json"), data, 0600)
 }
 
 // MergeConfigProfiles overlays config-resident profiles on top of the
