@@ -54,15 +54,32 @@ func codeRead(args []string) error {
 	path := args[0]
 
 	// Resolve relative paths from CWD.
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("could not get cwd: %w", err)
+	}
 	if !filepath.IsAbs(path) {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return fmt.Errorf("could not get cwd: %w", err)
-		}
 		path = filepath.Join(cwd, path)
 	}
 
-	content, err := os.ReadFile(path)
+	// Resolve symlinks so that a symlink escaping the project root is caught.
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("could not resolve path %s: %w", path, err)
+	}
+
+	// Enforce project-root boundary: the resolved path must be cwd itself or
+	// a descendant.  filepath.EvalSymlinks also resolves cwd so we evaluate it
+	// as well to handle symlinked working directories correctly.
+	root, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return fmt.Errorf("could not resolve cwd: %w", err)
+	}
+	if resolved != root && !strings.HasPrefix(resolved, root+string(os.PathSeparator)) {
+		return fmt.Errorf("path outside project root: %s", resolved)
+	}
+
+	content, err := os.ReadFile(resolved)
 	if err != nil {
 		return fmt.Errorf("could not read %s: %w", path, err)
 	}
