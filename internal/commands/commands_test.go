@@ -1,11 +1,16 @@
 package commands
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/DojoGenesis/cli/internal/activity"
 	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/config"
 	"github.com/DojoGenesis/cli/internal/guide"
@@ -845,6 +850,176 @@ func TestDispatchAgentChannelsNoID(t *testing.T) {
 	err := r.Dispatch(context.Background(), "agent channels")
 	if err == nil {
 		t.Fatal("expected error for 'agent channels' with no id, got nil")
+	}
+}
+
+// ─── redactSecretArgs ─────────────────────────────────────────────────────────
+
+// TestRedactSecretArgsSettingsSet verifies that the API key positional arg in
+// "/settings set <provider> <api-key>" is replaced with "<redacted>".
+func TestRedactSecretArgsSettingsSet(t *testing.T) {
+	args := []string{"set", "anthropic", "sk-ant-FAKE123"}
+	got := redactSecretArgs("settings", args)
+	if got[2] != "<redacted>" {
+		t.Errorf("redactSecretArgs: args[2] = %q; want <redacted>", got[2])
+	}
+	// Provider name must survive untouched.
+	if got[1] != "anthropic" {
+		t.Errorf("redactSecretArgs: args[1] = %q; want anthropic", got[1])
+	}
+	// Subcommand must survive untouched.
+	if got[0] != "set" {
+		t.Errorf("redactSecretArgs: args[0] = %q; want set", got[0])
+	}
+}
+
+// TestRedactSecretArgsSettingsSetOriginalUnchanged verifies that the original
+// args slice is not mutated — the command handler must still receive the real
+// value.
+func TestRedactSecretArgsSettingsSetOriginalUnchanged(t *testing.T) {
+	original := []string{"set", "openai", "sk-REALKEY"}
+	_ = redactSecretArgs("settings", original)
+	if original[2] != "sk-REALKEY" {
+		t.Errorf("original args were mutated: args[2] = %q; want sk-REALKEY", original[2])
+	}
+}
+
+// TestRedactSecretArgsNonSecretCommand verifies that args for a non-secret
+// command are returned unchanged.
+func TestRedactSecretArgsNonSecretCommand(t *testing.T) {
+	args := []string{"hello", "world"}
+	got := redactSecretArgs("help", args)
+	if got[0] != "hello" || got[1] != "world" {
+		t.Errorf("redactSecretArgs(help): got %v; want [hello world]", got)
+	}
+}
+
+// TestRedactSecretArgsSettingsOtherSubcmd verifies that /settings with a
+// non-secret subcommand (e.g. "effective") is not redacted.
+func TestRedactSecretArgsSettingsEffective(t *testing.T) {
+	args := []string{"effective"}
+	got := redactSecretArgs("settings", args)
+	if got[0] != "effective" {
+		t.Errorf("redactSecretArgs(settings effective): got %v; want [effective]", got)
+	}
+}
+
+// TestRedactSecretArgsSettingsSetTooFewArgs verifies that when too few args are
+// provided (secret index out of bounds), the function returns safely without
+// panicking and leaves args unchanged.
+func TestRedactSecretArgsSettingsSetTooFewArgs(t *testing.T) {
+	args := []string{"set", "anthropic"} // missing api-key — only 2 elements
+	got := redactSecretArgs("settings", args)
+	if len(got) != 2 {
+		t.Errorf("redactSecretArgs with too-few args: got len %d; want 2", len(got))
+	}
+	if got[1] != "anthropic" {
+		t.Errorf("redactSecretArgs with too-few args: args[1] = %q; want anthropic", got[1])
+	}
+}
+
+// TestRedactSecretArgsEmptyArgs verifies that an empty args slice is handled
+// safely and returned as-is.
+func TestRedactSecretArgsEmpty(t *testing.T) {
+	got := redactSecretArgs("settings", []string{})
+	if len(got) != 0 {
+		t.Errorf("redactSecretArgs with empty args: got len %d; want 0", len(got))
+	}
+}
+
+// ─── Activity log redaction integration ──────────────────────────────────────
+
+// readActivityLog reads all entries from the activity log and returns their
+// Summary strings.
+func readActivityLog(t *testing.T) []string {
+	t.Helper()
+	home := os.Getenv("HOME")
+	logPath := filepath.Join(home, ".dojo", "activity.log")
+	f, err := os.Open(logPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("could not open activity log: %v", err)
+	}
+	defer f.Close()
+
+	var summaries []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var e activity.Entry
+		if json.Unmarshal(line, &e) == nil {
+			summaries = append(summaries, e.Summary)
+		}
+	}
+	return summaries
+}
+
+// TestActivityLogNonSecretCommandNotRedacted verifies that dispatching a
+// non-secret command logs the args as-is (no spurious redaction).
+func TestActivityLogNonSecretCommandNotRedacted(t *testing.T) {
+	// Redirect HOME so the log goes to a throwaway directory.
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	r, _ := testRegistry()
+	// "practice" is a purely client-side command with no gateway call.
+	if err := r.Dispatch(context.Background(), "practice"); err != nil {
+		t.Fatalf("Dispatch practice: %v", err)
+	}
+
+	summaries := readActivityLog(t)
+	if len(summaries) == 0 {
+		t.Fatal("expected at least one activity log entry after successful dispatch")
+	}
+	last := summaries[len(summaries)-1]
+	if strings.Contains(last, "<redacted>") {
+		t.Errorf("non-secret command log entry contains unexpected <redacted>: %q", last)
+	}
+	if !strings.Contains(last, "/practice") {
+		t.Errorf("expected log entry to contain /practice, got %q", last)
+	}
+}
+
+// TestActivityLogSecretArgIsRedacted verifies that the activity log written by
+// Dispatch for /settings set contains "<redacted>" in place of the API key and
+// does NOT contain the literal key value.
+//
+// Because /settings set requires a live gateway (r.gw.SetProviderKey), we
+// cannot drive it through Dispatch in a unit test. Instead we call
+// activity.Log directly with the string that Dispatch would write — using
+// redactSecretArgs to build it — which exercises exactly the production code
+// path that assembles the log line.
+func TestActivityLogSecretArgIsRedacted(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	const realKey = "sk-ant-FAKE123"
+	name := "settings"
+	args := []string{"set", "anthropic", realKey}
+
+	// This mirrors what Dispatch does after a successful run:
+	logArgs := redactSecretArgs(name, args)
+	summary := "/" + name + " " + strings.Join(logArgs, " ")
+	activity.Log(activity.CommandRun, summary)
+
+	summaries := readActivityLog(t)
+	if len(summaries) == 0 {
+		t.Fatal("expected at least one activity log entry")
+	}
+	last := summaries[len(summaries)-1]
+	if strings.Contains(last, realKey) {
+		t.Errorf("activity log contains the real API key %q — it must be redacted: %q", realKey, last)
+	}
+	if !strings.Contains(last, "<redacted>") {
+		t.Errorf("activity log does not contain <redacted>: %q", last)
+	}
+	if !strings.Contains(last, "anthropic") {
+		t.Errorf("activity log should retain the provider name 'anthropic': %q", last)
 	}
 }
 

@@ -53,6 +53,41 @@ func (r *Registry) Runner() *hooks.Runner {
 	return r.runner
 }
 
+// secretArgPositions maps (command name, subcommand) → the index within args
+// (after the command name) that holds a secret. A subcommand of "" means the
+// secret sits at args[0] with no prior subcommand token.
+//
+// To add a new secret-bearing command: add one entry here — that is the only
+// place that needs changing.
+var secretArgPositions = map[[2]string]int{
+	// /settings set <provider> <api-key>  → args = ["set", provider, api-key]
+	// api-key is at index 2 within args.
+	{"settings", "set"}: 2,
+}
+
+// redactSecretArgs returns a copy of args with any secret positional argument
+// replaced by "<redacted>". The name parameter is the command name (without
+// the leading "/"). This function never mutates the original slice.
+func redactSecretArgs(name string, args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	sub := strings.ToLower(args[0])
+	key := [2]string{strings.ToLower(name), sub}
+	secretIdx, ok := secretArgPositions[key]
+	if !ok {
+		return args
+	}
+	if secretIdx >= len(args) {
+		return args
+	}
+	// Copy to avoid mutating the original.
+	redacted := make([]string, len(args))
+	copy(redacted, args)
+	redacted[secretIdx] = "<redacted>"
+	return redacted
+}
+
 // Dispatch finds and executes a slash command. Input should be the full line
 // after the leading "/", e.g. "skill ls" or "chat hello world".
 func (r *Registry) Dispatch(ctx context.Context, input string) error {
@@ -67,7 +102,8 @@ func (r *Registry) Dispatch(ctx context.Context, input string) error {
 	if cmd, ok := r.cmds[name]; ok {
 		err := cmd.Run(ctx, args)
 		if err == nil {
-			activity.Log(activity.CommandRun, fmt.Sprintf("/%s %s", name, strings.Join(args, " ")))
+			logArgs := redactSecretArgs(name, args)
+			activity.Log(activity.CommandRun, fmt.Sprintf("/%s %s", name, strings.Join(logArgs, " ")))
 		}
 		return err
 	}
@@ -77,7 +113,8 @@ func (r *Registry) Dispatch(ctx context.Context, input string) error {
 			if a == name {
 				err := cmd.Run(ctx, args)
 				if err == nil {
-					activity.Log(activity.CommandRun, fmt.Sprintf("/%s %s", name, strings.Join(args, " ")))
+					logArgs := redactSecretArgs(cmd.Name, args)
+					activity.Log(activity.CommandRun, fmt.Sprintf("/%s %s", name, strings.Join(logArgs, " ")))
 				}
 				return err
 			}
