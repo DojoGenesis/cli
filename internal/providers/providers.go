@@ -13,9 +13,9 @@ import (
 
 // KnownProvider represents a provider we know about statically.
 type KnownProvider struct {
-	ID          string       // "anthropic", "openai", "local"
-	DisplayName string       // "Anthropic", "OpenAI", "Local"
-	EnvKey      string       // env var name for the API key, e.g. "ANTHROPIC_API_KEY"
+	ID          string // "anthropic", "openai", "local"
+	DisplayName string // "Anthropic", "OpenAI", "Local"
+	EnvKey      string // env var name for the API key, e.g. "ANTHROPIC_API_KEY"
 	Models      []KnownModel
 }
 
@@ -36,7 +36,13 @@ func init() {
 			DisplayName: "Anthropic",
 			EnvKey:      "ANTHROPIC_API_KEY",
 			Models: []KnownModel{
-				{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6", Notes: "most capable"},
+				// Newest-first. Add new Claude aliases at the top of their family.
+				// Frontier "Mythos-class" capability ships in a future public Opus
+				// (Mythos Preview itself is Glasswing-gated, no public ID) — when it
+				// lands, add one line here. See AgenticStackOrchestration ADR 028.
+				{ID: "claude-opus-4-8", DisplayName: "Claude Opus 4.8", Notes: "most capable"},
+				{ID: "claude-opus-4-7", DisplayName: "Claude Opus 4.7", Notes: "capable"},
+				{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6", Notes: "capable"},
 				{ID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6", Notes: "fast + capable"},
 				{ID: "claude-haiku-4-5", DisplayName: "Claude Haiku 4.5", Notes: "fastest, lightweight"},
 			},
@@ -213,9 +219,9 @@ func Chat(ctx context.Context, req DirectChatRequest) (*DirectChatResponse, erro
 // ─── Anthropic ────────────────────────────────────────────────────────────────
 
 type anthropicRequest struct {
-	Model     string              `json:"model"`
-	MaxTokens int                 `json:"max_tokens"`
-	Messages  []anthropicMessage  `json:"messages"`
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	Messages  []anthropicMessage `json:"messages"`
 }
 
 type anthropicMessage struct {
@@ -391,14 +397,14 @@ func chatOpenAICompatible(ctx context.Context, req DirectChatRequest, endpoint s
 
 // geminiAPIRequest is the native Gemini generateContent request body.
 type geminiAPIRequest struct {
-	Contents         []geminiAPIContent      `json:"contents"`
-	GenerationConfig *geminiAPIGenerationCfg `json:"generationConfig,omitempty"`
-	SystemInstruction *geminiAPIContent      `json:"systemInstruction,omitempty"`
+	Contents          []geminiAPIContent      `json:"contents"`
+	GenerationConfig  *geminiAPIGenerationCfg `json:"generationConfig,omitempty"`
+	SystemInstruction *geminiAPIContent       `json:"systemInstruction,omitempty"`
 }
 
 type geminiAPIContent struct {
-	Role  string           `json:"role,omitempty"`
-	Parts []geminiAPIPart  `json:"parts"`
+	Role  string          `json:"role,omitempty"`
+	Parts []geminiAPIPart `json:"parts"`
 }
 
 type geminiAPIPart struct {
