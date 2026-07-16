@@ -164,6 +164,22 @@ func (in *Injector) Apply(req *client.ChatRequest) bool {
 // TellFor.
 const configVsCodeGate = "Config or code? Total+input-independent failure → wiring: check settings/env FIRST."
 
+// debuggingGate is the one-line "debug by disproof" gate — the most relevant
+// move the moment an error signals a build/test/logic failure rather than a
+// wiring boundary. It mirrors the workspace CLAUDE.md debugging protocol: state
+// the causal chain and name the cheapest experiment that toggles the bug before
+// touching a fix. Surfaced verbatim by TellFor for the build/test tell class.
+const debuggingGate = "Debug by disproof: state the causal chain and name the cheapest experiment that toggles the bug on and off before any fix."
+
+// Stable gate keys. The Nudger de-dupes on these — not on the display line — so
+// a gate fires at most once per session regardless of which error string (or
+// which surface: TellFor vs the REPL's repeated-failure detector) triggered it,
+// and the two classes stay independently fire-able because their keys differ.
+const (
+	gateKeyConfigVsCode = "config-vs-code"
+	gateKeyDebugging    = "debugging"
+)
+
 // wiringTells are lowercased substrings that mark an error as a boundary/wiring
 // failure — connection, DNS, auth, and dead-route signatures. Any match routes
 // to configVsCodeGate. Kept deliberately small and literal (no regex, no
@@ -183,26 +199,67 @@ var wiringTells = []string{
 	"404", // dead route / missing endpoint
 }
 
+// debuggingTells are lowercased substrings that mark an error as a build, test,
+// or compile/logic failure — the class where the right move is to form a
+// disprovable theory, not to check config. Any match routes to debuggingGate.
+// Kept small and literal like wiringTells. Several are the exact shapes the Go
+// toolchain emits — "panic:", "undefined:", and the "--- fail" / "fail\t"
+// markers `go test` prints — so ordinary prose that merely contains the word
+// "fail" does not trip the gate. "cannot use"/"compile"/"assertion" carry a
+// little more false-positive surface than the tokened forms, so they are the
+// last resort here (checked after the wiring class in tellFor) and stay literal.
+var debuggingTells = []string{
+	"panic:",      // Go runtime panic header
+	"--- fail",    // `go test` per-test failure marker (from "--- FAIL")
+	"fail\t",      // `go test` summary line "FAIL\t<pkg>" (tab-delimited)
+	"test failed", // generic test-runner phrasing
+	"build failed",
+	"undefined:", // Go compiler: undefined symbol
+	"cannot use", // Go compiler: type mismatch ("cannot use x as y")
+	"compile",    // "compile error" / "does not compile" / "compilation failed"
+	"assertion",  // failed assertion (test frameworks, runtime checks)
+}
+
 // TellFor maps a failed turn's error text to the single most relevant protocol
-// gate, or ("", false) when the text carries no recognized tell. Today the only
-// mapping is the config-vs-code discriminator (configVsCodeGate), triggered by
-// connection, auth, and model/route signatures — the errors that most often
-// look like a code bug but are really wiring. The match is case-insensitive and
-// substring-based; unrelated text returns ok=false so the caller stays silent.
+// gate line, or ("", false) when the text carries no recognized tell. Two tell
+// classes are recognized: wiring/boundary signatures (connection, auth, dead
+// route, unknown model) map to the config-vs-code discriminator, and build/
+// test/compile signatures map to the debug-by-disproof gate. The match is
+// case-insensitive and substring-based; unrelated text returns ok=false so the
+// caller stays silent. Wiring is checked first, so a boundary failure keeps its
+// config-vs-code framing even in the rare event its text also mentions a build.
 func TellFor(errText string) (gate string, ok bool) {
+	_, gate, ok = tellFor(errText)
+	return gate, ok
+}
+
+// tellFor is the shared matcher behind TellFor and Nudger.NudgeFor. Beyond the
+// display line it returns a STABLE gate key (gateKeyConfigVsCode /
+// gateKeyDebugging) so the Nudger can de-dupe on gate identity rather than
+// wording. Wiring/boundary tells win over build/test tells when both are
+// present, preserving TellFor's original config-vs-code precedence.
+func tellFor(errText string) (key, gate string, ok bool) {
 	lower := strings.ToLower(errText)
 	for _, tell := range wiringTells {
 		if strings.Contains(lower, tell) {
-			return configVsCodeGate, true
+			return gateKeyConfigVsCode, configVsCodeGate, true
 		}
 	}
 	// A dead/unknown model endpoint reads like a code error ("model X not
-	// found") but is a config choice — route it to the same gate. Required to
-	// co-occur with "model" so a generic "not found" doesn't false-positive.
+	// found") but is a config choice — route it to the config-vs-code gate.
+	// Required to co-occur with "model" so a generic "not found" doesn't
+	// false-positive.
 	if strings.Contains(lower, "model") && strings.Contains(lower, "not found") {
-		return configVsCodeGate, true
+		return gateKeyConfigVsCode, configVsCodeGate, true
 	}
-	return "", false
+	// Build/test/compile signatures — the debug-by-disproof class. Checked last
+	// so the wiring class always wins a tie.
+	for _, tell := range debuggingTells {
+		if strings.Contains(lower, tell) {
+			return gateKeyDebugging, debuggingGate, true
+		}
+	}
+	return "", "", false
 }
 
 // Nudger tracks which protocol gates have already been surfaced this session so
@@ -215,18 +272,42 @@ type Nudger struct {
 }
 
 // NudgeFor returns the gate line to surface for errText and true when it should
-// be shown now — i.e. errText matches a tell (TellFor) AND that gate has not
-// been shown before. On a true return it records the gate as shown, so any
-// later error mapping to the same gate returns ok=false (the fire-once-per-gate
-// guarantee). Errors with no tell always return ("", false) and record nothing.
+// be shown now — i.e. errText matches a tell (tellFor) AND that gate has not
+// been shown before. On a true return it records the gate (by its stable key)
+// as shown, so any later error mapping to the same gate returns ok=false (the
+// fire-once-per-gate guarantee). Errors with no tell always return ("", false)
+// and record nothing.
 func (n *Nudger) NudgeFor(errText string) (gate string, ok bool) {
-	g, matched := TellFor(errText)
-	if !matched || n.shown[g] {
+	key, g, matched := tellFor(errText)
+	if !matched || n.shown[key] {
 		return "", false
 	}
+	n.markShown(key)
+	return g, true
+}
+
+// NudgeDebugging surfaces the debug-by-disproof gate on demand, de-duped through
+// the SAME per-session ledger as NudgeFor. It returns (debuggingGate, true) only
+// the first time the debugging gate is requested this session — whether that
+// first request came from build/test error text via NudgeFor or from a caller
+// that has independently decided the gate applies (the REPL's repeated-failure
+// detector) — and ("", false) every time thereafter. This is the entry point
+// for "I already know the debugging gate is what's needed"; NudgeFor is the
+// entry point for "decide from the error text".
+func (n *Nudger) NudgeDebugging() (gate string, ok bool) {
+	if n.shown[gateKeyDebugging] {
+		return "", false
+	}
+	n.markShown(gateKeyDebugging)
+	return debuggingGate, true
+}
+
+// markShown records a gate key as surfaced, lazily creating the ledger. Shared
+// by NudgeFor and NudgeDebugging so the fire-once-per-gate bookkeeping lives in
+// one place.
+func (n *Nudger) markShown(key string) {
 	if n.shown == nil {
 		n.shown = make(map[string]bool)
 	}
-	n.shown[g] = true
-	return g, true
+	n.shown[key] = true
 }

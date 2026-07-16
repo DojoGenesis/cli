@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,16 @@ type REPL struct {
 	// per distinct gate. Zero value is ready to use; driven only from the single
 	// read-loop goroutine, so it needs no lock.
 	nudger protocol.Nudger
+
+	// Repeated-failure detection (the "Nth retry of the same thing" tell):
+	// lastErrSig is the normalized signature of the most recent failed chat turn
+	// and errRepeat is how many times in a row that same signature has recurred.
+	// Once the run reaches repeatFailureThreshold the debugging gate is surfaced
+	// through nudger — so it still de-dupes and still respects --plain and the
+	// protocol-enabled flag. A different error resets the run. Same read-loop
+	// goroutine as nudger, so no lock.
+	lastErrSig string
+	errRepeat  int
 
 	mu         sync.Mutex         // guards turnCancel
 	turnCancel context.CancelFunc // cancels the in-flight streaming turn; nil when idle
@@ -658,6 +669,10 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 			// rewrite: FriendlyError collapses a "dial tcp … connection refused"
 			// into a URL-naming message that no longer carries the wiring tell.
 			r.maybeProtocolNudge(err.Error())
+			// Repeated-failure tell: the same error recurring across turns
+			// escalates to the debugging gate even when a single instance carried
+			// no situated tell. Same raw text, for the same reason as above.
+			r.maybeRepeatFailureNudge(err.Error())
 			return nil
 		}
 	}
@@ -666,6 +681,7 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 		// Stream ended cleanly but carried a gateway error event; it was already
 		// rendered inline. Don't count it as a successful turn or award XP.
 		r.maybeProtocolNudge(lastErrText)
+		r.maybeRepeatFailureNudge(lastErrText)
 		return nil
 	}
 
@@ -721,6 +737,75 @@ func (r *REPL) maybeProtocolNudge(errText string) {
 		return
 	}
 	if gate, ok := r.nudger.NudgeFor(errText); ok {
+		fmt.Println(gcolor.HEX("#64748b").Sprintf("  [protocol] %s", gate))
+	}
+}
+
+// ─── Repeated-failure tell ("Nth retry of the same thing") ────────────────────
+
+// repeatFailureThreshold is how many times the SAME chat error (by normalized
+// signature) must recur before the repeated-failure detector surfaces the
+// debugging gate. Three: the point at which retrying the same thing has visibly
+// stopped working and the move is to form a theory, not retry a fourth time.
+const repeatFailureThreshold = 3
+
+// errSigDigits matches runs of digits. normalizeErrSignature collapses them to a
+// single "#" so volatile numerics — ports, IP octets, line:col positions,
+// request IDs, backoff timings — don't split what is really one recurring error
+// into distinct signatures.
+var errSigDigits = regexp.MustCompile(`\d+`)
+
+// normalizeErrSignature reduces a raw error string to a stable signature for
+// repeated-failure detection: lowercase, digit-runs collapsed to "#", and all
+// whitespace (including the tabs `go test` emits) squeezed to single spaces. It
+// erases only the volatile numerics and keeps the error's words — the
+// class-carrying part — so two attempts at the same failing thing share a
+// signature while genuinely different errors do not. Deliberately measured: it
+// neither over-collapses distinct classes (their words still differ) nor splits
+// one class on incidental number or spacing noise.
+func normalizeErrSignature(s string) string {
+	s = strings.ToLower(s)
+	s = errSigDigits.ReplaceAllString(s, "#")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// recordFailure feeds one failed chat turn into the repeated-failure detector
+// and reports whether the debugging gate should surface now. It always updates
+// the (signature, count) tracker so the count stays accurate, then returns
+// (gate, true) only when ALL hold: the same error has now recurred
+// repeatFailureThreshold times; the protocol is enabled and not suppressed by
+// --plain; and the Nudger has not already shown the debugging gate this session
+// (fire-once-per-gate, shared with maybeProtocolNudge). Otherwise ("", false).
+// Empty/whitespace error text is ignored outright — it neither advances nor
+// resets the run, since a blank error is not a distinct failure worth counting.
+func (r *REPL) recordFailure(errText string) (gate string, ok bool) {
+	sig := normalizeErrSignature(errText)
+	if sig == "" {
+		return "", false
+	}
+	if sig == r.lastErrSig {
+		r.errRepeat++
+	} else {
+		r.lastErrSig = sig
+		r.errRepeat = 1
+	}
+	if r.errRepeat < repeatFailureThreshold {
+		return "", false
+	}
+	if r.plain || r.cfg == nil || !r.cfg.Protocol.Enabled {
+		return "", false
+	}
+	return r.nudger.NudgeDebugging()
+}
+
+// maybeRepeatFailureNudge surfaces the debugging gate as a dim one-line
+// "[protocol] …" nudge when recordFailure reports the same error has recurred
+// enough times to warrant it. It shares maybeProtocolNudge's suppression rules
+// (checked inside recordFailure) and the same Nudger ledger, so the debugging
+// gate still fires at most once per session whether it was reached by a build/
+// test error's situated tell or by this repeated-failure path.
+func (r *REPL) maybeRepeatFailureNudge(errText string) {
+	if gate, ok := r.recordFailure(errText); ok {
 		fmt.Println(gcolor.HEX("#64748b").Sprintf("  [protocol] %s", gate))
 	}
 }

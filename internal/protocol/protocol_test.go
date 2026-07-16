@@ -417,3 +417,115 @@ func TestBuildSystemContext_EnabledByDefaultViaLoad(t *testing.T) {
 		t.Error("default-enabled config should inject the embedded default doc")
 	}
 }
+
+// ─── JIT tell-triggered injection: TellFor debugging class ────────────────────
+
+// TestTellFor_BuildTestSignaturesMapToDebuggingGate proves build/test/compile/
+// panic error text routes to the debug-by-disproof gate — the second tell class.
+func TestTellFor_BuildTestSignaturesMapToDebuggingGate(t *testing.T) {
+	cases := []struct {
+		name string
+		err  string
+	}{
+		{"go test per-test marker", "--- FAIL: TestFoo (0.00s)"},
+		{"go test summary line", "FAIL\tgithub.com/DojoGenesis/cli/internal/repl\t0.412s"},
+		{"panic header", "panic: runtime error: index out of range [3] with length 2"},
+		{"test failed prose", "1 test failed in package ./internal/protocol"},
+		{"build failed prose", "build failed: two errors"},
+		{"undefined symbol", "./repl.go:12:9: undefined: fooBar"},
+		{"cannot use type mismatch", "cannot use x (variable of type int) as string value in assignment"},
+		{"compile", "internal compiler error: could not compile package"},
+		{"assertion", "assertion failed: expected three, got four"},
+		{"case-insensitive", "PANIC: nil pointer dereference"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gate, ok := TellFor(tc.err)
+			if !ok {
+				t.Fatalf("TellFor(%q) ok=false, want true", tc.err)
+			}
+			if gate != debuggingGate {
+				t.Errorf("TellFor(%q) gate = %q, want the debugging gate %q", tc.err, gate, debuggingGate)
+			}
+		})
+	}
+}
+
+// TestTellFor_DebuggingNearMissesStaySilent guards the build/test class against
+// overreach: prose that merely contains "fail" (but none of the tokened shapes)
+// must NOT trip the gate.
+func TestTellFor_DebuggingNearMissesStaySilent(t *testing.T) {
+	for _, s := range []string{
+		"the request failed for an unknown reason", // "failed", but not "test failed" / "fail\t" / "--- fail"
+		"your prompt failed our safety filter",
+		"we could not fulfill that ask",
+	} {
+		if gate, ok := TellFor(s); ok {
+			t.Errorf("TellFor(%q) = (%q, true), want ok=false", s, gate)
+		}
+	}
+}
+
+// TestTellFor_WiringBeatsDebuggingWhenBothPresent proves the precedence: if an
+// error text somehow carries both a boundary signature and a build/test one, it
+// keeps the config-vs-code framing (wiring is checked first), so a connection
+// failure is never re-labeled a logic bug.
+func TestTellFor_WiringBeatsDebuggingWhenBothPresent(t *testing.T) {
+	gate, ok := TellFor("build failed: dial tcp 127.0.0.1:7340: connection refused")
+	if !ok {
+		t.Fatal("expected a tell to match")
+	}
+	if gate != configVsCodeGate {
+		t.Errorf("gate = %q, want config-vs-code (wiring precedence)", gate)
+	}
+}
+
+// TestNudger_DebuggingGateDeDupesAndIsIndependent proves the debugging gate, like
+// the config-vs-code gate, surfaces at most once — and that the two are
+// independent: showing one does not suppress the other.
+func TestNudger_DebuggingGateDeDupesAndIsIndependent(t *testing.T) {
+	var n Nudger
+
+	// A wiring error fires config-vs-code.
+	if g, ok := n.NudgeFor("connection refused"); !ok || g != configVsCodeGate {
+		t.Fatalf("wiring NudgeFor = (%q,%v), want config-vs-code,true", g, ok)
+	}
+	// A build error still fires — debugging is a distinct gate/key.
+	if g, ok := n.NudgeFor("panic: boom"); !ok || g != debuggingGate {
+		t.Fatalf("build NudgeFor = (%q,%v), want debugging,true", g, ok)
+	}
+	// A second, differently-worded build error is deduped (per gate, not string).
+	if g, ok := n.NudgeFor("--- FAIL: TestX"); ok {
+		t.Errorf("second debugging-class error should dedupe, got (%q,true)", g)
+	}
+}
+
+// TestNudger_NudgeDebugging_SharesLedgerWithNudgeFor proves the direct
+// NudgeDebugging entry point de-dupes against the text-driven NudgeFor path:
+// whichever fires first spends the single debugging-gate slot for the session.
+func TestNudger_NudgeDebugging_SharesLedgerWithNudgeFor(t *testing.T) {
+	// Direct-first: NudgeDebugging fires, then a build-tell NudgeFor is deduped.
+	var a Nudger
+	if g, ok := a.NudgeDebugging(); !ok || g != debuggingGate {
+		t.Fatalf("first NudgeDebugging = (%q,%v), want debugging,true", g, ok)
+	}
+	if g, ok := a.NudgeDebugging(); ok {
+		t.Errorf("second NudgeDebugging should dedupe, got (%q,true)", g)
+	}
+	if g, ok := a.NudgeFor("panic: later"); ok {
+		t.Errorf("NudgeFor debugging class after NudgeDebugging should dedupe, got (%q,true)", g)
+	}
+
+	// Text-first: a build-tell NudgeFor fires, then NudgeDebugging is deduped.
+	var b Nudger
+	if g, ok := b.NudgeFor("build failed"); !ok || g != debuggingGate {
+		t.Fatalf("build NudgeFor = (%q,%v), want debugging,true", g, ok)
+	}
+	if g, ok := b.NudgeDebugging(); ok {
+		t.Errorf("NudgeDebugging after a debugging-class NudgeFor should dedupe, got (%q,true)", g)
+	}
+	// The config-vs-code gate is still available on b — independence holds.
+	if g, ok := b.NudgeFor("connection refused"); !ok || g != configVsCodeGate {
+		t.Errorf("config-vs-code gate should remain available, got (%q,%v)", g, ok)
+	}
+}
