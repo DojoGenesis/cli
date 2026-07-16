@@ -30,11 +30,11 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	// has already moved the file, but it still cleans up on error paths.
 	defer os.Remove(tmpName) //nolint:errcheck
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		tmp.Close() //nolint:errcheck // best-effort cleanup; the write error above is the one we report
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		tmp.Close() //nolint:errcheck // best-effort cleanup; the sync error above is the one we report
 		return err
 	}
 	if err := tmp.Close(); err != nil {

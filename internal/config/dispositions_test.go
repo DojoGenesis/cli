@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -31,7 +32,7 @@ func TestLoadPresets_MissingDir(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	// No ~/.dojo/dispositions/ directory exists — should return builtins.
 	presets, err := LoadDispositionPresets()
@@ -49,7 +50,7 @@ func TestSaveAndLoadPreset(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	custom := DispositionPreset{
 		Name:       "custom",
@@ -182,7 +183,7 @@ func TestConfig_DispositionProfiles_RoundTrip(t *testing.T) {
 
 func TestConfig_Validate_CustomProfileAllowed(t *testing.T) {
 	cfg := &Config{
-		Gateway: GatewayConfig{URL: DefaultGatewayURL, Timeout: "60s"},
+		Gateway:  GatewayConfig{URL: DefaultGatewayURL, Timeout: "60s"},
 		Defaults: DefaultsConfig{Disposition: "myprofile"},
 		DispositionProfiles: map[string]DispositionPreset{
 			"myprofile": {Name: "myprofile", Pacing: "measured", Depth: "thorough", Tone: "warm", Initiative: "proactive"},
@@ -227,4 +228,101 @@ func TestMergeBuiltins(t *testing.T) {
 		}
 	}
 	t.Error("focused preset missing from merged results")
+}
+
+// ─── Discipline field ─────────────────────────────────────────────────────────
+//
+// Discipline is a 5th DispositionPreset field carrying cognitive discipline
+// (which operating gate this preset leans harder or lighter on), separate
+// from Pacing/Depth/Tone/Initiative which are pure interaction style. It
+// must be additive: existing file-based presets written before this field
+// existed still load fine, with Discipline defaulting to "".
+
+func TestBuiltinPresets_HaveDiscipline(t *testing.T) {
+	presets := BuiltinPresets()
+	byName := make(map[string]DispositionPreset, len(presets))
+	for _, p := range presets {
+		byName[p.Name] = p
+	}
+
+	for _, name := range []string{"focused", "balanced", "exploratory", "deliberate"} {
+		p, ok := byName[name]
+		if !ok {
+			t.Fatalf("BuiltinPresets() missing preset %q", name)
+		}
+		if p.Discipline == "" {
+			t.Errorf("preset %q has empty Discipline; every builtin should carry a discipline note", name)
+		}
+	}
+}
+
+// Each builtin's Discipline should actually describe that preset's intended
+// lean, not just be any non-empty string — pin the specific gate each names.
+func TestBuiltinPresets_DisciplineNamesExpectedGate(t *testing.T) {
+	byName := make(map[string]DispositionPreset)
+	for _, p := range BuiltinPresets() {
+		byName[p.Name] = p
+	}
+	cases := map[string]string{
+		"focused":     "output-channel",
+		"balanced":    "default gates",
+		"exploratory": "orchestrator-binding",
+		"deliberate":  "debugging gate",
+	}
+	for name, substr := range cases {
+		p, ok := byName[name]
+		if !ok {
+			t.Fatalf("BuiltinPresets() missing preset %q", name)
+		}
+		if !strings.Contains(p.Discipline, substr) {
+			t.Errorf("preset %q Discipline = %q; want it to mention %q", name, p.Discipline, substr)
+		}
+	}
+}
+
+func TestDispositionPreset_MissingDiscipline_LoadsAsZeroValue(t *testing.T) {
+	// A preset file written before the Discipline field existed — must still
+	// unmarshal cleanly, with Discipline defaulting to the zero value.
+	data := []byte(`{"name":"legacy","pacing":"swift","depth":"concise","tone":"direct","initiative":"reactive"}`)
+	var p DispositionPreset
+	if err := json.Unmarshal(data, &p); err != nil {
+		t.Fatalf("Unmarshal() of a pre-Discipline preset failed: %v", err)
+	}
+	if p.Discipline != "" {
+		t.Errorf(`Discipline should default to "" when absent from JSON, got %q`, p.Discipline)
+	}
+	// The rest of the preset must still be intact — the new field must not
+	// disturb existing decoding.
+	if p.Name != "legacy" || p.Pacing != "swift" || p.Depth != "concise" || p.Tone != "direct" || p.Initiative != "reactive" {
+		t.Errorf("preset fields corrupted by a missing discipline key: %+v", p)
+	}
+}
+
+func TestDispositionPreset_Discipline_RoundTrips(t *testing.T) {
+	tmp := t.TempDir()
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", tmp)
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
+
+	p := DispositionPreset{
+		Name: "with-discipline", Pacing: "swift", Depth: "concise", Tone: "direct", Initiative: "reactive",
+		Discipline: "custom discipline note",
+	}
+	if err := SaveDispositionPreset(p); err != nil {
+		t.Fatalf("SaveDispositionPreset() error: %v", err)
+	}
+
+	presets, err := LoadDispositionPresets()
+	if err != nil {
+		t.Fatalf("LoadDispositionPresets() error: %v", err)
+	}
+	for _, loaded := range presets {
+		if loaded.Name == "with-discipline" {
+			if loaded.Discipline != "custom discipline note" {
+				t.Errorf("Discipline did not round-trip: got %q", loaded.Discipline)
+			}
+			return
+		}
+	}
+	t.Fatal("saved preset with-discipline not found after LoadDispositionPresets()")
 }

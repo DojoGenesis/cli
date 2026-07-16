@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -199,7 +200,7 @@ func TestHealth_MockServer(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(want)
+		_ = json.NewEncoder(w).Encode(want)
 	}))
 	defer srv.Close()
 
@@ -265,7 +266,7 @@ func TestSeeds_MockServer(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(envelope)
+		_ = json.NewEncoder(w).Encode(envelope)
 	}))
 	defer srv.Close()
 
@@ -293,7 +294,7 @@ func TestSeeds_EmptyEnvelope(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(envelope)
+		_ = json.NewEncoder(w).Encode(envelope)
 	}))
 	defer srv.Close()
 
@@ -327,7 +328,7 @@ func TestAuthHeader_GetRequest(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(HealthResponse{Status: "ok"})
+		_ = json.NewEncoder(w).Encode(HealthResponse{Status: "ok"})
 	}))
 	defer srv.Close()
 
@@ -349,7 +350,7 @@ func TestAuthHeader_PostRequest(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"memory": Memory{ID: "m1", Content: "c"}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"memory": Memory{ID: "m1", Content: "c"}})
 	}))
 	defer srv.Close()
 
@@ -370,7 +371,7 @@ func TestAuthHeader_NoTokenOmitted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(HealthResponse{Status: "ok"})
+		_ = json.NewEncoder(w).Encode(HealthResponse{Status: "ok"})
 	}))
 	defer srv.Close()
 
@@ -675,7 +676,7 @@ func TestModels_Success(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -696,7 +697,7 @@ func TestProviders_Success(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -721,7 +722,7 @@ func TestMemories_Success(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -738,7 +739,7 @@ func TestMemories_Success(t *testing.T) {
 func TestGardenStats_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"total_seeds": 42})
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_seeds": 42})
 	}))
 	defer srv.Close()
 
@@ -790,7 +791,7 @@ func TestCreateAgent_Success(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(want)
+		_ = json.NewEncoder(w).Encode(want)
 	}))
 	defer srv.Close()
 
@@ -813,7 +814,7 @@ func TestAgents_Success(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -852,7 +853,7 @@ func TestSkillsAll_SinglePage(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -876,7 +877,7 @@ func TestSkillsAll_EmptyPage_StopsLoop(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -1033,5 +1034,148 @@ func TestWorkflowExecutionStream_5xx_ReturnsError(t *testing.T) {
 	err := c.WorkflowExecutionStream(context.Background(), "run-1", func(SSEChunk) {})
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+// ─── Stall watchdog (a gateway that connects then goes silent) ───────────────
+
+func TestChatStream_StallWatchdog(t *testing.T) {
+	old := streamStallTimeout
+	streamStallTimeout = 150 * time.Millisecond
+	defer func() { streamStallTimeout = old }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: hello\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Go silent — never send more data or [DONE]. The client watchdog must
+		// give up rather than hang forever.
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "", "5s")
+	var got []string
+	start := time.Now()
+	err := c.ChatStream(context.Background(), ChatRequest{Message: "hi"}, func(ch SSEChunk) {
+		got = append(got, ch.Data)
+	})
+	elapsed := time.Since(start)
+
+	if err == nil || !strings.Contains(err.Error(), "stalled") {
+		t.Fatalf("expected a stall error, got %v", err)
+	}
+	if len(got) != 1 || got[0] != "hello" {
+		t.Errorf("expected the single pre-stall chunk [hello], got %v", got)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("watchdog fired too slowly (%v) — should trip near the stall window", elapsed)
+	}
+}
+
+func TestParseSSE_NonCloserReaderNoWatchdog(t *testing.T) {
+	// A non-Closer reader (the test path) must not arm the watchdog; a complete
+	// stream still parses normally regardless of the stall window.
+	old := streamStallTimeout
+	streamStallTimeout = 10 * time.Millisecond
+	defer func() { streamStallTimeout = old }()
+
+	r := strings.NewReader("data: a\ndata: b\ndata: [DONE]\n")
+	var got []string
+	if err := parseSSE(r, func(c SSEChunk) { got = append(got, c.Data) }); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("expected [a b], got %v", got)
+	}
+}
+
+// ─── FriendlyError classifier ────────────────────────────────────────────────
+
+func TestFriendlyError_ConnectionRefused(t *testing.T) {
+	c := New("http://localhost:7340", "", "5s")
+	msg := c.FriendlyError(errors.New("dial tcp 127.0.0.1:7340: connect: connection refused"))
+	if !strings.Contains(msg, "cannot reach gateway at http://localhost:7340") {
+		t.Errorf("connection refused: got %q", msg)
+	}
+}
+
+func TestFriendlyError_NoSuchHost(t *testing.T) {
+	c := New("http://test-host", "", "5s")
+	msg := c.FriendlyError(errors.New(`Post "http://test-host/v1/chat": dial tcp: lookup test-host: no such host`))
+	if !strings.Contains(msg, "cannot reach gateway") {
+		t.Errorf("no such host: got %q", msg)
+	}
+}
+
+func TestFriendlyError_Stalled(t *testing.T) {
+	c := New("http://localhost:7340", "", "5s")
+	// A bare "gateway stalled" already reads cleanly; the classifier still routes
+	// it to the reach-the-gateway guidance because the socket is effectively dead.
+	msg := c.FriendlyError(errors.New("gateway stalled (no data for 120s)"))
+	if !strings.Contains(msg, "cannot reach gateway") && !strings.Contains(msg, "stalled") {
+		t.Errorf("stalled: got %q", msg)
+	}
+}
+
+func TestFriendlyError_AuthRejected(t *testing.T) {
+	c := New("http://localhost:7340", "", "5s")
+	for _, in := range []string{
+		"gateway returned 401: unauthorized",
+		"gateway returned 403: forbidden",
+	} {
+		msg := c.FriendlyError(errors.New(in))
+		if !strings.Contains(strings.ToLower(msg), "auth") {
+			t.Errorf("auth error %q: got %q, want auth guidance", in, msg)
+		}
+	}
+}
+
+func TestFriendlyError_Passthrough(t *testing.T) {
+	c := New("http://localhost:7340", "", "5s")
+	msg := c.FriendlyError(errors.New("unexpected parser state at token 3"))
+	if msg != "unexpected parser state at token 3" {
+		t.Errorf("passthrough: got %q, want the original message", msg)
+	}
+}
+
+func TestFriendlyError_Nil(t *testing.T) {
+	c := New("http://localhost:7340", "", "5s")
+	if msg := c.FriendlyError(nil); msg != "" {
+		t.Errorf("nil error: got %q, want empty", msg)
+	}
+}
+
+// ─── ChatRequest.SystemPrompt wire field ─────────────────────────────────────
+
+func TestChatRequest_SystemPrompt_Marshals(t *testing.T) {
+	req := ChatRequest{
+		Message:      "hello",
+		SessionID:    "sess-1",
+		SystemPrompt: "GENIUS PROTOCOL DOC",
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(b)
+	if !strings.Contains(got, `"system_prompt":"GENIUS PROTOCOL DOC"`) {
+		t.Errorf("expected system_prompt in wire body, got: %s", got)
+	}
+}
+
+func TestChatRequest_SystemPrompt_OmittedWhenEmpty(t *testing.T) {
+	// omitempty: a request that carries no protocol context must not emit the
+	// field, so existing callers and the current gateway see no change.
+	req := ChatRequest{Message: "hello", SessionID: "sess-1"}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "system_prompt") {
+		t.Errorf("empty SystemPrompt should be omitted, got: %s", string(b))
 	}
 }

@@ -9,7 +9,12 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DojoGenesis/cli/internal/art"
@@ -19,6 +24,7 @@ import (
 	"github.com/DojoGenesis/cli/internal/guide"
 	"github.com/DojoGenesis/cli/internal/hooks"
 	"github.com/DojoGenesis/cli/internal/plugins"
+	"github.com/DojoGenesis/cli/internal/protocol"
 	"github.com/DojoGenesis/cli/internal/providers"
 	"github.com/DojoGenesis/cli/internal/spirit"
 	"github.com/DojoGenesis/cli/internal/state"
@@ -36,6 +42,56 @@ type REPL struct {
 	turns    int    // number of successful chat turns
 	resumed  bool   // true when session was restored via --resume or /session resume
 	plain    bool   // true when --plain or --no-color is set; uses unstyled renderer output
+
+	// protocol injects the workspace genius protocol into the first chat turn of
+	// the session (and sets ChatRequest.SystemPrompt). Once-per-session, request
+	// context only — never rendered into output. nil-safe: Apply is inert when
+	// the protocol is disabled.
+	protocol *protocol.Injector
+
+	// nudger tracks which JIT protocol gates have already been surfaced this
+	// session so the tell-triggered nudge (maybeProtocolNudge) fires at most once
+	// per distinct gate. Zero value is ready to use; driven only from the single
+	// read-loop goroutine, so it needs no lock.
+	nudger protocol.Nudger
+
+	// Repeated-failure detection (the "Nth retry of the same thing" tell):
+	// lastErrSig is the normalized signature of the most recent failed chat turn
+	// and errRepeat is how many times in a row that same signature has recurred.
+	// Once the run reaches repeatFailureThreshold the debugging gate is surfaced
+	// through nudger — so it still de-dupes and still respects --plain and the
+	// protocol-enabled flag. A different error resets the run. Same read-loop
+	// goroutine as nudger, so no lock.
+	lastErrSig string
+	errRepeat  int
+
+	mu         sync.Mutex         // guards turnCancel
+	turnCancel context.CancelFunc // cancels the in-flight streaming turn; nil when idle
+}
+
+// beginTurn registers the cancel func for the streaming turn about to start so a
+// SIGINT can cancel just that turn. The returned func clears the registration.
+func (r *REPL) beginTurn(cancel context.CancelFunc) func() {
+	r.mu.Lock()
+	r.turnCancel = cancel
+	r.mu.Unlock()
+	return func() {
+		r.mu.Lock()
+		r.turnCancel = nil
+		r.mu.Unlock()
+	}
+}
+
+// cancelActiveTurn cancels the in-flight streaming turn, if any. Returns true
+// when a turn was actually cancelled. Called from the SIGINT watcher.
+func (r *REPL) cancelActiveTurn() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.turnCancel != nil {
+		r.turnCancel()
+		return true
+	}
+	return false
 }
 
 // New creates a REPL bound to the given config and gateway client.
@@ -56,11 +112,14 @@ func New(cfg *config.Config, gw *client.Client, resume bool, plain bool) *REPL {
 	}
 
 	r := &REPL{
-		cfg:      cfg,
-		gw:       gw,
-		turns:    0,
-		resumed:  false,
-		plain:    plain,
+		cfg:     cfg,
+		gw:      gw,
+		turns:   0,
+		resumed: false,
+		plain:   plain,
+		// Resolve the protocol context once at session start (project ./DOJO.md
+		// > ~/.dojo/DOJO.md > embedded default; empty when disabled).
+		protocol: protocol.NewInjector(cfg),
 	}
 
 	if resume {
@@ -76,12 +135,16 @@ func New(cfg *config.Config, gw *client.Client, resume bool, plain bool) *REPL {
 		}
 	} else {
 		r.session = fmt.Sprintf("dojo-cli-%s", time.Now().Format("20060102-150405"))
-		// Show last session hint (cosmetic only) when not resuming
-		if st, loadErr := state.Load(); loadErr == nil && st.LastSessionID != "" {
-			fmt.Printf("\n  %s %s\n",
-				gcolor.HEX("#94a3b8").Sprint("Last session:"),
-				gcolor.HEX("#e8b04a").Sprint(st.LastSessionID),
-			)
+		// Show last session hint (cosmetic only) when not resuming. Gated
+		// behind !plain like the welcome banner in printWelcome — piped/CI
+		// consumers under --plain get no decorative lines here either.
+		if !plain {
+			if st, loadErr := state.Load(); loadErr == nil && st.LastSessionID != "" {
+				fmt.Printf("\n  %s %s\n",
+					gcolor.HEX("#94a3b8").Sprint("Last session:"),
+					gcolor.HEX("#e8b04a").Sprint(st.LastSessionID),
+				)
+			}
 		}
 	}
 
@@ -193,9 +256,37 @@ func (r *REPL) syncProviderKeys(ctx context.Context) {
 	}
 }
 
+// fireSessionStart fires the SessionStart hooks. Called once from Run(),
+// after session/config setup completes and before the read loop begins, so
+// a plugin's startup hook (e.g. kata-harness's roll-status-injector, whose
+// entire job is injecting status at session start) sees a fully-initialized
+// session. Hook errors are logged, not fatal — same idiom as PreCommand/
+// PostCommand in handle().
+func (r *REPL) fireSessionStart(ctx context.Context) {
+	payload := map[string]any{"session": r.session, "resumed": r.resumed}
+	if err := r.runner.Fire(ctx, hooks.EventSessionStart, payload); err != nil {
+		log.Printf("[hooks] SessionStart error: %v", err)
+	}
+}
+
+// fireSessionEnd fires the SessionEnd hooks. Called via defer from Run() so
+// it runs on every exit path — normal exit, SIGTERM, a readline EOF/error,
+// or falling through to runPlain. Deliberately uses context.Background()
+// rather than Run()'s ctx: by the time Run() returns because ctx itself was
+// cancelled (SIGTERM), firing a "command" hook with that same cancelled ctx
+// would race exec.CommandContext's kill-watcher goroutine (see runCommand in
+// internal/hooks/runner.go) and could truncate or skip the hook entirely —
+// SessionEnd should still get a chance to complete.
+func (r *REPL) fireSessionEnd() {
+	payload := map[string]any{"session": r.session, "resumed": r.resumed}
+	if err := r.runner.Fire(context.Background(), hooks.EventSessionEnd, payload); err != nil {
+		log.Printf("[hooks] SessionEnd error: %v", err)
+	}
+}
+
 // Run starts the interactive loop. Returns when the user exits.
 func (r *REPL) Run(ctx context.Context) error {
-	printWelcome(r.cfg, r.session, r.resumed)
+	printWelcome(r.cfg, r.session, r.resumed, r.plain)
 
 	// Spirit: streak + session XP
 	if spiritSt, spiritErr := state.Load(); spiritErr == nil {
@@ -233,38 +324,43 @@ func (r *REPL) Run(ctx context.Context) error {
 
 		_ = spiritSt.Save()
 
-		// Display streak if > 1
-		if spiritSt.Spirit.StreakDays > 1 {
-			fmt.Printf("  %s%s\n",
-				gcolor.HEX("#94a3b8").Sprintf("%-16s", "streak:"),
-				gcolor.HEX("#ffd166").Sprintf("%d days", spiritSt.Spirit.StreakDays),
-			)
-		}
+		// Spirit visuals (streak, belt, promotions, achievements) are decorative —
+		// suppress them in plain/pipeline mode so stdout stays clean. XP state above
+		// is still recorded either way.
+		if !r.plain {
+			// Display streak if > 1
+			if spiritSt.Spirit.StreakDays > 1 {
+				fmt.Printf("  %s%s\n",
+					gcolor.HEX("#94a3b8").Sprintf("%-16s", "streak:"),
+					gcolor.HEX("#ffd166").Sprintf("%d days", spiritSt.Spirit.StreakDays),
+				)
+			}
 
-		// Display belt in welcome
-		belt := spirit.CurrentBelt(spiritSt.Spirit.XP)
-		if spiritSt.Spirit.XP > 0 {
-			fmt.Printf("  %s%s\n",
-				gcolor.HEX("#94a3b8").Sprintf("%-16s", "belt:"),
-				gcolor.HEX(belt.Color).Sprintf("%s %s (%d XP)", belt.Name, belt.Title, spiritSt.Spirit.XP),
-			)
-		}
+			// Display belt in welcome
+			belt := spirit.CurrentBelt(spiritSt.Spirit.XP)
+			if spiritSt.Spirit.XP > 0 {
+				fmt.Printf("  %s%s\n",
+					gcolor.HEX("#94a3b8").Sprintf("%-16s", "belt:"),
+					gcolor.HEX(belt.Color).Sprintf("%s %s (%d XP)", belt.Name, belt.Title, spiritSt.Spirit.XP),
+				)
+			}
 
-		if beltedUp {
-			fmt.Println()
-			fmt.Printf("  %s\n", gcolor.HEX("#ffd166").Sprint("BELT PROMOTION"))
-			fmt.Printf("  You are now: %s\n", gcolor.HEX(newBelt.Color).Sprintf("%s %s", newBelt.Name, newBelt.Title))
-			fmt.Printf("  %s\n", gcolor.HEX("#94a3b8").Sprintf("\"%s\"", spirit.BeltQuote(newBelt.Rank)))
+			if beltedUp {
+				fmt.Println()
+				fmt.Printf("  %s\n", gcolor.HEX("#ffd166").Sprint("BELT PROMOTION"))
+				fmt.Printf("  You are now: %s\n", gcolor.HEX(newBelt.Color).Sprintf("%s %s", newBelt.Name, newBelt.Title))
+				fmt.Printf("  %s\n", gcolor.HEX("#94a3b8").Sprintf("\"%s\"", spirit.BeltQuote(newBelt.Rank)))
+				fmt.Println()
+			}
+			for _, a := range newAchievements {
+				fmt.Printf("  %s %s %s\n",
+					gcolor.HEX("#ffd166").Sprint("Achievement:"),
+					gcolor.HEX("#f4a261").Sprint(a.Icon),
+					gcolor.HEX("#e8b04a").Sprint(a.Name),
+				)
+			}
 			fmt.Println()
 		}
-		for _, a := range newAchievements {
-			fmt.Printf("  %s %s %s\n",
-				gcolor.HEX("#ffd166").Sprint("Achievement:"),
-				gcolor.HEX("#f4a261").Sprint(a.Icon),
-				gcolor.HEX("#e8b04a").Sprint(a.Name),
-			)
-		}
-		fmt.Println()
 	}
 
 	// Push local API keys to the gateway so cloud providers get registered.
@@ -293,12 +389,37 @@ func (r *REPL) Run(ctx context.Context) error {
 		_ = st.Save()
 	}
 
+	// Session/config setup is complete as of the state save above — fire
+	// SessionStart now, before the read loop starts. SessionEnd fires via
+	// defer so it covers every return path out of Run() below.
+	r.fireSessionStart(ctx)
+	defer r.fireSessionEnd()
+
+	// Two-tier interrupt: a SIGINT that arrives while a response is streaming
+	// cancels ONLY that turn (the base ctx from main is not SIGINT-bound, so the
+	// session survives and the loop returns to the prompt). At an idle prompt the
+	// terminal is in raw mode and Ctrl+C is delivered to readline as a byte —
+	// handled below as ErrInterrupt — so this watcher fires only mid-stream.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sigCh:
+				r.cancelActiveTurn()
+			}
+		}
+	}()
+
 	rl, err := newReadline(r.turns)
 	if err != nil {
 		// Fallback to plain stdin if readline init fails (e.g. in pipes)
 		return r.runPlain(ctx)
 	}
-	defer rl.Close()
+	defer func() { _ = rl.Close() }()
 
 	for {
 		select {
@@ -313,6 +434,13 @@ func (r *REPL) Run(ctx context.Context) error {
 		line, err := rl.Readline()
 		if err != nil {
 			if err == readline.ErrInterrupt {
+				// Ctrl+C at the prompt clears a partial line; on an empty line
+				// (idle, or a second Ctrl+C right after cancelling a response)
+				// it quits cleanly.
+				if strings.TrimSpace(line) == "" {
+					fmt.Println("goodbye")
+					return nil
+				}
 				fmt.Println()
 				continue
 			}
@@ -442,6 +570,13 @@ func (r *REPL) handle(ctx context.Context, line string) error {
 
 				_ = spiritSt.Save()
 			}
+
+			// Done-means-verified: after a successful /agent dispatch or /run,
+			// run the opt-in build+test gate (Verify.AfterAgent, OFF by default).
+			// Best-effort — a red gate reports but never turns this into a failed
+			// command. REPL-only by construction: the one-shot path in
+			// cmd/dojo/main.go never calls handle(), so this can't fire there.
+			r.maybeVerifyAfterAgent(ctx, strings.ToLower(line))
 		}
 		return cmdErr
 	}
@@ -466,17 +601,50 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 		Stream:        true,
 		WorkspaceRoot: workspaceRoot,
 	}
+	// Carry the genius protocol on the FIRST turn only (once-per-session guard
+	// lives in the Injector). This mutates req.Message (immediate effect) and
+	// sets req.SystemPrompt (forward-compat) before the request goes out; it is
+	// request context, never echoed into the rendered response.
+	r.protocol.Apply(&req)
+
+	// Derive a per-turn context so a SIGINT cancels THIS response only (the
+	// watcher in Run calls cancelActiveTurn); the session's base ctx is untouched.
+	turnCtx, cancel := context.WithCancel(ctx)
+	clearTurn := r.beginTurn(cancel)
+	defer func() {
+		cancel()
+		clearTurn()
+	}()
 
 	fmt.Println()
 	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  dojo  "))
 
+	turnStart := time.Now()
 	var fullText strings.Builder
-	err := r.gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
+	var sawError bool
+	var lastErrText string
+	var tokensIn, tokensOut int
+	var sawUsage bool
+	err := r.gw.ChatStream(turnCtx, req, func(chunk client.SSEChunk) {
 		ev := ClassifyChunk(chunk)
+		if ev.Type == EventError {
+			sawError = true
+			lastErrText = ev.Content
+		}
 		rendered := ev.Render(r.plain)
 		if rendered != "" {
 			fmt.Print(rendered)
 			fullText.WriteString(ev.Content)
+		}
+		// Per-turn cost/token readout: opportunistically check every chunk for
+		// a usage payload (see extractUsage) rather than gating on a specific
+		// event name — in practice the gateway, if it sends usage at all, only
+		// attaches it to the terminal "done" event, but checking every chunk
+		// costs one cheap failed json.Unmarshal when absent and does not affect
+		// what gets rendered or how the stream proceeds.
+		if in, out, ok := extractUsage(chunk.Data); ok {
+			tokensIn, tokensOut = in, out
+			sawUsage = true
 		}
 	})
 
@@ -484,19 +652,62 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 	fmt.Println()
 
 	if err != nil {
-		if ctx.Err() != nil {
-			// User interrupted with Ctrl+C during streaming — not an error
-			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  [interrupted]"))
+		switch {
+		case ctx.Err() != nil:
+			// Base context ended (SIGTERM / shutdown) — let the loop exit.
+			return nil
+		case turnCtx.Err() != nil:
+			// Ctrl+C cancelled just this response; return to the prompt.
+			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  [cancelled]"))
+			return nil
+		default:
+			// Real failure (conn refused, DNS, auth, 5xx, stall) — show WHY,
+			// not a canned "stream interrupted". Combined with the error-event
+			// surfacing, the user now sees the actual cause.
+			gcolor.Red.Printf("  error: %s\n", r.gw.FriendlyError(err))
+			// JIT protocol nudge — pass the RAW error text, not FriendlyError's
+			// rewrite: FriendlyError collapses a "dial tcp … connection refused"
+			// into a URL-naming message that no longer carries the wiring tell.
+			r.maybeProtocolNudge(err.Error())
+			// Repeated-failure tell: the same error recurring across turns
+			// escalates to the debugging gate even when a single instance carried
+			// no situated tell. Same raw text, for the same reason as above.
+			r.maybeRepeatFailureNudge(err.Error())
 			return nil
 		}
-		// Stream dropped unexpectedly
-		fmt.Println(gcolor.HEX("#e8b04a").Sprint("  [stream interrupted — response may be incomplete]"))
-		r.turns++ // still count it — partial response was shown
+	}
+
+	if sawError {
+		// Stream ended cleanly but carried a gateway error event; it was already
+		// rendered inline. Don't count it as a successful turn or award XP.
+		r.maybeProtocolNudge(lastErrText)
+		r.maybeRepeatFailureNudge(lastErrText)
 		return nil
 	}
 
 	if fullText.Len() == 0 {
 		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  [no response — the gateway may have encountered an internal error]"))
+	}
+
+	// Per-turn cost/token readout — dim, interactive-only footer. Suppressed
+	// under --plain, which also covers --json: --json is a one-shot-only flag
+	// (cmd/dojo/main.go) that never reaches the REPL's chat() path at all, so
+	// gating on r.plain alone is sufficient here.
+	//
+	// As of this writing the gateway's /v1/chat stream never actually carries
+	// usage data: renderer.go's ClassifyChunk discards the "done" event's
+	// payload entirely, and both TestClassifyChunk_EventDone* fixtures in
+	// renderer_test.go model "done" data as either empty or a plain human
+	// string, never JSON. So sawUsage never flips true today and this block is
+	// a graceful no-op. It activates automatically — no further REPL changes
+	// needed — the moment the gateway attaches usage to any chunk, since
+	// extractUsage already recognizes every usage shape used elsewhere against
+	// this same gateway/providers (see extractUsage's doc comment).
+	if sawUsage && !r.plain {
+		total := tokensIn + tokensOut
+		fmt.Printf("  %s\n",
+			gcolor.HEX("#64748b").Sprintf("%s tokens · %.1fs", formatTokenCount(total), time.Since(turnStart).Seconds()),
+		)
 	}
 
 	// Spirit: award chat XP
@@ -507,6 +718,197 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 
 	r.turns++
 	return nil
+}
+
+// ─── JIT tell-triggered protocol nudge ────────────────────────────────────────
+
+// maybeProtocolNudge surfaces the single most relevant protocol gate as a dim
+// one-line "[protocol] …" nudge when a failed chat turn's error text matches a
+// wiring/boundary tell (protocol.TellFor). It is JIT by design — situated to the
+// moment of failure rather than recited up front — and deliberately quiet:
+//   - skipped when the protocol is disabled (Protocol.Enabled false, which
+//     already reflects DOJO_PROTOCOL_DISABLED via config.Load),
+//   - skipped under --plain/--no-color (r.plain) so piped/CI stdout stays clean
+//     (--json is one-shot-only and never reaches this REPL chat path),
+//   - fired at most once per distinct gate per session (r.nudger) so a recurring
+//     error never nags.
+func (r *REPL) maybeProtocolNudge(errText string) {
+	if r.plain || r.cfg == nil || !r.cfg.Protocol.Enabled {
+		return
+	}
+	if gate, ok := r.nudger.NudgeFor(errText); ok {
+		fmt.Println(gcolor.HEX("#64748b").Sprintf("  [protocol] %s", gate))
+	}
+}
+
+// ─── Repeated-failure tell ("Nth retry of the same thing") ────────────────────
+
+// repeatFailureThreshold is how many times the SAME chat error (by normalized
+// signature) must recur before the repeated-failure detector surfaces the
+// debugging gate. Three: the point at which retrying the same thing has visibly
+// stopped working and the move is to form a theory, not retry a fourth time.
+const repeatFailureThreshold = 3
+
+// errSigDigits matches runs of digits. normalizeErrSignature collapses them to a
+// single "#" so volatile numerics — ports, IP octets, line:col positions,
+// request IDs, backoff timings — don't split what is really one recurring error
+// into distinct signatures.
+var errSigDigits = regexp.MustCompile(`\d+`)
+
+// normalizeErrSignature reduces a raw error string to a stable signature for
+// repeated-failure detection: lowercase, digit-runs collapsed to "#", and all
+// whitespace (including the tabs `go test` emits) squeezed to single spaces. It
+// erases only the volatile numerics and keeps the error's words — the
+// class-carrying part — so two attempts at the same failing thing share a
+// signature while genuinely different errors do not. Deliberately measured: it
+// neither over-collapses distinct classes (their words still differ) nor splits
+// one class on incidental number or spacing noise.
+func normalizeErrSignature(s string) string {
+	s = strings.ToLower(s)
+	s = errSigDigits.ReplaceAllString(s, "#")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// recordFailure feeds one failed chat turn into the repeated-failure detector
+// and reports whether the debugging gate should surface now. It always updates
+// the (signature, count) tracker so the count stays accurate, then returns
+// (gate, true) only when ALL hold: the same error has now recurred
+// repeatFailureThreshold times; the protocol is enabled and not suppressed by
+// --plain; and the Nudger has not already shown the debugging gate this session
+// (fire-once-per-gate, shared with maybeProtocolNudge). Otherwise ("", false).
+// Empty/whitespace error text is ignored outright — it neither advances nor
+// resets the run, since a blank error is not a distinct failure worth counting.
+func (r *REPL) recordFailure(errText string) (gate string, ok bool) {
+	sig := normalizeErrSignature(errText)
+	if sig == "" {
+		return "", false
+	}
+	if sig == r.lastErrSig {
+		r.errRepeat++
+	} else {
+		r.lastErrSig = sig
+		r.errRepeat = 1
+	}
+	if r.errRepeat < repeatFailureThreshold {
+		return "", false
+	}
+	if r.plain || r.cfg == nil || !r.cfg.Protocol.Enabled {
+		return "", false
+	}
+	return r.nudger.NudgeDebugging()
+}
+
+// maybeRepeatFailureNudge surfaces the debugging gate as a dim one-line
+// "[protocol] …" nudge when recordFailure reports the same error has recurred
+// enough times to warrant it. It shares maybeProtocolNudge's suppression rules
+// (checked inside recordFailure) and the same Nudger ledger, so the debugging
+// gate still fires at most once per session whether it was reached by a build/
+// test error's situated tell or by this repeated-failure path.
+func (r *REPL) maybeRepeatFailureNudge(errText string) {
+	if gate, ok := r.recordFailure(errText); ok {
+		fmt.Println(gcolor.HEX("#64748b").Sprintf("  [protocol] %s", gate))
+	}
+}
+
+// ─── Verify loop (done-means-verified) ────────────────────────────────────────
+
+// maybeVerifyAfterAgent runs the opt-in verify gate after a successful /agent
+// dispatch or /run, printing a single clearly-labeled "[verify] PASS" or
+// "[verify] FAIL: …" line. Gated on Verify.AfterAgent (OFF by default;
+// DOJO_VERIFY_AFTER_AGENT flips it on) and on the command being a verify
+// trigger. Deliberately best-effort and non-blocking: a FAIL is reported, never
+// returned, so a red gate never aborts the session.
+func (r *REPL) maybeVerifyAfterAgent(ctx context.Context, lowerLine string) {
+	if r.cfg == nil || !r.cfg.Verify.AfterAgent || !isVerifyTrigger(lowerLine) {
+		return
+	}
+	line, passed := verifyGate(ctx)
+	if r.plain {
+		fmt.Printf("  %s\n", line)
+		return
+	}
+	hex := "#22c55e" // green for PASS
+	if !passed {
+		hex = "#ef4444" // red for FAIL
+	}
+	fmt.Println(gcolor.HEX(hex).Sprintf("  %s", line))
+}
+
+// isVerifyTrigger reports whether a successfully-dispatched slash-command line
+// is one whose work may have changed code — a /agent dispatch or a /run — and
+// so should be followed by the verify gate. It matches the canonical forms plus
+// the /agents alias, on the already-lowercased, field-split line, so extra
+// spacing never defeats it. Bare "/agent" (no dispatch) does not trigger.
+func isVerifyTrigger(lowerLine string) bool {
+	f := strings.Fields(lowerLine)
+	if len(f) == 0 {
+		return false
+	}
+	if f[0] == "/run" {
+		return true
+	}
+	return (f[0] == "/agent" || f[0] == "/agents") && len(f) >= 2 && f[1] == "dispatch"
+}
+
+// verifyGate runs the build+test gate — go build ./... then go test ./... at the
+// module root — and returns a single PASS/FAIL summary line plus whether it
+// passed. It is best-effort: a missing go.mod, an absent go toolchain, or a
+// failing step all resolve to a "[verify] FAIL: …" line rather than a returned
+// error. Steps run under ctx so a session shutdown cancels them. This mirrors
+// the /code gate's exec pattern (internal/commands/cmd_code.go); that package's
+// runGoCmd/findGoModRoot are unexported and unreachable from here, so the small
+// amount of exec logic is reproduced locally.
+func verifyGate(ctx context.Context) (line string, passed bool) {
+	root, err := goModRoot()
+	if err != nil {
+		return "[verify] FAIL: " + err.Error(), false
+	}
+	for _, args := range [][]string{
+		{"build", "./..."},
+		{"test", "./..."},
+	} {
+		cmd := exec.CommandContext(ctx, "go", args...)
+		cmd.Dir = root
+		if out, cmdErr := cmd.CombinedOutput(); cmdErr != nil {
+			return fmt.Sprintf("[verify] FAIL: go %s — %s", strings.Join(args, " "), verifyFailDetail(out, cmdErr)), false
+		}
+	}
+	return "[verify] PASS", true
+}
+
+// goModRoot walks up from the current working directory to the nearest
+// directory containing a go.mod — the module root the verify gate builds and
+// tests from. Mirrors internal/commands' findGoModRoot, which is unexported and
+// so not reachable from this package.
+func goModRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, statErr := os.Stat(filepath.Join(dir, "go.mod")); statErr == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("no go.mod found from %s upward", dir)
+		}
+		dir = parent
+	}
+}
+
+// verifyFailDetail condenses a failed gate's combined output into one concise
+// line for the FAIL summary: the first non-empty output line (where the go
+// toolchain prints the actual error), falling back to the process error when
+// there is no captured output. Truncated so a wall of build errors never floods
+// the prompt.
+func verifyFailDetail(out []byte, err error) string {
+	for _, ln := range strings.Split(string(out), "\n") {
+		if s := strings.TrimSpace(ln); s != "" {
+			return truncateSSE(s, 200)
+		}
+	}
+	return err.Error()
 }
 
 // truncateSSE truncates a string to max characters for log output.
@@ -555,11 +957,95 @@ func extractText(chunk client.SSEChunk) string {
 	return data
 }
 
+// extractUsage looks for token-usage counters in a raw SSE chunk payload
+// (client.SSEChunk.Data). client.SSEChunk carries no typed usage field —
+// Data is opaque JSON (or, per renderer_test.go's "done" fixtures, sometimes
+// not JSON at all) — so this is a best-effort, forward-compatible parse
+// rather than a decode against a known schema.
+//
+// It recognizes every usage shape already in use elsewhere against this same
+// gateway/providers, in this priority order:
+//   - {"usage": {"tokens_in": N, "tokens_out": N}} — the Dojo gateway's own
+//     naming, confirmed live on the /events "complete" entries consumed by
+//     internal/tui/pilot.go and the /api/telemetry/* rows in
+//     internal/commands/cmd_telemetry.go.
+//   - {"usage": {"input_tokens": N, "output_tokens": N}} — Anthropic's
+//     naming, used by the direct-API path in internal/providers/providers.go.
+//   - {"usage": {"prompt_tokens": N, "completion_tokens": N}} — OpenAI's
+//     naming, also used in internal/providers/providers.go.
+//
+// The same three key-pairs are also checked at the top level (no "usage"
+// wrapper), in case a future /v1/chat event flattens them. Returns
+// ok == false — a no-op for the caller — when data is empty, non-JSON, or
+// JSON that matches none of the above; that is the case for every "done"
+// payload seen in this codebase's tests today.
+func extractUsage(data string) (tokensIn, tokensOut int, ok bool) {
+	data = strings.TrimSpace(data)
+	if data == "" || data == "[DONE]" {
+		return 0, 0, false
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		return 0, 0, false
+	}
+
+	usage := m
+	if nested, isMap := m["usage"].(map[string]any); isMap {
+		usage = nested
+	}
+
+	pairs := [][2]string{
+		{"tokens_in", "tokens_out"},
+		{"input_tokens", "output_tokens"},
+		{"prompt_tokens", "completion_tokens"},
+	}
+	for _, p := range pairs {
+		in, inOK := numField(usage, p[0])
+		out, outOK := numField(usage, p[1])
+		if inOK || outOK {
+			return in, out, true
+		}
+	}
+	return 0, 0, false
+}
+
+// numField reads a numeric field out of a decoded-JSON object. encoding/json
+// decodes every JSON number into float64 when the target is map[string]any,
+// so this centralizes the float64→int conversion instead of repeating the
+// type assertion at each call site in extractUsage.
+func numField(m map[string]any, key string) (int, bool) {
+	v, ok := m[key].(float64)
+	if !ok {
+		return 0, false
+	}
+	return int(v), true
+}
+
+// formatTokenCount renders a token count as a compact, human-scannable
+// string for the per-turn footer. Under 1000 it prints the exact count
+// ("342"); at or above 1000 it prints a tilde-prefixed one-decimal "k"
+// figure ("~1.2k") — the tilde signals "approximate" without repeating the
+// word. A trailing ".0" is dropped so an even thousand reads "~1k", not
+// "~1.0k".
+func formatTokenCount(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	k := strings.TrimSuffix(fmt.Sprintf("%.1f", float64(n)/1000.0), ".0")
+	return "~" + k + "k"
+}
+
 // runPlain is the fallback when readline is unavailable (piped input, CI).
 func (r *REPL) runPlain(ctx context.Context) error {
 	// Note: printWelcome is already called by Run() before fallback here.
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 		fmt.Print("> ")
 		if !scanner.Scan() {
 			return nil
@@ -580,13 +1066,27 @@ func (r *REPL) runPlain(ctx context.Context) error {
 // ─── readline setup ──────────────────────────────────────────────────────────
 
 func newReadline(turns int) (*readline.Instance, error) {
+	// /guide start's children are generated from guide.All (internal/guide)
+	// instead of hand-maintained: guide.All has grown to 17 guides over time
+	// but this completer only ever offered the original 4 (welcome, spirit,
+	// agents, memory), so a static list would just drift stale again the next
+	// time a guide is added. Reading the catalogue here keeps it correct by
+	// construction — internal/guide itself is untouched.
+	guideStartItems := make([]readline.PrefixCompleterInterface, 0, len(guide.All))
+	for _, g := range guide.All {
+		guideStartItems = append(guideStartItems, readline.PcItem(g.ID))
+	}
+
 	completer := readline.NewPrefixCompleter(
 		readline.PcItem("/help"),
 		readline.PcItem("/health"),
-		readline.PcItem("/home"),
+		readline.PcItem("/home",
+			readline.PcItem("plain"),
+		),
 		readline.PcItem("/model",
 			readline.PcItem("ls"),
 			readline.PcItem("set"),
+			readline.PcItem("direct"),
 		),
 		readline.PcItem("/tools"),
 		readline.PcItem("/agent",
@@ -612,13 +1112,16 @@ func newReadline(turns int) (*readline.Instance, error) {
 		readline.PcItem("/workflow"),
 		readline.PcItem("/skill",
 			readline.PcItem("ls"),
+			readline.PcItem("search"),
 			readline.PcItem("get"),
 			readline.PcItem("inspect"),
 			readline.PcItem("tags"),
+			readline.PcItem("package-all"),
 		),
 		readline.PcItem("/doc"),
 		readline.PcItem("/session",
 			readline.PcItem("new"),
+			readline.PcItem("ls"),
 			readline.PcItem("resume"),
 		),
 		readline.PcItem("/run"),
@@ -626,7 +1129,6 @@ func newReadline(turns int) (*readline.Instance, error) {
 			readline.PcItem("ls"),
 			readline.PcItem("stats"),
 			readline.PcItem("plant"),
-			readline.PcItem("harvest"),
 			readline.PcItem("search"),
 			readline.PcItem("rm"),
 		),
@@ -650,8 +1152,15 @@ func newReadline(turns int) (*readline.Instance, error) {
 			readline.PcItem("fire"),
 		),
 		readline.PcItem("/settings",
+			readline.PcItem("effective"),
 			readline.PcItem("providers"),
 			readline.PcItem("set"),
+			readline.PcItem("profile",
+				readline.PcItem("ls"),
+				readline.PcItem("set"),
+				readline.PcItem("show"),
+				readline.PcItem("create"),
+			),
 		),
 		readline.PcItem("/init",
 			readline.PcItem("--force"),
@@ -660,13 +1169,16 @@ func newReadline(turns int) (*readline.Instance, error) {
 			readline.PcItem("--skip-seeds"),
 		),
 		readline.PcItem("/practice"),
-		readline.PcItem("/projects",
-			readline.PcItem("ls"),
-		),
+		readline.PcItem("/projects"),
 		readline.PcItem("/plugin",
 			readline.PcItem("ls"),
 			readline.PcItem("install"),
 			readline.PcItem("rm"),
+		),
+		readline.PcItem("/protocol",
+			readline.PcItem("status"),
+			readline.PcItem("harnesses"),
+			readline.PcItem("install"),
 		),
 		readline.PcItem("/disposition",
 			readline.PcItem("ls"),
@@ -678,12 +1190,7 @@ func newReadline(turns int) (*readline.Instance, error) {
 		readline.PcItem("/card"),
 		readline.PcItem("/guide",
 			readline.PcItem("ls"),
-			readline.PcItem("start",
-				readline.PcItem("welcome"),
-				readline.PcItem("spirit"),
-				readline.PcItem("agents"),
-				readline.PcItem("memory"),
-			),
+			readline.PcItem("start", guideStartItems...),
 			readline.PcItem("status"),
 			readline.PcItem("stop"),
 		),
@@ -719,7 +1226,39 @@ func newReadline(turns int) (*readline.Instance, error) {
 			readline.PcItem("build"),
 			readline.PcItem("vet"),
 			readline.PcItem("gate"),
+			readline.PcItem("undo"),
 		),
+		readline.PcItem("/craft",
+			readline.PcItem("adr"),
+			readline.PcItem("scout"),
+			readline.PcItem("claude-md",
+				readline.PcItem("--fix"),
+			),
+			readline.PcItem("memory",
+				readline.PcItem("ls"),
+				readline.PcItem("add"),
+				readline.PcItem("rm"),
+				readline.PcItem("prune"),
+				readline.PcItem("search"),
+			),
+			readline.PcItem("seed",
+				readline.PcItem("ls"),
+				readline.PcItem("plant"),
+				readline.PcItem("harvest"),
+				readline.PcItem("search"),
+				readline.PcItem("elevate"),
+			),
+			readline.PcItem("view"),
+			readline.PcItem("scaffold",
+				readline.PcItem("go-service"),
+				readline.PcItem("fullstack"),
+				readline.PcItem("orchestration"),
+				readline.PcItem("plugin"),
+				readline.PcItem("minimal"),
+			),
+			readline.PcItem("converge"),
+		),
+		readline.PcItem("/doctor"),
 		readline.PcItem("exit"),
 	)
 
@@ -739,14 +1278,18 @@ func historyPath() string {
 
 // ─── Welcome banner ──────────────────────────────────────────────────────────
 
-func printWelcome(cfg *config.Config, session string, resumed bool) {
+func printWelcome(cfg *config.Config, session string, resumed bool, plain bool) {
 	fmt.Println()
 
-	// Bonsai sigil — zen visual anchor
-	fmt.Print(art.SmallBonsaiString())
+	// Decorative banner (bonsai + gradient wordmark) is interactive-only —
+	// piped/CI consumers get the plain session/gateway lines below, nothing more.
+	if !plain {
+		// Bonsai sigil — zen visual anchor
+		fmt.Print(art.SmallBonsaiString())
 
-	// Sunset gradient wordmark
-	fmt.Println(sunsetWordmark("  Dojo CLI"))
+		// Sunset gradient wordmark
+		fmt.Println(sunsetWordmark("  Dojo CLI"))
+	}
 
 	// Session line: label in cloud-gray, value in warm-amber, "(resumed)" tag if applicable
 	if resumed {
@@ -781,16 +1324,20 @@ func printWelcome(cfg *config.Config, session string, resumed bool) {
 		}
 	}
 
-	// JetBrains Mono one-time tip
-	home, _ := os.UserHomeDir()
-	hintFile := home + "/.dojo/.mono-hint"
-	if _, err := os.Stat(hintFile); os.IsNotExist(err) {
-		gcolor.HEX("#94a3b8").Println("  tip: set terminal font to JetBrains Mono for best rendering")
-		// Create the marker file so the tip never shows again
-		_ = os.MkdirAll(home+"/.dojo", 0o755)
-		f, ferr := os.Create(hintFile)
-		if ferr == nil {
-			f.Close()
+	// JetBrains Mono one-time tip — decorative, interactive-only. Skipping it in
+	// plain mode also leaves the marker uncreated, so it still shows on the next
+	// interactive run.
+	if !plain {
+		home, _ := os.UserHomeDir()
+		hintFile := home + "/.dojo/.mono-hint"
+		if _, err := os.Stat(hintFile); os.IsNotExist(err) {
+			gcolor.HEX("#94a3b8").Println("  tip: set terminal font to JetBrains Mono for best rendering")
+			// Create the marker file so the tip never shows again
+			_ = os.MkdirAll(home+"/.dojo", 0o755)
+			f, ferr := os.Create(hintFile)
+			if ferr == nil {
+				_ = f.Close()
+			}
 		}
 	}
 

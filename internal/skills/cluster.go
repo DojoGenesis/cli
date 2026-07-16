@@ -399,4 +399,6 @@ func CategoryNames() []string {
 }
 
 // unexported accessor used in tests only — avoids exposing the field directly.
+//
+//nolint:unused // test-only accessor; kept for white-box tests in this package
 func (c category) displayName() string { return c.name }

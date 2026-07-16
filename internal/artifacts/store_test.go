@@ -8,6 +8,7 @@ package artifacts
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +69,128 @@ func TestDir(t *testing.T) {
 	// Different types → different dirs.
 	if Dir("alpha", TypeScout) == Dir("alpha", TypeSpec) {
 		t.Error("Dir should differ for different artifact types")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// safeArtifactPath — path-traversal containment (security regression)
+// ---------------------------------------------------------------------------
+
+func TestSafeArtifactPathRejectsTraversal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := Dir("proj-escape", TypeGeneric)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("setup mkdir: %v", err)
+	}
+
+	// The exact example from the audit: "../../../x" escaping the
+	// ~/.dojo/projects/<id>/<type> sandbox.
+	_, err := safeArtifactPath(dir, "../../../x")
+	if err == nil {
+		t.Fatal("safeArtifactPath should reject a '../../../x' traversal filename; got nil error")
+	}
+	if !strings.Contains(err.Error(), "escapes") {
+		t.Errorf("error = %v; want it to mention the path escaping the artifacts root", err)
+	}
+}
+
+func TestSafeArtifactPathRejectsDeepTraversal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := Dir("proj-escape-deep", TypeGeneric)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("setup mkdir: %v", err)
+	}
+
+	// Enough ".." segments to walk past HOME entirely, not just past the
+	// artifact-type directory — proves the check holds regardless of how
+	// far the traversal reaches.
+	_, err := safeArtifactPath(dir, strings.Repeat("../", 12)+"etc/passwd")
+	if err == nil {
+		t.Fatal("safeArtifactPath should reject a deep traversal filename; got nil error")
+	}
+}
+
+func TestSafeArtifactPathAcceptsNormalFilename(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := Dir("proj-ok", TypeGeneric)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("setup mkdir: %v", err)
+	}
+
+	got, err := safeArtifactPath(dir, "my-file.md")
+	if err != nil {
+		t.Fatalf("safeArtifactPath rejected a normal filename: %v", err)
+	}
+	if !strings.HasSuffix(got, "my-file.md") {
+		t.Errorf("safeArtifactPath = %q; want it to end in my-file.md", got)
+	}
+	// Use Contains rather than a HasPrefix(got, dir) check: on macOS dir may
+	// be spelled via the /var/folders symlink while safeArtifactPath returns
+	// the EvalSymlinks-resolved /private/var/folders form of the same path.
+	if !strings.Contains(got, "proj-ok") {
+		t.Errorf("safeArtifactPath = %q; want it rooted under the proj-ok artifacts dir", got)
+	}
+}
+
+func TestSafeArtifactPathAcceptsNestedSubdirFilename(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := Dir("proj-nested", TypeGeneric)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("setup mkdir: %v", err)
+	}
+
+	// Legitimate nested filenames (no "..") must still be allowed — this
+	// mirrors ensureMDExt's own test expectation ("sub/path/file").
+	got, err := safeArtifactPath(dir, "sub/path/file.md")
+	if err != nil {
+		t.Fatalf("safeArtifactPath rejected a nested filename: %v", err)
+	}
+	if !strings.HasSuffix(got, filepath.Join("sub", "path", "file.md")) {
+		t.Errorf("safeArtifactPath = %q; want it to end in sub/path/file.md", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Save / Read / Delete — path-traversal rejection through the public API
+// ---------------------------------------------------------------------------
+
+func TestSaveRejectsPathTraversal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	_, err := Save("proj-escape-save", TypeGeneric, "../../../x", "malicious content")
+	if err == nil {
+		t.Fatal("Save with a '../../../x' filename should return an error; got nil")
+	}
+}
+
+func TestReadRejectsPathTraversal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	// Seed a legitimate artifact so the project directory exists.
+	if _, err := Save("proj-escape-read", TypeGeneric, "legit", "content"); err != nil {
+		t.Fatalf("setup Save: %v", err)
+	}
+
+	_, err := Read("proj-escape-read", TypeGeneric, "../../../etc/passwd")
+	if err == nil {
+		t.Fatal("Read with a path-traversal filename should return an error; got nil")
+	}
+}
+
+func TestDeleteRejectsPathTraversal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	if _, err := Save("proj-escape-delete", TypeGeneric, "legit", "content"); err != nil {
+		t.Fatalf("setup Save: %v", err)
+	}
+
+	err := Delete("proj-escape-delete", TypeGeneric, "../../../etc/passwd")
+	if err == nil {
+		t.Fatal("Delete with a path-traversal filename should return an error; got nil")
 	}
 }
 

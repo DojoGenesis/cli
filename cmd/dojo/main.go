@@ -12,7 +12,9 @@ import (
 
 	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/protocol"
 	"github.com/DojoGenesis/cli/internal/repl"
+	"github.com/DojoGenesis/cli/internal/state"
 	gcolor "github.com/gookit/color"
 )
 
@@ -28,6 +30,7 @@ func main() {
 		flagOneShot     = flag.String("one-shot", "", "Execute a single message and exit (non-interactive)")
 		flagCompletion  = flag.String("completion", "", "Generate shell completions (bash|zsh|fish)")
 		flagResume      = flag.Bool("resume", false, "Resume the most recent session instead of starting fresh")
+		flagSession     = flag.String("session", "", "Resume a specific session ID instead of the most recent one (implies --resume; see /session ls)")
 		flagJSON        = flag.Bool("json", false, "Output JSON lines in one-shot mode (for scripted pipelines)")
 		flagPlain       = flag.Bool("plain", false, "Plain text output (no ANSI colors, for piped/CI usage)")
 	)
@@ -46,6 +49,20 @@ func main() {
 	if *flagCompletion != "" {
 		printCompletion(*flagCompletion)
 		os.Exit(0)
+	}
+
+	// Bare positional subcommands: `dojo version` / `dojo help` behave like the
+	// --version / -h flags. Neither needs config or a gateway, so handle them
+	// before anything else rather than launching the REPL.
+	if args := flag.Args(); len(args) > 0 {
+		switch args[0] {
+		case "version":
+			fmt.Printf("dojo %s\n", version)
+			os.Exit(0)
+		case "help":
+			flag.Usage()
+			os.Exit(0)
+		}
 	}
 
 	// Load config
@@ -73,12 +90,21 @@ func main() {
 	// Build gateway client
 	gw := client.New(cfg.Gateway.URL, cfg.Gateway.Token, cfg.Gateway.Timeout)
 
-	// Cancellable context — catches Ctrl+C
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// One-shot mode: send a single message and exit
+	// One-shot mode: send a single message and exit. Ctrl+C cancels the single
+	// turn and exits.
+	//
+	// NOTE (SessionStart/SessionEnd, W4-LIFECYCLE): deliberately NOT fired
+	// here. It would need its own plugin scan + hooks.Runner (this path never
+	// builds a repl.REPL, so there's nothing to reuse), but the actual
+	// blocker is that "prompt"/"agent" type hooks write straight to stdout
+	// via fmt.Printf regardless of --json (see runHook in
+	// internal/hooks/runner.go) — that would corrupt the JSON-lines contract
+	// --json promises to scripted/CI consumers of --one-shot. Revisit if/when
+	// hook stdout output is made --json-aware.
 	if *flagOneShot != "" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
 		workspaceRoot, _ := os.Getwd()
 		req := client.ChatRequest{
 			Message:       *flagOneShot,
@@ -87,8 +113,23 @@ func main() {
 			Stream:        true,
 			WorkspaceRoot: workspaceRoot,
 		}
-		err = gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
+		// Carry the genius protocol on this single turn (prepends req.Message and
+		// sets req.SystemPrompt when enabled; inert under DOJO_PROTOCOL_DISABLED).
+		protocol.NewInjector(cfg).Apply(&req)
+
+		// Record the first gateway error event. Without this a failed stream
+		// (429 quota, 404 dead model, …) renders blank and the process exits 0,
+		// so every failure looks like a silent success. See repl.EventError.
+		var (
+			errSeen bool
+			errMsg  string
+		)
+		streamErr := gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
 			ev := repl.ClassifyChunk(chunk)
+			if ev.Type == repl.EventError && !errSeen {
+				errSeen = true
+				errMsg = ev.Content
+			}
 			if *flagJSON {
 				if out := ev.RenderJSON(); out != "" {
 					fmt.Println(out)
@@ -102,14 +143,54 @@ func main() {
 		if !*flagJSON {
 			fmt.Println()
 		}
-		if err != nil {
-			fatalf("one-shot error: %s", err)
+
+		// Transport-level failure (couldn't connect, stalled, non-200 status).
+		if streamErr != nil {
+			if ctx.Err() != nil {
+				fmt.Fprintln(os.Stderr, "dojo: cancelled")
+				os.Exit(130)
+			}
+			fmt.Fprintf(os.Stderr, "dojo: %s\n", gw.FriendlyError(streamErr))
+			os.Exit(1)
+		}
+		// Transport succeeded but the stream carried a gateway error event —
+		// exit non-zero so scripts and CI see the failure.
+		if errSeen {
+			fmt.Fprintf(os.Stderr, "dojo: gateway error: %s\n", errMsg)
+			os.Exit(1)
 		}
 		return
 	}
 
+	// --json is a one-shot-only pipeline flag; in interactive mode it is a silent
+	// no-op today, so say so on stderr rather than ignoring it quietly.
+	if *flagJSON {
+		fmt.Fprintln(os.Stderr, "dojo: --json only applies to --one-shot mode; ignoring")
+	}
+
+	// Interactive REPL. The base context is deliberately NOT bound to SIGINT: a
+	// single Ctrl+C during a streaming turn must cancel only that turn (handled
+	// inside the REPL), not end the whole session. SIGTERM still shuts down.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	defer stop()
+
+	// --session <id> resumes one SPECIFIC session (Claude-Code-style
+	// resume-by-id), vs. --resume's "whatever was last active". repl.New's
+	// signature is unchanged (owned by a sibling change — see
+	// internal/repl/repl.go): its resume bool contract is "load
+	// state.LastSessionID and restore it verbatim". --session piggybacks on
+	// that exact contract instead of widening it: persist the requested id
+	// as the last session BEFORE constructing the REPL, then force
+	// resume=true so repl.New picks it up. Bare --resume (no --session) is
+	// untouched — same bool passthrough as before.
+	resume := *flagResume
+	if *flagSession != "" {
+		state.SaveSession(*flagSession)
+		resume = true
+	}
+
 	// Run REPL (plugin scan happens inside repl.New)
-	r := repl.New(cfg, gw, *flagResume, *flagPlain || *flagNoColor)
+	r := repl.New(cfg, gw, resume, *flagPlain || *flagNoColor)
 	if err := r.Run(ctx); err != nil {
 		fatalf("repl error: %s", err)
 	}
@@ -157,6 +238,8 @@ _dojo() {
     '/card:dojo profile card'
     '/warroom:scout vs challenger debate'
     '/craft:DojoCraft practitioner workbench'
+    '/doctor:read-only diagnostic'
+    '/protocol:KE harness discovery + install'
   )
   _describe 'command' commands
 }
@@ -164,7 +247,7 @@ compdef _dojo dojo
 `)
 	case "bash":
 		fmt.Print(`_dojo_completions() {
-  COMPREPLY=($(compgen -W "/help /health /home /model /tools /agent /skill /session /run /garden /trail /snapshot /trace /pilot /practice /projects /project /hooks /settings /guide /code /bloom /apps /workflow /doc /init /activity /plugin /disposition /telemetry /sensei /card /warroom /craft exit" -- "${COMP_WORDS[COMP_CWORD]}"))
+  COMPREPLY=($(compgen -W "/help /health /home /model /tools /agent /skill /session /run /garden /trail /snapshot /trace /pilot /practice /projects /project /hooks /settings /guide /code /bloom /apps /workflow /doc /init /activity /plugin /disposition /telemetry /sensei /card /warroom /craft /doctor /protocol exit" -- "${COMP_WORDS[COMP_CWORD]}"))
 }
 complete -F _dojo_completions dojo
 `)
@@ -203,6 +286,8 @@ complete -c dojo -f -a "/sensei" -d "koan from the sensei"
 complete -c dojo -f -a "/card" -d "dojo profile card"
 complete -c dojo -f -a "/warroom" -d "scout vs challenger debate"
 complete -c dojo -f -a "/craft" -d "DojoCraft practitioner workbench"
+complete -c dojo -f -a "/doctor" -d "read-only diagnostic"
+complete -c dojo -f -a "/protocol" -d "KE harness discovery + install"
 `)
 	default:
 		fmt.Fprintf(os.Stderr, "dojo: unknown shell %q (supported: bash, zsh, fish)\n", shell)

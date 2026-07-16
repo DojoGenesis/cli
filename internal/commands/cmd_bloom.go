@@ -16,8 +16,12 @@ import (
 // bloomCmd returns the /bloom command.
 func (r *Registry) bloomCmd() Command {
 	return Command{
-		Name:    "bloom",
-		Aliases: []string{"tree", "garden", "zen"},
+		Name: "bloom",
+		// "garden" is deliberately NOT an alias here: /garden is itself a
+		// registered command name, and Registry.Dispatch checks exact command
+		// names before scanning aliases — so a "garden" alias on this command
+		// would always lose to the real /garden and could never be reached.
+		Aliases: []string{"tree", "zen"},
 		Usage:   "/bloom",
 		Short:   "Watch your bonsai grow — animated zen garden",
 		Run: func(ctx context.Context, args []string) error {

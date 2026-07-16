@@ -133,10 +133,10 @@ func TestRecentSkipsMalformedLines(t *testing.T) {
 		t.Fatalf("open log for garbage write: %v", err)
 	}
 	if _, err := f.WriteString("THIS IS NOT JSON\n"); err != nil {
-		f.Close()
+		f.Close() //nolint:errcheck // cleanup before t.Fatalf; test already failing, close failure is not actionable
 		t.Fatalf("write garbage line: %v", err)
 	}
-	f.Close()
+	f.Close() //nolint:errcheck // test fixture teardown; write already succeeded, close failure would not affect the read-back assertions below
 
 	got, err := Recent(0)
 	if err != nil {

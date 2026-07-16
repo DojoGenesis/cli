@@ -105,6 +105,45 @@ func TestFire_CommandHook_ExecutesScript(t *testing.T) {
 	}
 }
 
+// ─── Fire() with SessionStart event (W4-LIFECYCLE) ────────────────────────────
+
+// TestFire_SessionStartHook_ExecutesScript proves the new EventSessionStart
+// constant flows through Runner.Fire() exactly like the pre-existing events
+// (matching is purely string-based in Fire(); nothing event-specific is
+// hardcoded there). The REPL fires this event once at startup — see
+// internal/repl.REPL.fireSessionStart — so this is the mechanism a
+// kata-harness-shaped SessionStart hook now relies on to actually run.
+func TestFire_SessionStartHook_ExecutesScript(t *testing.T) {
+	tmp := t.TempDir()
+	markerFile := filepath.Join(tmp, "session-start-ran.txt")
+
+	ps := []plugins.Plugin{
+		{
+			Name:    "session-start-plugin",
+			Version: "1.0",
+			Path:    tmp,
+			HookRules: []plugins.HookRule{
+				{
+					Event: EventSessionStart,
+					Hooks: []plugins.HookDef{
+						{Type: "command", Command: "touch " + markerFile},
+					},
+				},
+			},
+		},
+	}
+
+	r := New(ps)
+	err := r.Fire(context.Background(), EventSessionStart, map[string]any{"session": "dojo-cli-test", "resumed": false})
+	if err != nil {
+		t.Fatalf("Fire() returned error: %v", err)
+	}
+
+	if _, statErr := os.Stat(markerFile); os.IsNotExist(statErr) {
+		t.Errorf("SessionStart hook did not run: marker file %q was not created", markerFile)
+	}
+}
+
 // ─── Fire() with async hook ───────────────────────────────────────────────────
 
 func TestFire_AsyncHook_ReturnsBeforeCompletion(t *testing.T) {
@@ -406,7 +445,7 @@ func TestMatcherGlob(t *testing.T) {
 	}
 
 	// Remove marker to reuse it.
-	os.Remove(markerFile)
+	_ = os.Remove(markerFile)
 
 	// Should NOT match: command is /health, not garden*
 	err = r.Fire(context.Background(), EventPreCommand, map[string]any{"command": "/health"})
@@ -451,6 +490,54 @@ func TestIfConditionFalse(t *testing.T) {
 	}
 }
 
+// ─── shellFor (Windows vs POSIX shell selection) ──────────────────────────────
+
+func TestShellFor(t *testing.T) {
+	cases := []struct {
+		goos     string
+		wantExe  string
+		wantFlag string
+	}{
+		{"windows", "cmd", "/C"},
+		{"linux", "sh", "-c"},
+		{"darwin", "sh", "-c"},
+		{"freebsd", "sh", "-c"},
+	}
+	for _, tc := range cases {
+		exe, flag := shellFor(tc.goos)
+		if exe != tc.wantExe || flag != tc.wantFlag {
+			t.Errorf("shellFor(%q) = (%q, %q), want (%q, %q)", tc.goos, exe, flag, tc.wantExe, tc.wantFlag)
+		}
+	}
+}
+
+// ─── matcherMatches: malformed glob is handled, not silently swallowed ───────
+
+func TestMatcherMatches_BadPattern_ReturnsFalseNotPanic(t *testing.T) {
+	// "[" is an unterminated character class — path.Match returns
+	// ErrBadPattern. Before the fix this was swallowed via
+	// `matched, _ := path.Match(...)`, so a malformed matcher just never
+	// fired with zero signal to the plugin author. The observable contract
+	// (no match, no panic) is unchanged by the fix — what changed is that
+	// it's now logged instead of silently disappearing; this test pins the
+	// safe-default behavior since matcherMatches has no injectable logger
+	// to assert the log line itself against.
+	if matcherMatches("[", map[string]any{"command": "/garden ls"}) {
+		t.Error("matcherMatches with a malformed glob should return false, not match")
+	}
+}
+
+func TestMatcherMatches_ValidPattern_StillWorks(t *testing.T) {
+	// Sanity check alongside the bad-pattern test: a well-formed glob is
+	// unaffected by checking the path.Match error.
+	if !matcherMatches("garden*", map[string]any{"command": "/garden ls"}) {
+		t.Error("matcherMatches(\"garden*\", .../garden ls) should match")
+	}
+	if matcherMatches("garden*", map[string]any{"command": "/health"}) {
+		t.Error("matcherMatches(\"garden*\", .../health) should not match")
+	}
+}
+
 // ─── "if" condition: env var ──────────────────────────────────────────────────
 
 func TestIfConditionEnvVar(t *testing.T) {
@@ -478,7 +565,7 @@ func TestIfConditionEnvVar(t *testing.T) {
 	r := New(ps)
 
 	// Env var NOT set → hook should not fire.
-	os.Unsetenv(envVar)
+	_ = os.Unsetenv(envVar)
 	err := r.Fire(context.Background(), EventPreCommand, nil)
 	if err != nil {
 		t.Fatalf("Fire() returned error: %v", err)

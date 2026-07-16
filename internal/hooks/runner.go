@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"runtime"
 	"strings"
 	"time"
 
@@ -19,11 +20,12 @@ import (
 
 // Event names that dojo-cli fires.
 const (
-	EventPreCommand  = "PreCommand"
-	EventPostCommand = "PostCommand"
-	EventPostSkill   = "PostSkill"
-	EventPostAgent   = "PostAgent"
-	EventSessionEnd  = "SessionEnd"
+	EventPreCommand   = "PreCommand"
+	EventPostCommand  = "PostCommand"
+	EventPostSkill    = "PostSkill"
+	EventPostAgent    = "PostAgent"
+	EventSessionStart = "SessionStart"
+	EventSessionEnd   = "SessionEnd"
 )
 
 // Runner executes hook rules for a given event.
@@ -107,7 +109,16 @@ func matcherMatches(matcher string, payload map[string]any) bool {
 	if idx := strings.IndexByte(cmd, ' '); idx >= 0 {
 		cmd = cmd[:idx]
 	}
-	matched, _ := path.Match(matcher, cmd)
+	matched, err := path.Match(matcher, cmd)
+	if err != nil {
+		// A malformed glob (e.g. an unbalanced "[") used to fail silently
+		// here and the hook would just never fire, with no signal to the
+		// plugin author about why. Surface it instead — still treated as
+		// "no match" so behavior otherwise stays the same, it's just no
+		// longer silent.
+		log.Printf("[hooks] invalid matcher %q: %v", matcher, err)
+		return false
+	}
 	return matched
 }
 
@@ -174,16 +185,30 @@ func runHTTPHook(ctx context.Context, url string, payload map[string]any) error 
 		log.Printf("[hooks] http hook: request error: %v", err)
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	log.Printf("[hooks] http hook: response status %s", resp.Status)
 	return nil
 }
 
+// shellFor returns the shell executable and its "run this string" flag for
+// the given GOOS. Stock Windows has no `sh` on PATH, so hook commands there
+// need `cmd /C`; every other supported platform (darwin, linux, ...) uses
+// the POSIX `sh -c`. Taking goos as a parameter — instead of reading
+// runtime.GOOS inline — keeps the branch a pure, table-testable function.
+func shellFor(goos string) (exe string, flag string) {
+	if goos == "windows" {
+		return "cmd", "/C"
+	}
+	return "sh", "-c"
+}
+
 // runCommand executes a shell command string with CLAUDE_PLUGIN_ROOT set to
-// the plugin's directory. The command is passed to sh -c so it can use
-// shell expansion (e.g. variable substitution, quoting).
+// the plugin's directory. The command is run through sh -c (cmd /C on
+// Windows — see shellFor) so it can use shell expansion (e.g. variable
+// substitution, quoting).
 func runCommand(ctx context.Context, command, pluginRoot string) error {
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	exe, flag := shellFor(runtime.GOOS)
+	cmd := exec.CommandContext(ctx, exe, flag, command)
 	cmd.Env = append(cmd.Environ(),
 		"CLAUDE_PLUGIN_ROOT="+pluginRoot,
 	)

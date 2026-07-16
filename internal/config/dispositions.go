@@ -9,21 +9,48 @@ import (
 )
 
 // DispositionPreset defines an ADA disposition configuration.
+//
+// Pacing/Depth/Tone/Initiative are pure interaction style — how fast, how
+// deep, how warm, how eagerly the agent acts. Discipline is a separate axis:
+// a short note on which cognitive gate(s) this preset leans on harder or
+// lighter than the default (orchestrator-binding, output-channel discipline,
+// the debugging gate, etc. — see the workspace CLAUDE.md's Operating Gates).
+// Style says how it talks; discipline says what it's stricter or looser
+// about while doing so.
+//
+// Discipline is additive: a preset loaded from JSON/YAML written before this
+// field existed simply unmarshals it to "" (Go's zero value for string), so
+// old file-based presets under ~/.dojo/dispositions/*.json keep loading
+// exactly as before — an empty Discipline just means "no note; behave like
+// the default gate set."
 type DispositionPreset struct {
 	Name       string `json:"name"`
 	Pacing     string `json:"pacing"`
 	Depth      string `json:"depth"`
 	Tone       string `json:"tone"`
 	Initiative string `json:"initiative"`
+	Discipline string `json:"discipline,omitempty"`
 }
 
 // BuiltinPresets returns the four canonical disposition presets.
 func BuiltinPresets() []DispositionPreset {
 	return []DispositionPreset{
-		{Name: "focused", Pacing: "swift", Depth: "concise", Tone: "direct", Initiative: "reactive"},
-		{Name: "balanced", Pacing: "measured", Depth: "thorough", Tone: "balanced", Initiative: "proactive"},
-		{Name: "exploratory", Pacing: "measured", Depth: "exhaustive", Tone: "warm", Initiative: "autonomous"},
-		{Name: "deliberate", Pacing: "deliberate", Depth: "exhaustive", Tone: "direct", Initiative: "proactive"},
+		{
+			Name: "focused", Pacing: "swift", Depth: "concise", Tone: "direct", Initiative: "reactive",
+			Discipline: "tighten output-channel discipline: route big or reusable output to a file with a short status+path, keep chat lean, no exploratory detours",
+		},
+		{
+			Name: "balanced", Pacing: "measured", Depth: "thorough", Tone: "balanced", Initiative: "proactive",
+			Discipline: "default gates: apply the standard operating gates as written, no loosening or tightening",
+		},
+		{
+			Name: "exploratory", Pacing: "measured", Depth: "exhaustive", Tone: "warm", Initiative: "autonomous",
+			Discipline: "relax orchestrator-binding: widen search, favor breadth and inline investigation over immediately dispatching agents",
+		},
+		{
+			Name: "deliberate", Pacing: "deliberate", Depth: "exhaustive", Tone: "direct", Initiative: "proactive",
+			Discipline: "enforce the debugging gate hard: no fix lands without a stated causal chain and a repro that toggles the bug on and off",
+		},
 	}
 }
 

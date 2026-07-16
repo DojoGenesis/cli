@@ -18,11 +18,11 @@ func (r *Registry) codeCmd() Command {
 	return Command{
 		Name:    "code",
 		Aliases: []string{"c"},
-		Usage:   "/code [read <file>|diff [file]|test [pkg]|build|vet|gate]",
+		Usage:   "/code [read <file>|diff [file]|test [pkg]|build|vet|gate|undo]",
 		Short:   "File operations and build tooling for self-build workflows",
 		Run: func(ctx context.Context, args []string) error {
 			if len(args) == 0 {
-				return fmt.Errorf("usage: /code [read <file>|diff [file]|test [pkg]|build|vet|gate]")
+				return fmt.Errorf("usage: /code [read <file>|diff [file]|test [pkg]|build|vet|gate|undo]")
 			}
 			sub := strings.ToLower(args[0])
 
@@ -39,8 +39,10 @@ func (r *Registry) codeCmd() Command {
 				return codeVet()
 			case "gate":
 				return codeGate()
+			case "undo":
+				return codeUndo()
 			default:
-				return fmt.Errorf("unknown subcommand %q — try: read, diff, test, build, vet, gate", sub)
+				return fmt.Errorf("unknown subcommand %q — try: read, diff, test, build, vet, gate, undo", sub)
 			}
 		},
 	}
@@ -91,9 +93,8 @@ func codeRead(args []string) error {
 	if len(args) >= 2 {
 		if parts := strings.SplitN(args[1], ":", 2); len(parts) == 2 {
 			if n, err := fmt.Sscanf(parts[0], "%d", &startLine); n == 1 && err == nil {
-				if n, err := fmt.Sscanf(parts[1], "%d", &endLine); n == 1 && err == nil {
-					// Valid range.
-				}
+				// Valid start; also attempt to parse the end of the range.
+				_, _ = fmt.Sscanf(parts[1], "%d", &endLine)
 			}
 		}
 	}
@@ -175,6 +176,73 @@ func codeGate() error {
 	}
 
 	gcolor.Bold.Print(gcolor.HEX("#22c55e").Sprint("  All gates passed.\n\n"))
+	return nil
+}
+
+// codeUndo previews unstaged working-tree changes to tracked files and,
+// after explicit confirmation, reverts them. It is the git-backed safety
+// net for a self-build session — undoing a bad edit without touching
+// staged content, commit history, or untracked files.
+//
+// Preview and revert both use the "." pathspec, so they act on the same
+// scope: the current directory and below (the "project root" boundary
+// codeRead enforces for file reads). Neither step ever leaves that scope
+// or the enclosing git repository.
+func codeUndo() error {
+	if _, err := exec.LookPath("git"); err != nil {
+		return fmt.Errorf("git not found in PATH — /code undo requires git")
+	}
+	if err := exec.Command("git", "rev-parse", "--is-inside-work-tree").Run(); err != nil {
+		return fmt.Errorf("not a git repository (or any parent up to /)")
+	}
+
+	// Capture (rather than stream) the diff so we can decide whether there's
+	// anything to do, and so the confirmation prompt sits directly below the
+	// exact change-set it describes.
+	stat, err := exec.Command("git", "diff", "--stat", "--", ".").Output()
+	if err != nil {
+		return fmt.Errorf("could not read git diff: %w", err)
+	}
+
+	if len(strings.TrimSpace(string(stat))) == 0 {
+		fmt.Println()
+		gcolor.HEX("#94a3b8").Print("  Nothing to revert — no unstaged changes to tracked files.")
+		fmt.Println()
+		fmt.Println()
+		return nil
+	}
+
+	fmt.Println()
+	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  /code undo — would revert these unstaged changes:"))
+	fmt.Println()
+	fmt.Println()
+	fmt.Print(string(stat))
+	fmt.Println()
+	gcolor.HEX("#94a3b8").Print("  Staged changes and commit history are untouched; untracked files are left alone.")
+	fmt.Println()
+	fmt.Println()
+
+	// Reuses the same y/N stdin idiom as plugins.InstallConfirmed (see
+	// cmd_plugin.go) — craftConfirm lives in cmd_craft.go but is
+	// package-visible, so no duplicate confirm helper is needed here.
+	if !craftConfirm("Revert these unstaged changes?") {
+		gcolor.HEX("#94a3b8").Print("  Cancelled — no changes made.")
+		fmt.Println()
+		fmt.Println()
+		return nil
+	}
+
+	// git restore (no --staged) rewrites the worktree from the index only:
+	// staged content and history are structurally untouched, and untracked
+	// files are structurally out of scope (nothing to restore them from).
+	if err := runGitCmd("restore", "--", "."); err != nil {
+		return fmt.Errorf("git restore failed: %w", err)
+	}
+
+	fmt.Println()
+	gcolor.HEX("#22c55e").Print("  Reverted. Working tree now matches the index.")
+	fmt.Println()
+	fmt.Println()
 	return nil
 }
 

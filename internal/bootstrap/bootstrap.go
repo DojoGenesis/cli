@@ -13,6 +13,7 @@ import (
 	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/config"
 	"github.com/DojoGenesis/cli/internal/ioutilx"
+	"github.com/DojoGenesis/cli/internal/protocol"
 	"github.com/DojoGenesis/cli/internal/state"
 	gcolor "github.com/gookit/color"
 )
@@ -27,21 +28,24 @@ type Options struct {
 
 // Result summarises what was created or skipped.
 type Result struct {
-	SettingsCreated     bool
-	PluginsCopied       int
-	PluginsSkipped      int
-	DispositionsWritten int
-	MCPConfigWritten    bool
-	SeedsPlanted        int
-	SeedsSkipped        int
-	Errors              []string
+	SettingsCreated        bool
+	PluginsCopied          int
+	PluginsSkipped         int
+	DispositionsWritten    int
+	MCPConfigWritten       bool
+	ProtocolOverlayWritten bool
+	SeedsPlanted           int
+	SeedsSkipped           int
+	Errors                 []string
 }
 
 // Run executes the full bootstrap sequence and prints a summary.
 func Run(ctx context.Context, opts Options, gw *client.Client, w io.Writer) (*Result, error) {
 	dojoDir := config.DojoDir()
-	os.MkdirAll(dojoDir, 0700)
 	r := &Result{}
+	if err := os.MkdirAll(dojoDir, 0700); err != nil {
+		r.Errors = append(r.Errors, "mkdir: "+err.Error())
+	}
 
 	// 1. Settings
 	created, err := writeSettings(dojoDir, opts)
@@ -69,6 +73,19 @@ func Run(ctx context.Context, opts Options, gw *client.Client, w io.Writer) (*Re
 		r.Errors = append(r.Errors, "mcp: "+err.Error())
 	}
 	r.MCPConfigWritten = mcpWritten
+
+	// 4b. Protocol overlay — drop an editable ~/.dojo/DOJO.md from the embedded
+	// default so the operator can see and override the genius protocol. NEVER
+	// clobbers an existing overlay (WriteDefaultOverlay is a no-op when present),
+	// so we stat first to report whether this run actually wrote it.
+	overlayPath := filepath.Join(dojoDir, "DOJO.md")
+	_, overlayStatErr := os.Stat(overlayPath)
+	overlayExisted := overlayStatErr == nil
+	if err := protocol.WriteDefaultOverlay(dojoDir); err != nil {
+		r.Errors = append(r.Errors, "protocol overlay: "+err.Error())
+	} else {
+		r.ProtocolOverlayWritten = !overlayExisted
+	}
 
 	// 5. Seeds (if gateway available)
 	if !opts.SkipSeeds && gw != nil {
@@ -121,10 +138,18 @@ func writeSettings(dojoDir string, opts Options) (bool, error) {
 	return true, ioutilx.AtomicWriteFile(path, data, 0600)
 }
 
-// firstPartyPlugins is the canonical list of first-party Dojo plugins.
+// firstPartyPlugins is the canonical list of first-party Dojo plugins installed
+// by /init. kata-harness is the ONLY ratified harness (kata-harness RATIFIED
+// 2026-07-13) and must ship by default; bring-loop, community-skills, and
+// dojo-craft are first-party companions that were previously omitted. All four
+// live alongside the originals in CoworkPluginsByDojoGenesis/plugins/.
 var firstPartyPlugins = []string{
 	"agent-orchestration",
+	"bring-loop",
+	"community-skills",
 	"continuous-learning",
+	"dojo-craft",
+	"kata-harness",
 	"pretext-pdf",
 	"skill-forge",
 	"specification-driven-development",
@@ -146,7 +171,9 @@ func copyPlugins(dojoDir string, opts Options) (copied, skipped int, errs []stri
 	}
 
 	destDir := filepath.Join(dojoDir, "plugins")
-	os.MkdirAll(destDir, 0755)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		errs = append(errs, fmt.Sprintf("create plugins dir: %s", err))
+	}
 
 	for _, name := range firstPartyPlugins {
 		src := filepath.Join(source, name)
@@ -167,7 +194,11 @@ func copyPlugins(dojoDir string, opts Options) (copied, skipped int, errs []stri
 
 		// Remove existing if force
 		if opts.Force {
-			os.RemoveAll(dst)
+			if err := os.RemoveAll(dst); err != nil {
+				errs = append(errs, fmt.Sprintf("remove %s: %s", name, err))
+				skipped++
+				continue
+			}
 		}
 
 		if err := copyDir(src, dst); err != nil {
@@ -245,7 +276,9 @@ initiative: moderate
 // writeDispositions writes the four YAML preset files to ~/.dojo/dispositions/.
 func writeDispositions(dojoDir string, force bool) (int, error) {
 	dir := filepath.Join(dojoDir, "dispositions")
-	os.MkdirAll(dir, 0755)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return 0, err
+	}
 	written := 0
 	for name, content := range dispositionPresets {
 		path := filepath.Join(dir, name)
@@ -345,51 +378,70 @@ func plantSeeds(ctx context.Context, gw *client.Client) (planted, skipped int, e
 
 // printSummary writes a formatted bootstrap summary to w.
 func printSummary(w io.Writer, r *Result) {
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, gcolor.HEX("#e8b04a").Sprint("  Dojo workspace initialized"))
-	fmt.Fprintln(w)
+	// w is process stdout or an in-memory test buffer; a write failure here
+	// has no better place to be reported, so it's intentionally swallowed.
+	fw := func(a ...any) {
+		fmt.Fprintln(w, a...) //nolint:errcheck // best-effort write
+	}
+	fwf := func(format string, a ...any) {
+		fmt.Fprintf(w, format, a...) //nolint:errcheck // best-effort write
+	}
+
+	fw()
+	fw(gcolor.HEX("#e8b04a").Sprint("  Dojo workspace initialized"))
+	fw()
 
 	check := gcolor.HEX("#7fb88c").Sprint("✓")
 	skip := gcolor.HEX("#94a3b8").Sprint("–")
 
 	if r.SettingsCreated {
-		fmt.Fprintf(w, "  %s  settings.json created\n", check)
+		fwf("  %s  settings.json created\n", check)
 	} else {
-		fmt.Fprintf(w, "  %s  settings.json (already exists)\n", skip)
+		fwf("  %s  settings.json (already exists)\n", skip)
 	}
 
 	if r.PluginsCopied > 0 {
-		fmt.Fprintf(w, "  %s  %d plugins installed\n", check, r.PluginsCopied)
+		fwf("  %s  %d plugins installed\n", check, r.PluginsCopied)
 	}
 	if r.PluginsSkipped > 0 {
-		fmt.Fprintf(w, "  %s  %d plugins skipped\n", skip, r.PluginsSkipped)
+		fwf("  %s  %d plugins skipped\n", skip, r.PluginsSkipped)
 	}
 
 	if r.DispositionsWritten > 0 {
-		fmt.Fprintf(w, "  %s  %d disposition presets written\n", check, r.DispositionsWritten)
+		fwf("  %s  %d disposition presets written\n", check, r.DispositionsWritten)
 	} else {
-		fmt.Fprintf(w, "  %s  dispositions (already exist)\n", skip)
+		fwf("  %s  dispositions (already exist)\n", skip)
 	}
 
 	if r.MCPConfigWritten {
-		fmt.Fprintf(w, "  %s  mcp.json created (7 servers)\n", check)
+		fwf("  %s  mcp.json created (7 servers)\n", check)
 	} else {
-		fmt.Fprintf(w, "  %s  mcp.json (already exists)\n", skip)
+		fwf("  %s  mcp.json (already exists)\n", skip)
 	}
 
+	// Protocol is on by default and carried onto every chat/agent turn. Say so,
+	// and name both override paths in one line so the operator never has to hunt.
+	if r.ProtocolOverlayWritten {
+		fwf("  %s  DOJO.md protocol overlay created\n", check)
+	} else {
+		fwf("  %s  DOJO.md protocol overlay (already exists)\n", skip)
+	}
+	fwf("  %s  genius protocol active — override with project ./DOJO.md, or DOJO_PROTOCOL_DISABLED=1 to disable\n",
+		gcolor.HEX("#7fb88c").Sprint("›"))
+
 	if r.SeedsPlanted > 0 {
-		fmt.Fprintf(w, "  %s  %d starter seeds planted\n", check, r.SeedsPlanted)
+		fwf("  %s  %d starter seeds planted\n", check, r.SeedsPlanted)
 	}
 	if r.SeedsSkipped > 0 {
-		fmt.Fprintf(w, "  %s  %d seeds skipped\n", skip, r.SeedsSkipped)
+		fwf("  %s  %d seeds skipped\n", skip, r.SeedsSkipped)
 	}
 
 	if len(r.Errors) > 0 {
-		fmt.Fprintln(w)
+		fw()
 		for _, e := range r.Errors {
-			fmt.Fprintf(w, "  %s  %s\n", gcolor.HEX("#e8b04a").Sprint("!"), gcolor.HEX("#94a3b8").Sprint(e))
+			fwf("  %s  %s\n", gcolor.HEX("#e8b04a").Sprint("!"), gcolor.HEX("#94a3b8").Sprint(e))
 		}
 	}
 
-	fmt.Fprintln(w)
+	fw()
 }

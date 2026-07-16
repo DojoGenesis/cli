@@ -69,6 +69,8 @@ Settings are loaded from `~/.dojo/settings.json`. A missing file is not an error
 | `DOJO_PROVIDER`        | `defaults.provider` |
 | `DOJO_TELEMETRY_URL`   | telemetry API base  |
 | `DOJO_SKILLS_PATH`     | default skill dir for `/skill package-all` |
+| `DOJO_PROTOCOL_DISABLED` | any non-empty value disables the genius protocol (`protocol.enabled`) |
+| `DOJO_PROTOCOL_PATH`   | `protocol.path` — explicit override doc, takes precedence over `./DOJO.md` |
 
 ## Requirements
 
@@ -84,6 +86,7 @@ Settings are loaded from `~/.dojo/settings.json`. A missing file is not an error
 | `--disposition <d>`   | ADA disposition preset: `focused`, `balanced`, `exploratory`, `deliberate`  |
 | `--one-shot <msg>`    | Execute a single message and exit (non-interactive)                         |
 | `--resume`            | Resume the most recent session instead of starting fresh                    |
+| `--session <id>`      | Resume a specific session ID instead of the most recent one (implies `--resume`) |
 | `--no-color`          | Disable color output                                                        |
 | `--plain`             | Plain text output — no ANSI colors (for piped or CI use)                    |
 | `--json`              | JSON lines output in one-shot mode (for scripted pipelines)                 |
@@ -105,6 +108,12 @@ dojo --one-shot "summarize the last run" --json | jq '.text'
 dojo --resume
 ```
 
+**Resume a specific session:**
+
+```bash
+dojo --session dojo-cli-20260409-142301
+```
+
 **Shell completions:**
 
 ```bash
@@ -123,6 +132,7 @@ Type a message without `/` to chat with the gateway. Use slash commands for stru
 |-----------------------------------|--------------------------------------------------------|
 | `/help`                           | Show available commands                                |
 | `/health`                         | Gateway health and uptime stats                        |
+| `/doctor`                         | Full diagnostic: gateway, providers, config, protocol, harnesses |
 | `/home`                           | Workspace state overview (TUI panel)                   |
 | `/home plain`                     | Workspace state in plain text                          |
 | `/model [ls]`                     | List available models and providers                    |
@@ -163,7 +173,10 @@ Type a message without `/` to chat with the gateway. Use slash commands for stru
 |-------------------------|------------------------------------------|
 | `/session`              | Show active session ID                   |
 | `/session new`          | Start a fresh session                    |
-| `/session <id>`         | Resume a prior session by ID             |
+| `/session ls`           | List recent sessions from local history, most-recent-first |
+| `/session resume`       | Resume the most recently active session  |
+| `/session resume <id>`  | Resume one specific session by ID (warns if not found in local history) |
+| `/session <id>`         | Switch directly to a session ID (not verified against gateway) |
 
 Session IDs follow the format `dojo-cli-YYYYMMDD-HHmmss` when created via `/session new`.
 
@@ -218,6 +231,16 @@ Track statuses: `pending`, `in-progress`, `completed`, `blocked`.
 | `/hooks ls`               | List loaded hook rules from all plugins                 |
 | `/hooks fire <event>`     | Manually fire a hook event (for testing)                |
 
+### Protocol & Harnesses
+
+| Command                             | Description                                               |
+|--------------------------------------|-------------------------------------------------------------|
+| `/protocol` or `/protocol status`   | Genius-protocol enabled/source + kata-harness install state |
+| `/protocol harnesses`               | List the KE harness catalog: status, ratified, installed    |
+| `/protocol install <name> [--yes]`  | Install a ratified, locally-available harness into `plugins.path` |
+
+See [Genius Protocol](#genius-protocol) below for how the protocol doc is resolved and overridden.
+
 ### Dispositions
 
 | Command                                                     | Description                           |
@@ -269,6 +292,7 @@ Track statuses: `pending`, `in-progress`, `completed`, `blocked`.
 | `/code build`                   | Run `go build ./...`                              |
 | `/code vet`                     | Run `go vet ./...`                                |
 | `/code gate`                    | Run the full build gate: build + test + vet       |
+| `/code undo`                    | Preview unstaged changes to tracked files, then revert on confirmation |
 
 ## Directory Structure
 
@@ -333,6 +357,33 @@ Create and save custom presets with `/disposition create`:
 /disposition create sprint fast shallow assertive high
 ```
 
+## Genius Protocol
+
+A workspace "genius protocol" — a compact operating doctrine — is injected into every session **by default**. The CLI prepends it to the first turn of a chat or `--one-shot` run (and sets it as the system prompt for gateways that support one); later turns rely on the gateway's own session context instead of re-sending it.
+
+Resolution order (first match wins):
+
+1. an explicit `protocol.path` in `~/.dojo/settings.json`
+2. `./DOJO.md` in the current project directory
+3. `~/.dojo/DOJO.md`
+4. the embedded default doc
+
+**Override or disable it:**
+
+```bash
+# Disable for one run
+DOJO_PROTOCOL_DISABLED=1 dojo
+```
+
+```json
+// ~/.dojo/settings.json — disable persistently
+{ "protocol": { "enabled": false } }
+```
+
+Or drop a `DOJO.md` file in the project root (or `~/.dojo/DOJO.md` for a machine-wide override) to replace the content instead of turning it off — either is picked up automatically ahead of the embedded default.
+
+`/init` writes an editable `~/.dojo/DOJO.md` starter copy (never overwriting one that already exists) and installs the ratified **kata-harness** plugin alongside the rest of the first-party plugin set. Check current state anytime with `/doctor` (PROTOCOL + HARNESSES sections) or `/protocol status`; browse and install other KE harnesses with `/protocol harnesses` and `/protocol install <name>` — see [Protocol & Harnesses](#protocol--harnesses) above.
+
 ## Plugin System
 
 Plugins extend the CLI with hook rules and skills. Place plugin directories under `~/.dojo/plugins/` (or the path configured in `plugins.path`), or use `/plugin install` to clone from a git URL.
@@ -386,15 +437,18 @@ XP is earned through guided tutorials (`/guide`), daily practice sessions, and r
 
 ## Session Management
 
-Sessions scope conversation history on the gateway. Each `dojo` invocation generates a session ID automatically. You can rotate or resume sessions mid-session.
+Sessions scope conversation history on the gateway. Each `dojo` invocation generates a session ID automatically. You can rotate, list, or resume sessions mid-session.
 
 ```
 /session                     # show current session ID
 /session new                 # rotate to a fresh session
-/session dojo-cli-20260409   # resume a specific session
+/session ls                  # list recent sessions from local history
+/session resume              # resume the most recently active session
+/session resume dojo-cli-20260409-142301  # resume one specific session by ID
+/session dojo-cli-20260409-142301         # switch directly (not verified against gateway)
 ```
 
-Use `--resume` at startup to continue the most recent session automatically.
+Use `--resume` at startup to continue the most recent session automatically, or `--session <id>` to resume one specific session by ID (implies `--resume`).
 
 ## Design
 

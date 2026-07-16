@@ -248,7 +248,7 @@ func chatAnthropic(ctx context.Context, req DirectChatRequest) (*DirectChatRespo
 
 	msgs := make([]anthropicMessage, len(req.Messages))
 	for i, m := range req.Messages {
-		msgs[i] = anthropicMessage{Role: m.Role, Content: m.Content}
+		msgs[i] = anthropicMessage(m)
 	}
 
 	body := anthropicRequest{
@@ -278,7 +278,7 @@ func chatAnthropic(ctx context.Context, req DirectChatRequest) (*DirectChatRespo
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: http request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // response body close error is not actionable after a completed read
 
 	if resp.StatusCode != http.StatusOK {
 		var errBody map[string]interface{}
@@ -336,7 +336,7 @@ type openAIResponse struct {
 func chatOpenAICompatible(ctx context.Context, req DirectChatRequest, endpoint string) (*DirectChatResponse, error) {
 	msgs := make([]openAIMessage, len(req.Messages))
 	for i, m := range req.Messages {
-		msgs[i] = openAIMessage{Role: m.Role, Content: m.Content}
+		msgs[i] = openAIMessage(m)
 	}
 
 	body := openAIRequest{
@@ -365,7 +365,7 @@ func chatOpenAICompatible(ctx context.Context, req DirectChatRequest, endpoint s
 	if err != nil {
 		return nil, fmt.Errorf("%s: http request: %w", req.Provider, err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // response body close error is not actionable after a completed read
 
 	if resp.StatusCode != http.StatusOK {
 		var errBody map[string]interface{}
@@ -462,8 +462,8 @@ func chatGoogle(ctx context.Context, req DirectChatRequest) (*DirectChatResponse
 	}
 
 	url := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
-		model, req.APIKey,
+		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent",
+		model,
 	)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
@@ -471,13 +471,20 @@ func chatGoogle(ctx context.Context, req DirectChatRequest) (*DirectChatResponse
 		return nil, fmt.Errorf("google: build request: %w", err)
 	}
 	httpReq.Header.Set("content-type", "application/json")
+	// The API key travels in a header, not the URL query string: net/http
+	// embeds the full request URL — including query params — in the *url.Error
+	// it returns from Client.Do on a network/TLS failure, which would
+	// otherwise leak the live key to terminal output, logs, or CI on any
+	// transient error. x-goog-api-key is Google's documented header-auth
+	// alternative to "?key=" for the Generative Language API.
+	httpReq.Header.Set("x-goog-api-key", req.APIKey)
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("google: http request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // response body close error is not actionable after a completed read
 
 	if resp.StatusCode != http.StatusOK {
 		var errBody map[string]interface{}

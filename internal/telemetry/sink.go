@@ -37,11 +37,23 @@ type Sink struct {
 	mu        sync.Mutex
 	client    *http.Client
 	done      chan struct{}
+	disabled  bool
 }
+
+// telemetryNoticeOnce ensures the activation notice printed by Start (below)
+// fires at most once per process, no matter how many Sinks get created or
+// started — e.g. /pilot can be entered and exited more than once per session.
+var telemetryNoticeOnce sync.Once
 
 // New creates a Sink that will POST events for the given session ID.
 // The telemetry base URL is read from DOJO_TELEMETRY_URL or defaults to
 // the production worker endpoint.
+//
+// If DOJO_TELEMETRY_DISABLED is set (to any non-empty value), the returned
+// Sink is inert: Ingest, Start, and Flush all become no-ops and nothing is
+// ever sent over the network. This is the opt-out for the SSE event data
+// /pilot otherwise POSTs every 5s with no other disclosure — see Start for
+// the one-time notice printed when telemetry does activate.
 func New(sessionID string) *Sink {
 	base := os.Getenv("DOJO_TELEMETRY_URL")
 	if base == "" {
@@ -55,12 +67,17 @@ func New(sessionID string) *Sink {
 		buffer:    make([]TelemetryEvent, 0, 64),
 		client:    &http.Client{Timeout: 10 * time.Second},
 		done:      make(chan struct{}),
+		disabled:  os.Getenv("DOJO_TELEMETRY_DISABLED") != "",
 	}
 }
 
 // Ingest appends a telemetry event to the buffer. It never blocks the caller
-// beyond the mutex acquisition.
+// beyond the mutex acquisition. A no-op when telemetry is disabled — there's
+// no point buffering events that Flush will never send.
 func (s *Sink) Ingest(eventType string, ts int64, data map[string]any) {
+	if s.disabled {
+		return
+	}
 	s.mu.Lock()
 	s.buffer = append(s.buffer, TelemetryEvent{
 		Type: eventType,
@@ -72,7 +89,18 @@ func (s *Sink) Ingest(eventType string, ts int64, data map[string]any) {
 
 // Start launches a background goroutine that flushes the event buffer every
 // 5 seconds. It stops when ctx is cancelled or Close is called.
+//
+// If telemetry is disabled, Start is a no-op — no goroutine is launched and
+// nothing is ever POSTed. Otherwise, the first time any Sink actually
+// activates in this process, a one-line disclosure notice is printed to
+// stderr so the periodic POSTing isn't silent.
 func (s *Sink) Start(ctx context.Context) {
+	if s.disabled {
+		return
+	}
+	telemetryNoticeOnce.Do(func() {
+		fmt.Fprintf(os.Stderr, "telemetry -> %s (DOJO_TELEMETRY_DISABLED=1 to opt out)\n", s.baseURL)
+	})
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -93,7 +121,11 @@ func (s *Sink) Start(ctx context.Context) {
 
 // Flush drains the buffer and POSTs all buffered events to the ingest
 // endpoint. On HTTP or network errors it logs a warning but never panics.
+// A no-op returning nil when telemetry is disabled.
 func (s *Sink) Flush() error {
+	if s.disabled {
+		return nil
+	}
 	// Swap buffer under lock so Ingest() isn't blocked during the POST.
 	s.mu.Lock()
 	if len(s.buffer) == 0 {
@@ -124,7 +156,7 @@ func (s *Sink) Flush() error {
 	if err != nil {
 		return fmt.Errorf("POST %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // idiomatic best-effort close; status code is validated separately below
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("POST %s returned %d", url, resp.StatusCode)

@@ -180,15 +180,15 @@ func UpdateStreak(s *SpiritState, now time.Time) int {
 
 	daysSince := int(now.Sub(lastActive).Hours() / 24)
 
-	switch {
-	case daysSince == 0:
+	switch daysSince {
+	case 0:
 		// Same day — no new streak increment, but award bonus if not yet today
 		// (shouldn't happen because of StreakBonusDate check above)
 		return 0
-	case daysSince == 1:
+	case 1:
 		// Consecutive day — streak continues
 		s.StreakDays++
-	case daysSince == 2:
+	case 2:
 		// Grace window (48h) — streak continues
 		s.StreakDays++
 	default:

@@ -23,6 +23,7 @@ const (
 	EventWarning                     // Warning or notice
 	EventDone                        // Stream complete
 	EventEmpty                       // No content to render
+	EventError                       // Gateway/provider error — always rendered visibly
 )
 
 // String returns a human-readable label for the event type.
@@ -44,6 +45,8 @@ func (et EventType) String() string {
 		return "done"
 	case EventEmpty:
 		return "empty"
+	case EventError:
+		return "error"
 	default:
 		return "unknown"
 	}
@@ -94,6 +97,21 @@ func ClassifyChunk(chunk client.SSEChunk) RenderEvent {
 		}
 		return RenderEvent{Type: EventWarning, Content: content}
 
+	case "error":
+		// P0: gateway/provider failures (429 quota, 404 dead model, etc.) arrive
+		// as event:error. These MUST be surfaced — never swallowed into a blank
+		// "success". The error message lives under the "error" key.
+		msg := extractError(data)
+		if msg == "" {
+			msg = "unknown gateway error"
+		}
+		return RenderEvent{Type: EventError, Content: msg}
+
+	case "intent_classified", "provider_selected":
+		// Routing telemetry — useful to the gateway, noise to the user. Drop
+		// quietly so plain/pipeline stdout carries only the real answer.
+		return RenderEvent{Type: EventEmpty}
+
 	case "done":
 		return RenderEvent{Type: EventDone}
 	}
@@ -117,7 +135,10 @@ func ClassifyChunk(chunk client.SSEChunk) RenderEvent {
 // RenderJSON formats the event as a JSON line for scripted pipelines.
 // Each event is a single-line JSON object with type, content, and meta fields.
 func (re RenderEvent) RenderJSON() string {
-	if re.Type == EventEmpty || re.Type == EventDone {
+	// EventThinking is a reasoning placeholder, not answer content — keep it out
+	// of the JSON pipeline. EventError DOES flow through: a scripted consumer must
+	// see {"type":"error",...} so a failed run is observable, not silently empty.
+	if re.Type == EventEmpty || re.Type == EventDone || re.Type == EventThinking {
 		return ""
 	}
 	obj := map[string]any{
@@ -139,8 +160,11 @@ func (re RenderEvent) Render(plain bool) string {
 		return re.Content
 
 	case EventThinking:
+		// Plain/pipeline mode: the reasoning placeholder ("Processing your
+		// request…") is not answer content — suppress it so stdout stays clean.
+		// Interactive mode keeps the dim reasoning trace.
 		if plain {
-			return "[thinking] " + re.Content
+			return ""
 		}
 		return gcolor.HEX("#94a3b8").Sprint(re.Content)
 
@@ -175,6 +199,12 @@ func (re RenderEvent) Render(plain bool) string {
 			return "[warning] " + re.Content
 		}
 		return gcolor.HEX("#f4a261").Sprintf("[warning] %s", re.Content)
+
+	case EventError:
+		if plain {
+			return "error: " + re.Content
+		}
+		return gcolor.HEX("#ef4444").Sprintf("error: %s", re.Content)
 
 	case EventDone, EventEmpty:
 		return ""
@@ -215,6 +245,36 @@ func extractContentFromData(data string) string {
 	}
 
 	// Not JSON — plain text chunk
+	return data
+}
+
+// extractError pulls a human-readable message from an event:error payload.
+// It handles {"error":"msg"}, {"error":{"message":"msg"}}, and bare {"message":"msg"};
+// non-JSON payloads are returned verbatim so a failure is never rendered blank.
+func extractError(data string) string {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		return data
+	}
+	if v, ok := m["error"]; ok {
+		switch e := v.(type) {
+		case string:
+			if e != "" {
+				return e
+			}
+		case map[string]any:
+			for _, key := range []string{"message", "content", "text", "detail"} {
+				if s, ok := e[key].(string); ok && s != "" {
+					return s
+				}
+			}
+		}
+	}
+	for _, key := range []string{"message", "content", "text", "detail"} {
+		if s, ok := m[key].(string); ok && s != "" {
+			return s
+		}
+	}
 	return data
 }
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/DojoGenesis/cli/internal/art"
 	"github.com/DojoGenesis/cli/internal/client"
+	"github.com/DojoGenesis/cli/internal/mdrender"
 	"github.com/DojoGenesis/cli/internal/orchestration"
 	"github.com/DojoGenesis/cli/internal/skills"
 	"github.com/DojoGenesis/cli/internal/tui"
@@ -165,23 +166,7 @@ func (r *Registry) runCmd() Command {
 					printKV("status", colorStatus(status.Status))
 					fmt.Println()
 
-					// Poll DAG until terminal state.
-					for {
-						dag, pollErr := r.gw.OrchestrationDAG(ctx, status.ExecutionID)
-						if pollErr != nil {
-							fmt.Println(gcolor.HEX("#ef4444").Sprintf("  poll error: %v", pollErr))
-							break
-						}
-						r.printDAGNodes(dag.Nodes)
-						if dag.Status == "completed" || dag.Status == "failed" {
-							fmt.Println()
-							printKV("result", colorStatus(dag.Status))
-							fmt.Println()
-							return nil
-						}
-						time.Sleep(800 * time.Millisecond)
-					}
-					return nil
+					return r.pollDAGUntilTerminal(ctx, status.ExecutionID)
 				}
 				// Orchestration failed — fall through to ChatStream MVP.
 				fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  orchestration unavailable (%v), falling back to chat", err))
@@ -207,23 +192,7 @@ func (r *Registry) runCmd() Command {
 					printKV("status", colorStatus(status.Status))
 					fmt.Println()
 
-					// Poll DAG until terminal state.
-					for {
-						dag, pollErr := r.gw.OrchestrationDAG(ctx, status.ExecutionID)
-						if pollErr != nil {
-							fmt.Println(gcolor.HEX("#ef4444").Sprintf("  poll error: %v", pollErr))
-							break
-						}
-						r.printDAGNodes(dag.Nodes)
-						if dag.Status == "completed" || dag.Status == "failed" {
-							fmt.Println()
-							printKV("result", colorStatus(dag.Status))
-							fmt.Println()
-							return nil
-						}
-						time.Sleep(800 * time.Millisecond)
-					}
-					return nil
+					return r.pollDAGUntilTerminal(ctx, status.ExecutionID)
 				}
 				// Orchestration failed — fall through to ChatStream MVP.
 				fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  orchestration unavailable (%v), falling back to chat", err))
@@ -282,6 +251,40 @@ func (r *Registry) runCmd() Command {
 	}
 }
 
+// pollDAGUntilTerminal polls the orchestration DAG for executionID, printing
+// node status after every poll, until the DAG reaches a terminal state
+// ("completed" or "failed") or a poll fails. It is shared by both /run DAG
+// paths (--dag NL-parse and client-side template match), which previously
+// duplicated this loop verbatim.
+//
+// On a poll error this prints a message and returns nil — mirroring the
+// pre-extraction behavior of both call sites, which treated "stop polling"
+// as "fall through to success" rather than propagating the error. A poll
+// error caused by context cancellation (ctx.Err() != nil — e.g. the user hit
+// Ctrl+C) prints a clean "[cancelled]" instead of the raw
+// "poll error: context canceled" text.
+func (r *Registry) pollDAGUntilTerminal(ctx context.Context, executionID string) error {
+	for {
+		dag, pollErr := r.gw.OrchestrationDAG(ctx, executionID)
+		if pollErr != nil {
+			if ctx.Err() != nil {
+				fmt.Println(gcolor.HEX("#94a3b8").Sprint("  [cancelled]"))
+			} else {
+				fmt.Println(gcolor.HEX("#ef4444").Sprintf("  poll error: %v", pollErr))
+			}
+			return nil
+		}
+		r.printDAGNodes(dag.Nodes)
+		if dag.Status == "completed" || dag.Status == "failed" {
+			fmt.Println()
+			printKV("result", colorStatus(dag.Status))
+			fmt.Println()
+			return nil
+		}
+		time.Sleep(800 * time.Millisecond)
+	}
+}
+
 // printDAGNodes renders DAG node status with icons.
 func (r *Registry) printDAGNodes(nodes []map[string]any) {
 	for _, n := range nodes {
@@ -328,6 +331,20 @@ func (r *Registry) docCmd() Command {
 			fmt.Println()
 			gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Document: %s\n\n", id))
 			for k, v := range doc {
+				// "content" is the conventional document-body field (same name
+				// CASGetContent uses for a skill body above) — render it as
+				// markdown instead of a raw dump so headings, lists, and code
+				// fences display properly. Every other field is metadata and
+				// keeps the plain key-value / JSON rendering below.
+				if k == "content" {
+					if s, ok := v.(string); ok {
+						fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  %-24s", k))
+						fmt.Println()
+						fmt.Println(mdrender.RenderMarkdown(s))
+						fmt.Println()
+						continue
+					}
+				}
 				switch val := v.(type) {
 				case map[string]any, []any:
 					b, jsonErr := json.MarshalIndent(val, "    ", "  ")
@@ -533,7 +550,7 @@ func (r *Registry) skillCmd() Command {
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Skill: %s @ %s\n\n", tag.Name, tag.Version))
 				printKV("ref", tag.Ref)
 				fmt.Println()
-				fmt.Println(gcolor.White.Sprint(string(content)))
+				fmt.Println(mdrender.RenderMarkdown(string(content)))
 				fmt.Println()
 				return nil
 
@@ -652,7 +669,7 @@ func (r *Registry) skillCmd() Command {
 					}
 					time.Sleep(250 * time.Millisecond)
 
-					gcolor.HEX("#22c55e").Printf("  [OK]   %s → %s\n", skillName, ref[:12])
+					gcolor.HEX("#22c55e").Printf("  [OK]   %s → %s\n", skillName, shortRef(ref))
 					succeeded++
 				}
 
@@ -713,6 +730,18 @@ func (r *Registry) skillCmd() Command {
 // ─── /skill helpers ──────────────────────────────────────────────────────────
 
 const skillPageSize = 30
+
+// shortRef returns the first 12 characters of a CAS ref for compact display,
+// or ref unchanged if it is shorter than that. ref comes straight from the
+// gateway response (CASPutContent) with no length guarantee — an unguarded
+// ref[:12] slice panics (and previously crashed the whole CLI mid
+// /skill package-all) whenever the gateway returns a short ref.
+func shortRef(ref string) string {
+	if len(ref) >= 12 {
+		return ref[:12]
+	}
+	return ref
+}
 
 // parseSkillLsArgs extracts (filter, showAll, page) from the args slice.
 // Recognises: "all", "p<N>" or plain integers as page numbers, everything else

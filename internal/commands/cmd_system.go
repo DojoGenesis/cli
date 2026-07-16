@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -16,6 +17,47 @@ import (
 	"github.com/DojoGenesis/cli/internal/tui"
 	gcolor "github.com/gookit/color"
 )
+
+// gatewayHTTPStatus extracts the HTTP status code from a gateway client
+// error's text, if present. The client formats non-2xx responses as
+// "gateway <path> returned <code>: <body>" (see internal/client/client.go's
+// get/post helpers). Returns 0 when no status code is present at all — e.g. a
+// connection-level failure (refused, timeout, DNS) that never got an HTTP
+// response, which is the one case that is genuinely "unreachable".
+func gatewayHTTPStatus(err error) int {
+	const marker = "returned "
+	msg := err.Error()
+	idx := strings.Index(msg, marker)
+	if idx == -1 {
+		return 0
+	}
+	rest := msg[idx+len(marker):]
+	end := strings.IndexByte(rest, ':')
+	if end == -1 {
+		end = len(rest)
+	}
+	code, convErr := strconv.Atoi(strings.TrimSpace(rest[:end]))
+	if convErr != nil {
+		return 0
+	}
+	return code
+}
+
+// wrapGatewayErr labels a gateway call failure by what actually happened
+// instead of always saying "unreachable": a 401/403 means the gateway is up
+// but rejected our credentials, a 5xx means it's up but erroring internally,
+// and anything else (including no status code at all — refused/timeout/DNS)
+// keeps the original "unreachable" label since we never got a real response.
+func wrapGatewayErr(err error) error {
+	switch code := gatewayHTTPStatus(err); {
+	case code == 401 || code == 403:
+		return fmt.Errorf("gateway auth failed (401/403): %w", err)
+	case code >= 500 && code <= 599:
+		return fmt.Errorf("gateway error (5xx): %w", err)
+	default:
+		return fmt.Errorf("gateway unreachable: %w", err)
+	}
+}
 
 // ─── /health ────────────────────────────────────────────────────────────────
 
@@ -28,7 +70,7 @@ func (r *Registry) healthCmd() Command {
 		Run: func(ctx context.Context, args []string) error {
 			h, err := r.gw.Health(ctx)
 			if err != nil {
-				return fmt.Errorf("gateway unreachable: %w", err)
+				return wrapGatewayErr(err)
 			}
 			fmt.Println()
 			printKV("status", colorStatus(h.Status))
@@ -71,7 +113,7 @@ func (r *Registry) homeCmd() Command {
 func (r *Registry) homePlain(ctx context.Context) error {
 	h, err := r.gw.Health(ctx)
 	if err != nil {
-		return fmt.Errorf("gateway unreachable: %w", err)
+		return wrapGatewayErr(err)
 	}
 	agents, agentErr := r.gw.Agents(ctx)
 	seeds, seedErr := r.gw.Seeds(ctx)
@@ -297,7 +339,7 @@ func (r *Registry) traceCmd() Command {
 				fmt.Println()
 				fmt.Println()
 				fmt.Println(gcolor.HEX("#457b9d").Sprint("  Trace follows the active session's decision and tool-use history."))
-				fmt.Println(gcolor.HEX("#457b9d").Sprint("  Connect the gateway with --trace to enable full trace output."))
+				fmt.Println(gcolor.HEX("#457b9d").Sprint("  There is no --trace startup flag. Run /trace <id> with a real trace ID to fetch it from the gateway."))
 				fmt.Println()
 				printKV("gateway", r.cfg.Gateway.URL)
 				fmt.Println(gcolor.HEX("#94a3b8").Sprint("  hint: /trace <id>  — provide a trace ID to inspect"))
