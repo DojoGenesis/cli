@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Plugin holds the metadata and hook rules discovered for a single plugin.
@@ -130,8 +131,41 @@ func loadPluginMeta(dir string) (pluginMeta, bool) {
 	return pluginMeta{}, false
 }
 
-// loadHooks reads hooks/hooks.json and converts the map-of-event format into []HookRule.
-// Format: { "EventName": [ { "matcher": "...", "if": "...", "hooks": [...] } ] }
+// Dojo-cli's own hook event names, duplicated here (not imported) because
+// internal/hooks already imports internal/plugins — importing the other
+// direction would create a cycle. Keep these in sync with the Event*
+// constants in internal/hooks/runner.go.
+const (
+	dojoEventPreCommand  = "PreCommand"
+	dojoEventPostCommand = "PostCommand"
+	dojoEventPostSkill   = "PostSkill"
+	dojoEventPostAgent   = "PostAgent"
+	dojoEventSessionEnd  = "SessionEnd"
+)
+
+// loadHooks reads hooks/hooks.json and converts it into []HookRule.
+//
+// Two schemas are supported:
+//
+//   - Flat (dojo-native, back-compat): {"<event>": [{matcher,if,hooks}, ...], ...}
+//     directly at the top level. Event names are used verbatim — unchanged
+//     from this function's original, wrapper-unaware behavior.
+//
+//   - Wrapped (Claude-Code-native): {"hooks": {"<event>": [...], ...}} — a
+//     single top-level "hooks" key whose value is itself an event-name-keyed
+//     object. This is the shape Claude Code's own hook files use (see e.g.
+//     kata-harness's plugin/hooks/hooks.json), so it's what plugin authors
+//     porting an existing Claude Code hooks.json actually hand us. Event
+//     names found here are translated via ccEventToDojo; a Claude-Code
+//     event with no honest dojo equivalent is skipped (logged) rather than
+//     mismapped or bolted on as a literal "hooks" pseudo-event.
+//
+// Before this function grew wrapper support, feeding it a wrapped file
+// meant unmarshalling {"hooks": {...}} (an object) into map[string][]hookEntry
+// (expects every value to be an array) — a hard type-mismatch error, so
+// loadHooks logged a warning and returned zero rules. The plugin's hooks
+// were silently inert either way; this rewrite makes the wrapped shape a
+// first-class input instead of a parse failure.
 func loadHooks(pluginDir, pluginName string) []HookRule {
 	hooksPath := filepath.Join(pluginDir, "hooks", "hooks.json")
 	data, err := os.ReadFile(hooksPath)
@@ -139,18 +173,36 @@ func loadHooks(pluginDir, pluginName string) []HookRule {
 		return nil
 	}
 
-	// hooks.json is an object keyed by event name.
-	var raw map[string][]hookEntry
-	if err := json.Unmarshal(data, &raw); err != nil {
+	eventMap, wrapped, err := parseHooksJSON(data)
+	if err != nil {
 		log.Printf("[plugins] warning: skipping hooks for plugin at %s — failed to parse hooks.json: %v", pluginDir, err)
 		return nil
 	}
 
 	var rules []HookRule
-	for event, entries := range raw {
+	for event, entries := range eventMap {
+		ruleEvent := event
+		if wrapped {
+			dojoEvent, ok := ccEventToDojo(event)
+			if !ok {
+				log.Printf("[plugins] note: plugin %q hooks.json — Claude-Code event %q has no dojo equivalent, skipping %d hook(s)", pluginName, event, len(entries))
+				continue
+			}
+			ruleEvent = dojoEvent
+		}
+		if strings.EqualFold(ruleEvent, "hooks") {
+			// Defense in depth: a literal top-level "hooks" key that isn't
+			// the wrapper (e.g. the degenerate flat shape {"hooks": [...]})
+			// would otherwise slip through as a pseudo-event that can never
+			// match any real dojo event — exactly the trap that made
+			// wrapped hooks.json files silently inert before this fix.
+			// Refuse to reproduce it under any input shape.
+			log.Printf("[plugins] warning: plugin %q hooks.json has a top-level %q key that isn't a real event — skipping %d hook(s); wrapped Claude-Code hooks belong under {\"hooks\": {\"<Event>\": [...]}}", pluginName, event, len(entries))
+			continue
+		}
 		for _, entry := range entries {
 			rules = append(rules, HookRule{
-				Event:   event,
+				Event:   ruleEvent,
 				Matcher: entry.Matcher,
 				If:      entry.If,
 				Hooks:   entry.Hooks,
@@ -158,6 +210,69 @@ func loadHooks(pluginDir, pluginName string) []HookRule {
 		}
 	}
 	return rules
+}
+
+// parseHooksJSON parses the raw bytes of a hooks.json file, trying the
+// Claude-Code wrapper schema first and falling back to the flat dojo-native
+// schema — see loadHooks for the shape of each. Returns the parsed
+// event->entries map, whether the wrapped schema matched (so the caller
+// knows to run Claude-Code -> dojo event translation), and any parse error.
+func parseHooksJSON(data []byte) (eventMap map[string][]hookEntry, wrapped bool, err error) {
+	var probe struct {
+		Hooks json.RawMessage `json:"hooks"`
+	}
+	if probeErr := json.Unmarshal(data, &probe); probeErr == nil && len(probe.Hooks) > 0 {
+		var inner map[string][]hookEntry
+		if innerErr := json.Unmarshal(probe.Hooks, &inner); innerErr == nil {
+			return inner, true, nil
+		}
+		// "hooks" was present but wasn't an event-name-keyed object (e.g.
+		// some other shape entirely) — fall through and try the flat schema
+		// below; if that also fails, its error is what gets reported.
+	}
+
+	var flat map[string][]hookEntry
+	if flatErr := json.Unmarshal(data, &flat); flatErr != nil {
+		return nil, false, flatErr
+	}
+	return flat, false, nil
+}
+
+// ccEventToDojo translates a hook event name found inside the Claude-Code
+// wrapper schema to its dojo-cli equivalent. Two kinds of input are
+// accepted: dojo's own event names (identity passthrough, in case a wrapped
+// hooks.json already uses dojo's vocabulary) and Claude Code's hook event
+// names, mapped to their closest dojo counterpart:
+//
+//	PreToolUse   -> PreCommand   (about to run a tool/command)
+//	PostToolUse  -> PostCommand  (a tool/command just finished)
+//	SubagentStop -> PostAgent    (a dispatched subagent finished)
+//	SessionEnd   -> SessionEnd   (same concept, dojo has it natively —
+//	                              covered by the identity case below)
+//
+// Deliberately NOT mapped: SessionStart. dojo-cli has no "beginning of
+// session" event among its 5 (PreCommand/PostCommand/PostSkill/PostAgent/
+// SessionEnd) — SessionEnd is a false friend for it, not "the closest":
+// mapping SessionStart -> SessionEnd would fire a startup hook (e.g.
+// kata-harness's roll-status-injector, whose entire job is injecting status
+// at session start) at the END of the session instead — wrong, not just
+// imprecise. Also left unmapped for the same reason (no honest dojo
+// lifecycle counterpart): Notification, UserPromptSubmit, Stop, PreCompact.
+// Callers report these as "no dojo equivalent" and skip them rather than
+// silently mismapping them.
+func ccEventToDojo(event string) (string, bool) {
+	switch event {
+	case dojoEventPreCommand, dojoEventPostCommand, dojoEventPostSkill, dojoEventPostAgent, dojoEventSessionEnd:
+		return event, true
+	case "PreToolUse":
+		return dojoEventPreCommand, true
+	case "PostToolUse":
+		return dojoEventPostCommand, true
+	case "SubagentStop":
+		return dojoEventPostAgent, true
+	default:
+		return "", false
+	}
 }
 
 // countFiles counts files matching a glob pattern inside dir.
