@@ -14,9 +14,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/protocol"
 	gcolor "github.com/gookit/color"
 )
 
@@ -326,5 +329,327 @@ func TestProtocolIsPluginDir(t *testing.T) {
 	}
 	if isPluginDir(bare) {
 		t.Error("expected isPluginDir false for a directory with no manifest")
+	}
+}
+
+// ─── /protocol show + /protocol edit test helpers ─────────────────────────────
+
+// protocolHermeticCwd composes clearProtocolEnv with a fresh, empty cwd so
+// /protocol show and /protocol edit resolution sees no project ./DOJO.md and
+// no ~/.dojo/DOJO.md unless the test writes one. Returns the (unresolved)
+// temp cwd. t.Chdir auto-restores at test end (same contract as t.Setenv), so
+// — like every other test in this file — this cannot run in parallel.
+func protocolHermeticCwd(t *testing.T) string {
+	t.Helper()
+	clearProtocolEnv(t)
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	return cwd
+}
+
+// withColorDisabled forces gcolor.Enable off for the duration of a test so
+// mdrender.RenderMarkdown returns raw markdown verbatim instead of
+// glamour-styled ANSI output (see internal/mdrender/mdrender_test.go),
+// letting assertions match literal doc text. Restores the previous value on
+// cleanup since gcolor.Enable is shared package-level state.
+func withColorDisabled(t *testing.T) {
+	t.Helper()
+	prev := gcolor.Enable
+	gcolor.Enable = false
+	t.Cleanup(func() { gcolor.Enable = prev })
+}
+
+// stubEditorScript writes a POSIX shell script to dir that appends every
+// argument it receives, one per line, to markerPath — a minimal stand-in for
+// a real $EDITOR that lets a test observe exactly what protocolEdit invoked
+// it with, without opening a real interactive program. exitCode controls the
+// script's own exit status so failure propagation can be exercised too.
+func stubEditorScript(t *testing.T, dir, markerPath string, exitCode int) string {
+	t.Helper()
+	script := filepath.Join(dir, "fake-editor.sh")
+	body := "#!/bin/sh\n" +
+		"for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"" + markerPath + "\"; done\n" +
+		"exit " + strconv.Itoa(exitCode) + "\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("write stub editor script: %v", err)
+	}
+	return script
+}
+
+// ─── /protocol show ────────────────────────────────────────────────────────────
+
+func TestProtocolShowEmbeddedDefault(t *testing.T) {
+	protocolHermeticCwd(t) // empty HOME + empty cwd → no overlay anywhere
+	withColorDisabled(t)
+	r, _ := testRegistry()
+	r.cfg.Protocol.Enabled = true
+
+	out, err := captureProtocolStdout(t, r.protocolShow)
+	if err != nil {
+		t.Fatalf("/protocol show returned error: %v", err)
+	}
+	if !strings.Contains(out, "embedded default") {
+		t.Errorf("expected an 'embedded default' source label; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Dojo Genius Protocol") {
+		t.Errorf("expected the embedded doc's heading to be rendered; got:\n%s", out)
+	}
+	if !strings.Contains(out, protocol.DefaultDoc()) {
+		t.Errorf("expected the raw embedded doc body verbatim (color disabled); got:\n%s", out)
+	}
+}
+
+func TestProtocolShowProjectOverlay(t *testing.T) {
+	cwd := protocolHermeticCwd(t)
+	withColorDisabled(t)
+	const custom = "# My Custom Protocol\n\nDo the thing my way.\n"
+	protoWriteFile(t, filepath.Join(cwd, "DOJO.md"), custom)
+
+	r, _ := testRegistry()
+	out, err := captureProtocolStdout(t, r.protocolShow)
+	if err != nil {
+		t.Fatalf("/protocol show returned error: %v", err)
+	}
+
+	// os.Getwd() (called inside protocolShow right after t.Chdir(cwd)) returns
+	// the same string t.TempDir() produced here — verified empirically; Go's
+	// Getwd on this platform does not re-resolve the /var vs /private/var
+	// symlink once the process has already chdir'd into it.
+	wantPath := filepath.Join(cwd, "DOJO.md")
+	if !strings.Contains(out, wantPath) {
+		t.Errorf("expected source line to name %q; got:\n%s", wantPath, out)
+	}
+	if !strings.Contains(out, "My Custom Protocol") {
+		t.Errorf("expected the project overlay's own content, not the embedded default; got:\n%s", out)
+	}
+	if strings.Contains(out, "Dojo Genius Protocol") {
+		t.Errorf("project overlay should shadow the embedded default entirely; got:\n%s", out)
+	}
+}
+
+func TestProtocolShowDisabledNotesInjection(t *testing.T) {
+	protocolHermeticCwd(t)
+	withColorDisabled(t)
+	r, _ := testRegistry()
+	r.cfg.Protocol.Enabled = false
+
+	out, err := captureProtocolStdout(t, r.protocolShow)
+	if err != nil {
+		t.Fatalf("/protocol show returned error: %v", err)
+	}
+	if !strings.Contains(out, "protocol.enabled = false") {
+		t.Errorf("expected a disabled-protocol note; got:\n%s", out)
+	}
+}
+
+func TestProtocolShowDispatch(t *testing.T) {
+	protocolHermeticCwd(t)
+	withColorDisabled(t)
+	r, _ := testRegistry()
+
+	if err := r.Dispatch(context.Background(), "protocol show"); err != nil {
+		t.Fatalf("/protocol show dispatch returned error: %v", err)
+	}
+}
+
+// ─── protocolResolveEditTarget ─────────────────────────────────────────────────
+
+func TestProtocolResolveEditTargetProjectOverlayWins(t *testing.T) {
+	cwd := protocolHermeticCwd(t)
+	projectPath := filepath.Join(cwd, "DOJO.md")
+	protoWriteFile(t, projectPath, "# Project override\n")
+	dojoDir := filepath.Join(t.TempDir(), ".dojo")
+
+	got, err := protocolResolveEditTarget(cwd, dojoDir)
+	if err != nil {
+		t.Fatalf("protocolResolveEditTarget returned error: %v", err)
+	}
+	if got != projectPath {
+		t.Errorf("got %q; want project overlay %q", got, projectPath)
+	}
+	if _, statErr := os.Stat(filepath.Join(dojoDir, "DOJO.md")); statErr == nil {
+		t.Error("dojoDir/DOJO.md should not have been created when the project overlay already wins")
+	}
+}
+
+func TestProtocolResolveEditTargetCreatesDefaultOverlay(t *testing.T) {
+	cwd := protocolHermeticCwd(t) // no ./DOJO.md in cwd
+	dojoDir := filepath.Join(t.TempDir(), ".dojo")
+
+	got, err := protocolResolveEditTarget(cwd, dojoDir)
+	if err != nil {
+		t.Fatalf("protocolResolveEditTarget returned error: %v", err)
+	}
+	want := filepath.Join(dojoDir, "DOJO.md")
+	if got != want {
+		t.Errorf("got %q; want %q", got, want)
+	}
+	data, readErr := os.ReadFile(want)
+	if readErr != nil {
+		t.Fatalf("expected %s to have been created: %v", want, readErr)
+	}
+	if string(data) != protocol.DefaultDoc() {
+		t.Error("newly created overlay should contain the embedded default doc verbatim")
+	}
+}
+
+func TestProtocolResolveEditTargetPreservesExistingDojoOverlay(t *testing.T) {
+	cwd := protocolHermeticCwd(t) // no ./DOJO.md in cwd
+	dojoDir := filepath.Join(t.TempDir(), ".dojo")
+	dojoOverlay := filepath.Join(dojoDir, "DOJO.md")
+	const custom = "# Already customized\n"
+	protoWriteFile(t, dojoOverlay, custom)
+
+	got, err := protocolResolveEditTarget(cwd, dojoDir)
+	if err != nil {
+		t.Fatalf("protocolResolveEditTarget returned error: %v", err)
+	}
+	if got != dojoOverlay {
+		t.Errorf("got %q; want %q", got, dojoOverlay)
+	}
+	data, readErr := os.ReadFile(dojoOverlay)
+	if readErr != nil {
+		t.Fatalf("re-reading %s: %v", dojoOverlay, readErr)
+	}
+	if string(data) != custom {
+		t.Errorf("existing overlay must never be clobbered; got %q, want %q", string(data), custom)
+	}
+}
+
+// ─── /protocol edit ─────────────────────────────────────────────────────────────
+
+func TestProtocolEditNoEditorPrintsGuidance(t *testing.T) {
+	protocolHermeticCwd(t)
+	t.Setenv("EDITOR", "")
+	t.Setenv("VISUAL", "")
+	r, _ := testRegistry()
+
+	out, err := captureProtocolStdout(t, func() error {
+		return r.protocolEdit(context.Background())
+	})
+	if err != nil {
+		t.Fatalf("no $EDITOR/$VISUAL should print guidance, not error: %v", err)
+	}
+	if !strings.Contains(out, "set $EDITOR") {
+		t.Errorf("expected guidance to set $EDITOR; got:\n%s", out)
+	}
+	// dojoDir is HOME-derived (os.Getenv passthrough, no symlink resolution),
+	// so — unlike the cwd/os.Getwd() case in TestProtocolShowProjectOverlay —
+	// this string is guaranteed to match byte-for-byte with what protocolEdit
+	// printed.
+	wantPath := filepath.Join(config.DojoDir(), "DOJO.md")
+	if !strings.Contains(out, wantPath) {
+		t.Errorf("expected the resolved overlay path %q in guidance; got:\n%s", wantPath, out)
+	}
+	if _, statErr := os.Stat(wantPath); statErr != nil {
+		t.Errorf("expected the overlay to have been created even without an editor: %v", statErr)
+	}
+}
+
+func TestProtocolEditDispatchNoEditor(t *testing.T) {
+	protocolHermeticCwd(t)
+	t.Setenv("EDITOR", "")
+	t.Setenv("VISUAL", "")
+	r, _ := testRegistry()
+
+	if err := r.Dispatch(context.Background(), "protocol edit"); err != nil {
+		t.Fatalf("/protocol edit dispatch with no editor set should not error: %v", err)
+	}
+}
+
+func TestProtocolEditLaunchesEditorWithResolvedTarget(t *testing.T) {
+	protocolHermeticCwd(t)
+	marker := filepath.Join(t.TempDir(), "editor-args.log")
+	script := stubEditorScript(t, t.TempDir(), marker, 0)
+	t.Setenv("EDITOR", script)
+	t.Setenv("VISUAL", "")
+
+	r, _ := testRegistry()
+	out, err := captureProtocolStdout(t, func() error {
+		return r.protocolEdit(context.Background())
+	})
+	if err != nil {
+		t.Fatalf("protocolEdit with a working stub editor should not error: %v", err)
+	}
+	if !strings.Contains(out, "next session") {
+		t.Errorf("expected a 'takes effect next session' note; got:\n%s", out)
+	}
+
+	data, readErr := os.ReadFile(marker)
+	if readErr != nil {
+		t.Fatalf("expected the stub editor to have run and logged its args: %v", readErr)
+	}
+	gotArgs := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	wantTarget := filepath.Join(config.DojoDir(), "DOJO.md")
+	if len(gotArgs) != 1 || gotArgs[0] != wantTarget {
+		t.Errorf("stub editor args = %v; want exactly [%s]", gotArgs, wantTarget)
+	}
+}
+
+func TestProtocolEditSplitsMultiWordEditor(t *testing.T) {
+	protocolHermeticCwd(t)
+	marker := filepath.Join(t.TempDir(), "editor-args.log")
+	script := stubEditorScript(t, t.TempDir(), marker, 0)
+	// A common real-world shape ("code --wait") — the binary and its flags
+	// must be split apart from the target path, not passed as one argv token.
+	t.Setenv("EDITOR", script+" --wait --flag2")
+	t.Setenv("VISUAL", "")
+
+	r, _ := testRegistry()
+	if _, err := captureProtocolStdout(t, func() error {
+		return r.protocolEdit(context.Background())
+	}); err != nil {
+		t.Fatalf("protocolEdit with a multi-word $EDITOR should not error: %v", err)
+	}
+
+	data, readErr := os.ReadFile(marker)
+	if readErr != nil {
+		t.Fatalf("expected the stub editor to have run: %v", readErr)
+	}
+	gotArgs := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	wantTarget := filepath.Join(config.DojoDir(), "DOJO.md")
+	wantArgs := []string{"--wait", "--flag2", wantTarget}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("stub editor args = %v; want %v", gotArgs, wantArgs)
+	}
+	for i := range wantArgs {
+		if gotArgs[i] != wantArgs[i] {
+			t.Errorf("arg[%d] = %q; want %q", i, gotArgs[i], wantArgs[i])
+		}
+	}
+}
+
+func TestProtocolEditEditorFailurePropagates(t *testing.T) {
+	protocolHermeticCwd(t)
+	marker := filepath.Join(t.TempDir(), "editor-args.log")
+	script := stubEditorScript(t, t.TempDir(), marker, 7)
+	t.Setenv("EDITOR", script)
+	t.Setenv("VISUAL", "")
+
+	r, _ := testRegistry()
+	_, err := captureProtocolStdout(t, func() error {
+		return r.protocolEdit(context.Background())
+	})
+	if err == nil {
+		t.Fatal("expected protocolEdit to surface a nonzero-exit editor as an error")
+	}
+	if !strings.Contains(err.Error(), "launch editor") {
+		t.Errorf("expected a 'launch editor' error; got: %v", err)
+	}
+}
+
+func TestProtocolEditDispatchWithStubEditor(t *testing.T) {
+	protocolHermeticCwd(t)
+	marker := filepath.Join(t.TempDir(), "editor-args.log")
+	script := stubEditorScript(t, t.TempDir(), marker, 0)
+	t.Setenv("EDITOR", script)
+	t.Setenv("VISUAL", "")
+
+	r, _ := testRegistry()
+	if err := r.Dispatch(context.Background(), "protocol edit"); err != nil {
+		t.Fatalf("/protocol edit dispatch with a working stub editor should not error: %v", err)
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Errorf("expected the stub editor to have run via Dispatch: %v", statErr)
 	}
 }

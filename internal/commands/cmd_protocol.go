@@ -1,11 +1,15 @@
 package commands
 
 // cmd_protocol.go — /protocol: make the KE harness ecosystem discoverable and
-// installable from the CLI, and surface the genius-protocol state, without ever
-// bypassing ke's operator-gated publish pipeline.
+// installable from the CLI, and surface + customize the genius-protocol state,
+// without ever bypassing ke's operator-gated publish pipeline.
 //
 //	/protocol            — focused status: protocol enabled/source + is kata-harness installed
 //	/protocol status     — same as above
+//	/protocol show       — print the CURRENTLY EFFECTIVE protocol doc (rendered markdown),
+//	                        via internal/protocol.LoadOverlay's own precedence
+//	/protocol edit       — open the writable overlay (project ./DOJO.md, else
+//	                        ~/.dojo/DOJO.md) in $EDITOR/$VISUAL so it can be customized
 //	/protocol harnesses  — list the KE catalog: name · status · ratified/draft · installed?
 //	/protocol install <name> [--yes]
 //	                     — copy a ratified, locally-available harness plugin into the
@@ -13,9 +17,14 @@ package commands
 //	                       not-locally-available harnesses print operator guidance.
 //
 // SAFETY model (why this file is read-mostly):
-//   - The ONLY write is copying an already-local, ratified plugin directory into
-//     cfg.Plugins.Path on an explicit install + confirmation. Nothing else mutates
-//     state, calls a network endpoint, or shells out.
+//   - The ONLY writes are: (1) copying an already-local, ratified plugin directory
+//     into cfg.Plugins.Path on an explicit install + confirmation, and (2) /protocol
+//     edit creating dojoDir/DOJO.md from the embedded default on first touch (via
+//     protocol.WriteDefaultOverlay, which never clobbers a file that's already
+//     there) before handing it to the user's own $EDITOR/$VISUAL. Nothing else
+//     mutates state, calls a network endpoint, or shells out beyond that editor
+//     launch — and the editor launch never runs with a shell, so the resolved
+//     path is never subject to shell interpolation.
 //   - No operator-gated action is ever taken: this command never runs `ke promote`
 //     or `ke publish`, never shells out to bin/ke. Unratified or not-yet-pulled
 //     harnesses route to printed instructions, per "the store discovers, ke installs".
@@ -31,11 +40,15 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/DojoGenesis/cli/internal/activity"
+	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/mdrender"
 	"github.com/DojoGenesis/cli/internal/plugins"
+	"github.com/DojoGenesis/cli/internal/protocol"
 	gcolor "github.com/gookit/color"
 )
 
@@ -247,8 +260,8 @@ func copyPluginTree(src, dst string) error {
 func (r *Registry) protocolCmd() Command {
 	return Command{
 		Name:  "protocol",
-		Usage: "/protocol [status|harnesses|install <name> [--yes]]",
-		Short: "Discover + install KE harnesses and show genius-protocol state",
+		Usage: "/protocol [status|show|edit|harnesses|install <name> [--yes]]",
+		Short: "Discover/install KE harnesses; show or edit the genius-protocol doc",
 		Run: func(ctx context.Context, args []string) error {
 			if len(args) == 0 {
 				return r.protocolStatus()
@@ -256,6 +269,10 @@ func (r *Registry) protocolCmd() Command {
 			switch strings.ToLower(args[0]) {
 			case "status":
 				return r.protocolStatus()
+			case "show":
+				return r.protocolShow()
+			case "edit":
+				return r.protocolEdit(ctx)
 			case "harnesses", "harness", "ls", "list":
 				return r.protocolHarnesses()
 			case "install", "add":
@@ -270,7 +287,7 @@ func (r *Registry) protocolCmd() Command {
 				}
 				return r.protocolInstall(ctx, args[1], noConfirm)
 			default:
-				return fmt.Errorf("unknown subcommand %q — use status, harnesses, or install <name>", args[0])
+				return fmt.Errorf("unknown subcommand %q — use status, show, edit, harnesses, or install <name>", args[0])
 			}
 		},
 	}
@@ -328,6 +345,118 @@ func (r *Registry) protocolStatus() error {
 	}
 	fmt.Printf("    %s  %d of %d harness(es) installed — /protocol harnesses for the full list\n",
 		doctorTag(true), installed, total)
+	fmt.Println()
+	fmt.Println(gcolor.HEX("#94a3b8").Sprint("  view the effective doc:  /protocol show"))
+	fmt.Println(gcolor.HEX("#94a3b8").Sprint("  customize it:            /protocol edit"))
+	fmt.Println()
+	return nil
+}
+
+// ─── show ───────────────────────────────────────────────────────────────────
+
+// protocolShow prints the currently effective protocol doc — the exact text
+// LoadOverlay resolves at session start (project ./DOJO.md > ~/.dojo/DOJO.md >
+// embedded default) — rendered as markdown, with the active source labeled so
+// it's obvious at a glance which file, if any, is driving the injected
+// protocol.
+func (r *Registry) protocolShow() error {
+	cwd, _ := os.Getwd()
+	doc, source := protocol.LoadOverlay(cwd, config.DojoDir())
+
+	fmt.Println()
+	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Genius Protocol — effective doc"))
+	fmt.Println()
+	fmt.Println()
+	fmt.Println(gcolor.HEX("#94a3b8").Sprint("  source: " + protocolSourceLabel(source)))
+	if !r.cfg.Protocol.Enabled {
+		fmt.Println(gcolor.HEX("#e63946").Sprint("  protocol.enabled = false — this doc is NOT currently injected into sessions"))
+	}
+	fmt.Println()
+	fmt.Println(mdrender.RenderMarkdown(doc))
+	fmt.Println()
+	return nil
+}
+
+// protocolSourceLabel normalizes LoadOverlay's source marker for display:
+// its literal "(embedded default)" reads as plain prose here, matching the
+// "embedded default" wording /protocol status already uses.
+func protocolSourceLabel(source string) string {
+	if source == "(embedded default)" {
+		return "embedded default"
+	}
+	return source
+}
+
+// ─── edit ───────────────────────────────────────────────────────────────────
+
+// protocolResolveEditTarget picks the writable overlay path an operator
+// should customize, mirroring LoadOverlay's precedence (project ./DOJO.md
+// wins when present) but returning a path to open rather than resolved
+// content. Unlike LoadOverlay it never falls through to an in-memory embedded
+// default — editing needs a real file on disk, so when neither override
+// exists yet it creates dojoDir/DOJO.md from the embedded default via
+// protocol.WriteDefaultOverlay, which never clobbers a file that's already
+// there.
+func protocolResolveEditTarget(cwd, dojoDir string) (string, error) {
+	if cwd != "" {
+		p := filepath.Join(cwd, "DOJO.md")
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p, nil
+		}
+	}
+	if err := protocol.WriteDefaultOverlay(dojoDir); err != nil {
+		return "", fmt.Errorf("prepare %s: %w", filepath.Join(dojoDir, "DOJO.md"), err)
+	}
+	return filepath.Join(dojoDir, "DOJO.md"), nil
+}
+
+// protocolEdit opens the writable protocol overlay in the user's editor so
+// they can customize the injected genius protocol. Target resolution is
+// protocolResolveEditTarget: project ./DOJO.md if it already exists, else
+// ~/.dojo/DOJO.md (created from the embedded default on first touch).
+//
+// $EDITOR is tried first, then $VISUAL. Neither set is NOT an error — the
+// overlay is still resolved/created either way, so this prints the path and
+// guidance instead of failing; the CLI never blocks a session on an editor it
+// can't find.
+func (r *Registry) protocolEdit(ctx context.Context) error {
+	cwd, _ := os.Getwd()
+	target, err := protocolResolveEditTarget(cwd, config.DojoDir())
+	if err != nil {
+		return err
+	}
+
+	editor := strings.TrimSpace(os.Getenv("EDITOR"))
+	if editor == "" {
+		editor = strings.TrimSpace(os.Getenv("VISUAL"))
+	}
+	if editor == "" {
+		fmt.Println()
+		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Overlay ready at " + target))
+		fmt.Println(gcolor.HEX("#e8b04a").Sprint("  set $EDITOR (or $VISUAL) to edit it, e.g. export EDITOR=vim"))
+		fmt.Println()
+		return nil
+	}
+
+	// $EDITOR/$VISUAL may carry arguments (e.g. "code --wait") — split on
+	// whitespace rather than treating the whole string as one binary name, the
+	// way a shell would locate the program vs. its flags. No shell is
+	// invoked, so target is passed as a single argv element and is never
+	// subject to shell interpolation.
+	fields := strings.Fields(editor)
+	bin, extraArgs := fields[0], fields[1:]
+	cmdArgs := append(append([]string{}, extraArgs...), target)
+
+	cmd := exec.CommandContext(ctx, bin, cmdArgs...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if runErr := cmd.Run(); runErr != nil {
+		return fmt.Errorf("launch editor %q on %s: %w", editor, target, runErr)
+	}
+
+	fmt.Println()
+	fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Changes take effect next session — the protocol resolves once at session start."))
 	fmt.Println()
 	return nil
 }
