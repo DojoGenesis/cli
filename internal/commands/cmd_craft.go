@@ -4,12 +4,14 @@ package commands
 // Subcommands: adr, scout, claude-md, memory, seed, view, scaffold, converge
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -127,7 +129,46 @@ Be concise and precise. Focus on the decision, not the technology overview.`, ne
 		Stream:    true,
 	}
 
-	return r.craftStream(ctx, systemPrompt, req)
+	content, streamErr := r.craftStream(ctx, systemPrompt, req)
+	fmt.Println()
+	if streamErr != nil {
+		return fmt.Errorf("gateway error — ADR not written: %w", streamErr)
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return fmt.Errorf("gateway returned no content (model unavailable?) — ADR not written")
+	}
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("could not get cwd: %w", err)
+	}
+	dir := filepath.Join(cwd, "decisions")
+	path := filepath.Join(dir, fmt.Sprintf("%03d-%s.md", nextNum, craftSlug(title)))
+
+	fmt.Println()
+	gcolor.HEX("#94a3b8").Printf("  target: %s\n\n", path)
+	if !craftConfirm(fmt.Sprintf("Write ADR to %s?", path)) {
+		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — ADR not written."))
+		fmt.Println()
+		return nil
+	}
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("could not create decisions/ directory: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return fmt.Errorf("could not write ADR: %w", err)
+	}
+
+	fmt.Println()
+	gcolor.Bold.Print(gcolor.HEX("#7fb88c").Sprintf("  ADR written to %s", path))
+	fmt.Println()
+	fmt.Println()
+	return nil
 }
 
 // craftNextADRNumber scans decisions/ in CWD for the highest ADR number.
@@ -191,7 +232,12 @@ Be direct. Prefer action over exploration. Assume the operator has limited atten
 		Stream:    true,
 	}
 
-	return r.craftStream(ctx, systemPrompt, req)
+	_, err := r.craftStream(ctx, systemPrompt, req)
+	fmt.Println()
+	if err != nil {
+		return fmt.Errorf("gateway error: %w", err)
+	}
+	return nil
 }
 
 // ─── /craft claude-md ────────────────────────────────────────────────────────
@@ -272,12 +318,17 @@ Rules that reference outdated patterns or approaches.
 ## Improvement Suggestions
 Specific rewrites for the 3 highest-value improvements. Show old → new.
 
-If --fix mode: emit corrected versions of each file after the report, fenced by triple backticks and the file path.
+If --fix mode: after the report, for each file that needs changes emit one block
+in exactly this shape — a line "FILE: <relative-path>" using the path exactly as
+given in the "## File: <path>" headers above, immediately followed by the full
+corrected file content inside a fenced code block (nothing else on the FILE
+line, one block per file, no commentary between blocks).
+
 Be specific. Do not suggest generic "add more documentation".`
 
 	message := combined.String()
 	if fix {
-		message += "\n\n---\nPlease also output fixed versions of each file."
+		message += "\n\n---\nPlease also output fixed versions of each file, using the FILE: block format described above."
 	}
 
 	req := client.ChatRequest{
@@ -286,7 +337,64 @@ Be specific. Do not suggest generic "add more documentation".`
 		Stream:    true,
 	}
 
-	return r.craftStream(ctx, systemPrompt, req)
+	content, err := r.craftStream(ctx, systemPrompt, req)
+	fmt.Println()
+	if err != nil {
+		return fmt.Errorf("gateway error — no files modified: %w", err)
+	}
+
+	if !fix {
+		return nil
+	}
+
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return fmt.Errorf("gateway returned no content (model unavailable?) — no files modified")
+	}
+
+	fixes := craftParseFixedFiles(content)
+	if len(fixes) == 0 {
+		fmt.Println()
+		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  --fix requested but no fixed-file blocks were found in the response — nothing written."))
+		fmt.Println()
+		return nil
+	}
+
+	relPaths := make([]string, 0, len(fixes))
+	for p := range fixes {
+		relPaths = append(relPaths, p)
+	}
+	sort.Strings(relPaths)
+
+	fmt.Println()
+	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Proposed fixes"))
+	fmt.Println()
+	fmt.Println()
+	for _, p := range relPaths {
+		fmt.Printf("  %s\n", gcolor.HEX("#f4a261").Sprint(p))
+	}
+	fmt.Println()
+
+	if !craftConfirm(fmt.Sprintf("Write %d fixed file(s)?", len(relPaths))) {
+		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — no files modified."))
+		fmt.Println()
+		return nil
+	}
+
+	fmt.Println()
+	for _, p := range relPaths {
+		target := p
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(cwd, p)
+		}
+		if err := os.WriteFile(target, []byte(fixes[p]), 0644); err != nil {
+			fmt.Printf("  %s  %s\n", gcolor.HEX("#ef4444").Sprint("fail "), gcolor.HEX("#94a3b8").Sprintf("%s: %v", p, err))
+			continue
+		}
+		fmt.Printf("  %s  %s\n", gcolor.HEX("#7fb88c").Sprint("write"), gcolor.White.Sprint(p))
+	}
+	fmt.Println()
+	return nil
 }
 
 // ─── /craft memory ───────────────────────────────────────────────────────────
@@ -348,17 +456,76 @@ func (r *Registry) craftMemory(ctx context.Context, args []string) error {
 		fmt.Println()
 
 	case "prune":
-		// List first, then report how many exist — pruning logic deferred to Gateway.
 		memories, err := r.gw.Memories(ctx)
 		if err != nil {
 			return fmt.Errorf("could not fetch memories: %w", err)
 		}
+
+		// Optional criterion: /craft memory prune <type> restricts the target
+		// set to memories whose Type matches (case-insensitive). No criterion
+		// given → target is every memory currently stored.
+		var criterion string
+		if len(args) > 1 {
+			criterion = strings.ToLower(args[1])
+		}
+		var target []client.Memory
+		for _, m := range memories {
+			if criterion == "" || strings.ToLower(m.Type) == criterion {
+				target = append(target, m)
+			}
+		}
+
 		fmt.Println()
-		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Memory Prune Preview"))
+		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Memory Prune"))
 		fmt.Println()
 		fmt.Println()
-		gcolor.HEX("#94a3b8").Printf("  %d memories total\n", len(memories))
-		fmt.Println(gcolor.HEX("#457b9d").Sprint("  hint: use /craft memory rm <id> to delete individual entries"))
+		if criterion != "" {
+			gcolor.HEX("#94a3b8").Printf("  criterion: type = %q\n", criterion)
+		} else {
+			gcolor.HEX("#94a3b8").Println("  criterion: all memories")
+		}
+		gcolor.HEX("#94a3b8").Printf("  %d of %d memories match\n\n", len(target), len(memories))
+
+		if len(target) == 0 {
+			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Nothing to prune."))
+			fmt.Println()
+			return nil
+		}
+
+		for _, m := range target {
+			fmt.Printf("  %s  %s\n",
+				gcolor.HEX("#f4a261").Sprintf("%-36s", m.ID),
+				gcolor.White.Sprint(truncate(m.Content, 60)),
+			)
+		}
+		fmt.Println()
+
+		if !craftConfirm(fmt.Sprintf("Delete these %d memory entries?", len(target))) {
+			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — nothing pruned."))
+			fmt.Println()
+			return nil
+		}
+
+		deleted := 0
+		var failures []string
+		for _, m := range target {
+			if delErr := r.gw.DeleteMemory(ctx, m.ID); delErr != nil {
+				failures = append(failures, fmt.Sprintf("%s: %v", m.ID, delErr))
+				continue
+			}
+			deleted++
+		}
+
+		fmt.Println()
+		gcolor.Bold.Print(gcolor.HEX("#7fb88c").Sprintf("  Pruned %d/%d memories", deleted, len(target)))
+		fmt.Println()
+		if len(failures) > 0 {
+			fmt.Println()
+			gcolor.HEX("#ef4444").Println("  Failures:")
+			for _, f := range failures {
+				fmt.Printf("    %s\n", gcolor.HEX("#94a3b8").Sprint(f))
+			}
+		}
 		fmt.Println()
 
 	case "search":
@@ -400,25 +567,28 @@ func (r *Registry) craftSeed(ctx context.Context, args []string) error {
 	}
 
 	switch op {
-	case "ls", "list", "harvest":
+	case "ls", "list":
 		seeds, err := r.gw.Seeds(ctx)
 		if err != nil {
 			return fmt.Errorf("could not fetch seeds: %w", err)
 		}
 		fmt.Println()
 		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Seeds (%d)\n\n", len(seeds)))
-		if len(seeds) == 0 {
-			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Garden is empty. Use /craft seed plant <text> to add a seed."))
-			fmt.Println()
-			return nil
-		}
-		for _, s := range seeds {
-			fmt.Printf("  %s  %s\n",
-				gcolor.HEX("#f4a261").Sprintf("%-44s", s.Name),
-				gcolor.HEX("#94a3b8").Sprint(truncate(s.Content, 50)),
-			)
+		craftPrintSeedList(seeds)
+
+	case "harvest":
+		// Honest label: there is no curation logic distinct from `ls` yet.
+		// Previously this was a silent, undocumented alias for ls — say so
+		// explicitly instead of pretending harvest does something different.
+		seeds, err := r.gw.Seeds(ctx)
+		if err != nil {
+			return fmt.Errorf("could not fetch seeds: %w", err)
 		}
 		fmt.Println()
+		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Seeds (%d)\n\n", len(seeds)))
+		gcolor.HEX("#94a3b8").Println("  (harvest currently = ls; no distinct curation logic yet)")
+		fmt.Println()
+		craftPrintSeedList(seeds)
 
 	case "plant":
 		if len(args) < 2 {
@@ -476,29 +646,65 @@ func (r *Registry) craftSeed(ctx context.Context, args []string) error {
 		fmt.Println()
 
 	case "elevate":
-		// Elevate seeds to memory: list seeds, display guidance.
-		seeds, err := r.gw.Seeds(ctx)
-		if err != nil {
-			return fmt.Errorf("could not fetch seeds: %w", err)
+		if len(args) < 2 {
+			// No target given — show what's available and how to elevate it.
+			seeds, err := r.gw.Seeds(ctx)
+			if err != nil {
+				return fmt.Errorf("could not fetch seeds: %w", err)
+			}
+			fmt.Println()
+			gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Seed Elevation"))
+			fmt.Println()
+			fmt.Println()
+			gcolor.HEX("#94a3b8").Printf("  %d seeds in garden\n\n", len(seeds))
+			if len(seeds) == 0 {
+				fmt.Println(gcolor.HEX("#94a3b8").Sprint("  No seeds to elevate."))
+				fmt.Println()
+				return nil
+			}
+			fmt.Println(gcolor.HEX("#457b9d").Sprint("  usage: /craft seed elevate <seed-id-or-text>"))
+			fmt.Println()
+			craftPrintSeedList(seeds)
+			return nil
 		}
+
+		target := strings.Join(args[1:], " ")
+
+		// If target matches an existing seed's ID, elevate that seed's content.
+		// Otherwise treat target as literal freeform text to elevate directly.
+		elevateText := target
+		elevateSource := "text"
+		if seeds, seedErr := r.gw.Seeds(ctx); seedErr == nil {
+			for _, s := range seeds {
+				if s.ID == target {
+					elevateText = s.Content
+					elevateSource = fmt.Sprintf("seed %q", s.Name)
+					break
+				}
+			}
+		}
+
 		fmt.Println()
 		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Seed Elevation"))
 		fmt.Println()
 		fmt.Println()
-		gcolor.HEX("#94a3b8").Printf("  %d seeds in garden\n\n", len(seeds))
-		if len(seeds) == 0 {
-			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  No seeds to elevate."))
+		gcolor.HEX("#94a3b8").Printf("  source: %s\n", elevateSource)
+		fmt.Printf("  %s\n\n", gcolor.White.Sprint(truncate(elevateText, 100)))
+
+		if !craftConfirm("Store this as durable memory?") {
+			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — nothing elevated."))
 			fmt.Println()
 			return nil
 		}
-		fmt.Println(gcolor.HEX("#457b9d").Sprint("  To elevate a seed to durable memory:"))
-		fmt.Println(gcolor.HEX("#457b9d").Sprint("    /craft memory add <text from seed>"))
+
+		mem, err := r.gw.StoreMemory(ctx, client.StoreMemoryRequest{Content: elevateText})
+		if err != nil {
+			return fmt.Errorf("could not elevate seed: %w", err)
+		}
 		fmt.Println()
-		for _, s := range seeds {
-			fmt.Printf("  %s  %s\n",
-				gcolor.HEX("#f4a261").Sprintf("%-44s", s.Name),
-				gcolor.HEX("#94a3b8").Sprint(truncate(s.Content, 50)),
-			)
+		fmt.Println(gcolor.HEX("#7fb88c").Sprint("  Seed elevated to memory"))
+		if mem != nil {
+			printKV("id", mem.ID)
 		}
 		fmt.Println()
 
@@ -696,14 +902,14 @@ func craftScaffold(args []string) error {
 	case "go-service":
 		dirs = []string{"cmd/server", "internal/handlers", "internal/config"}
 		files = map[string]string{
-			"go.mod":  "module github.com/example/service\n\ngo 1.24.0\n",
-			"Makefile": "build:\n\tgo build ./...\n\ntest:\n\tgo test ./...\n\n.PHONY: build test\n",
+			"go.mod":             "module github.com/example/service\n\ngo 1.24.0\n",
+			"Makefile":           "build:\n\tgo build ./...\n\ntest:\n\tgo test ./...\n\n.PHONY: build test\n",
 			"cmd/server/main.go": "package main\n\nfunc main() {\n}\n",
 		}
 	case "fullstack":
 		dirs = []string{"server/cmd", "server/internal", "frontend/src"}
 		files = map[string]string{
-			"Makefile": "build:\n\tgo build ./server/...\n\n.PHONY: build\n",
+			"Makefile":           "build:\n\tgo build ./server/...\n\n.PHONY: build\n",
 			"server/cmd/main.go": "package main\n\nfunc main() {\n}\n",
 		}
 	case "orchestration":
@@ -714,8 +920,8 @@ func craftScaffold(args []string) error {
 	case "plugin":
 		dirs = []string{"commands", "skills/example"}
 		files = map[string]string{
-			"plugin.json": "{\n  \"name\": \"my-plugin\",\n  \"version\": \"0.1.0\",\n  \"description\": \"\"\n}\n",
-			".mcp.json":   "{\n  \"mcpServers\": {}\n}\n",
+			"plugin.json":             "{\n  \"name\": \"my-plugin\",\n  \"version\": \"0.1.0\",\n  \"description\": \"\"\n}\n",
+			".mcp.json":               "{\n  \"mcpServers\": {}\n}\n",
 			"skills/example/SKILL.md": "---\nname: example\nversion: 0.1.0\n---\n\n# Example Skill\n",
 		}
 	case "minimal":
@@ -728,7 +934,30 @@ func craftScaffold(args []string) error {
 	}
 
 	fmt.Println()
-	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Scaffolding: %s\n\n", template))
+	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Scaffold: %s\n\n", template))
+
+	fileNames := make([]string, 0, len(files))
+	for name := range files {
+		fileNames = append(fileNames, name)
+	}
+	sort.Strings(fileNames)
+
+	gcolor.HEX("#94a3b8").Println("  This will create:")
+	for _, d := range dirs {
+		fmt.Printf("    %s  %s\n", gcolor.HEX("#7fb88c").Sprint("dir "), gcolor.White.Sprint(d+"/"))
+	}
+	for _, name := range fileNames {
+		fmt.Printf("    %s  %s\n", gcolor.HEX("#7fb88c").Sprint("file"), gcolor.White.Sprint(name))
+	}
+	fmt.Println()
+	gcolor.HEX("#94a3b8").Printf("  target: %s\n\n", cwd)
+
+	if !craftConfirm(fmt.Sprintf("Create %d dir(s) and %d file(s) in %s?", len(dirs), len(files), cwd)) {
+		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — nothing created."))
+		fmt.Println()
+		return nil
+	}
+	fmt.Println()
 
 	for _, d := range dirs {
 		path := filepath.Join(cwd, d)
@@ -738,7 +967,8 @@ func craftScaffold(args []string) error {
 		fmt.Printf("  %s  %s\n", gcolor.HEX("#7fb88c").Sprint("mkdir"), gcolor.White.Sprint(d))
 	}
 
-	for name, content := range files {
+	for _, name := range fileNames {
+		content := files[name]
 		path := filepath.Join(cwd, name)
 		// Don't overwrite existing files.
 		if _, err := os.Stat(path); err == nil {
@@ -860,29 +1090,154 @@ func (r *Registry) craftConverge(ctx context.Context) error {
 	return nil
 }
 
+// ─── shared helpers (confirmation, fs, parsing) ──────────────────────────────
+
+// craftConfirm prints a y/N prompt to stderr and blocks for a line of input on
+// stdin, returning true only for an explicit "y" or "yes" (case-insensitive).
+// Mirrors the confirmation style of plugins.InstallConfirmed (see cmd_plugin.go
+// / internal/plugins/installer.go) but stays file-local: every /craft
+// write/delete path below needs the same guard, and cmd_craft.go is the only
+// file this session is allowed to touch.
+func craftConfirm(prompt string) bool {
+	fmt.Fprintf(os.Stderr, "  %s [y/N]: ", prompt)
+	reader := bufio.NewReader(os.Stdin)
+	answer, _ := reader.ReadString('\n')
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	return answer == "y" || answer == "yes"
+}
+
+// craftSlug converts a title into a filesystem-safe slug for ADR filenames:
+// lowercase, alphanumeric runs joined by single hyphens, no leading/trailing
+// hyphens. Falls back to "untitled" for a title with no alphanumeric content.
+func craftSlug(title string) string {
+	var b strings.Builder
+	lastHyphen := true // suppress a leading hyphen
+	for _, r := range strings.ToLower(title) {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastHyphen = false
+		default:
+			if !lastHyphen {
+				b.WriteByte('-')
+				lastHyphen = true
+			}
+		}
+	}
+	slug := strings.TrimSuffix(b.String(), "-")
+	if slug == "" {
+		return "untitled"
+	}
+	return slug
+}
+
+// craftPrintSeedList prints a seed listing in the shared /craft seed table
+// format, or an empty-garden hint when there are none. Shared by `seed ls`
+// and `seed harvest`, which — per the fix below — is now an honestly-labelled
+// alias for ls rather than a silent one.
+func craftPrintSeedList(seeds []client.Seed) {
+	if len(seeds) == 0 {
+		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Garden is empty. Use /craft seed plant <text> to add a seed."))
+		fmt.Println()
+		return
+	}
+	for _, s := range seeds {
+		fmt.Printf("  %s  %s\n",
+			gcolor.HEX("#f4a261").Sprintf("%-44s", s.Name),
+			gcolor.HEX("#94a3b8").Sprint(truncate(s.Content, 50)),
+		)
+	}
+	fmt.Println()
+}
+
+// craftParseFixedFiles extracts "FILE: <path>" + fenced-code-block pairs from
+// an LLM response, per the format dictated to the model in craftClaudeMD's
+// --fix system prompt. Malformed or unterminated blocks are handled leniently
+// (skipped, or truncated at end-of-input) rather than erroring — a partial
+// response still yields whatever complete blocks it has, and the caller
+// already refuses to write anything if this returns empty.
+func craftParseFixedFiles(content string) map[string]string {
+	out := make(map[string]string)
+	lines := strings.Split(content, "\n")
+	i := 0
+	for i < len(lines) {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "FILE:") {
+			i++
+			continue
+		}
+		path := strings.TrimSpace(strings.TrimPrefix(line, "FILE:"))
+		i++
+		for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
+			i++
+		}
+		if i >= len(lines) || !strings.HasPrefix(strings.TrimSpace(lines[i]), "```") {
+			continue // no fence found — malformed block, resume scanning from here
+		}
+		i++ // past opening fence
+		start := i
+		for i < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[i]), "```") {
+			i++
+		}
+		body := strings.Join(lines[start:i], "\n")
+		if i < len(lines) {
+			i++ // past closing fence
+		}
+		if path != "" {
+			if !strings.HasSuffix(body, "\n") {
+				body += "\n"
+			}
+			out[path] = body
+		}
+	}
+	return out
+}
+
 // ─── streaming helper ────────────────────────────────────────────────────────
 
 // craftStream sends a chat request with a system prompt injected as the first user
-// message prefix and streams the response to stdout.
+// message prefix, streams the response to stdout, and returns the full accumulated
+// text alongside any error. Callers that only care about live display (e.g. /craft
+// scout) can discard the returned string; callers that need to act on the result
+// (e.g. /craft adr writing a file) use it directly.
 // The gateway /v1/chat endpoint does not have a separate system_prompt field,
 // so we prepend it inline.
-func (r *Registry) craftStream(ctx context.Context, systemPrompt string, req client.ChatRequest) error {
+//
+// A mid-stream "error" SSE event (e.g. the gateway surfacing an upstream model
+// failure — openai 429, anthropic 404, etc. — as an event rather than a non-200
+// HTTP status) is captured and, if no other content arrived, turned into a
+// returned error rather than being silently dropped. This is what lets callers
+// tell "gateway down" apart from "gateway returned nothing" and avoid writing
+// an empty file in either case.
+func (r *Registry) craftStream(ctx context.Context, systemPrompt string, req client.ChatRequest) (string, error) {
 	req.Message = systemPrompt + "\n\n---\n\n" + req.Message
-	return r.gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
+	var out strings.Builder
+	var streamErrMsg string
+	err := r.gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
 		if chunk.Data == "" {
+			return
+		}
+		if chunk.Event == "error" {
+			streamErrMsg = chunk.Data
 			return
 		}
 		// Parse delta payload using encoding/json for correct Unicode/escape handling.
 		var delta struct {
 			Delta string `json:"delta"`
 		}
-		if err := json.Unmarshal([]byte(chunk.Data), &delta); err == nil && delta.Delta != "" {
+		if jsonErr := json.Unmarshal([]byte(chunk.Data), &delta); jsonErr == nil && delta.Delta != "" {
 			fmt.Print(delta.Delta)
+			out.WriteString(delta.Delta)
 			return
 		}
 		// Fallback: print raw data for non-delta events (content, etc.).
 		if chunk.Event == "" || chunk.Event == "message" || chunk.Event == "delta" {
 			fmt.Print(chunk.Data)
+			out.WriteString(chunk.Data)
 		}
 	})
+	if err == nil && streamErrMsg != "" && out.Len() == 0 {
+		err = fmt.Errorf("gateway stream error: %s", streamErrMsg)
+	}
+	return out.String(), err
 }
