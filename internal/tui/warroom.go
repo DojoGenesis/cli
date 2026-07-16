@@ -167,7 +167,7 @@ type WarRoomModel struct {
 	initialTopic string
 
 	// Error state
-	err error
+	err error //nolint:unused // pending: top-level last-error field for a model-wide error banner; per-panel errors currently render inline via scoutBuf/challengerBuf instead
 }
 
 // NewWarRoomModel constructs a WarRoomModel ready for tea.NewProgram.
@@ -238,7 +238,7 @@ func (m WarRoomModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case scoutErrorMsg:
 		m.scoutStreaming = false
 		m.scoutCh = nil
-		m.scoutBuf.WriteString(fmt.Sprintf("\n[error: %v]", msg.err))
+		fmt.Fprintf(m.scoutBuf, "\n[error: %v]", msg.err)
 		m.scoutLines = wrapText(m.scoutBuf.String(), m.panelContentWidth())
 		return m, nil
 
@@ -258,7 +258,7 @@ func (m WarRoomModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case challengerErrorMsg:
 		m.challengerStreaming = false
 		m.challengerCh = nil
-		m.challengerBuf.WriteString(fmt.Sprintf("\n[error: %v]", msg.err))
+		fmt.Fprintf(m.challengerBuf, "\n[error: %v]", msg.err)
 		m.challengerLines = wrapText(m.challengerBuf.String(), m.panelContentWidth())
 		return m, nil
 	}
@@ -381,12 +381,13 @@ func (m WarRoomModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.insertInputChar('k')
 
 	case "down":
-		if m.focus == focusScout {
+		switch m.focus {
+		case focusScout:
 			vis := m.panelViewHeight()
 			if max := len(m.scoutLines) - vis; max > 0 && m.scoutScroll < max {
 				m.scoutScroll++
 			}
-		} else if m.focus == focusChallenger {
+		case focusChallenger:
 			vis := m.panelViewHeight()
 			if max := len(m.challengerLines) - vis; max > 0 && m.challengerScroll < max {
 				m.challengerScroll++
@@ -397,11 +398,12 @@ func (m WarRoomModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "j":
 		if m.focus != focusInput {
 			vis := m.panelViewHeight()
-			if m.focus == focusScout {
+			switch m.focus {
+			case focusScout:
 				if max := len(m.scoutLines) - vis; max > 0 && m.scoutScroll < max {
 					m.scoutScroll++
 				}
-			} else if m.focus == focusChallenger {
+			case focusChallenger:
 				if max := len(m.challengerLines) - vis; max > 0 && m.challengerScroll < max {
 					m.challengerScroll++
 				}
@@ -416,12 +418,13 @@ func (m WarRoomModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if step < 1 {
 			step = 1
 		}
-		if m.focus == focusScout {
+		switch m.focus {
+		case focusScout:
 			m.scoutScroll -= step
 			if m.scoutScroll < 0 {
 				m.scoutScroll = 0
 			}
-		} else if m.focus == focusChallenger {
+		case focusChallenger:
 			m.challengerScroll -= step
 			if m.challengerScroll < 0 {
 				m.challengerScroll = 0
@@ -435,14 +438,15 @@ func (m WarRoomModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if step < 1 {
 			step = 1
 		}
-		if m.focus == focusScout {
+		switch m.focus {
+		case focusScout:
 			if max := len(m.scoutLines) - vis; max > 0 {
 				m.scoutScroll += step
 				if m.scoutScroll > max {
 					m.scoutScroll = max
 				}
 			}
-		} else if m.focus == focusChallenger {
+		case focusChallenger:
 			if max := len(m.challengerLines) - vis; max > 0 {
 				m.challengerScroll += step
 				if m.challengerScroll > max {
@@ -453,18 +457,20 @@ func (m WarRoomModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "home":
-		if m.focus == focusScout {
+		switch m.focus {
+		case focusScout:
 			m.scoutScroll = 0
-		} else if m.focus == focusChallenger {
+		case focusChallenger:
 			m.challengerScroll = 0
 		}
 		return m, nil
 
 	case "g":
 		if m.focus != focusInput {
-			if m.focus == focusScout {
+			switch m.focus {
+			case focusScout:
 				m.scoutScroll = 0
-			} else if m.focus == focusChallenger {
+			case focusChallenger:
 				m.challengerScroll = 0
 			}
 			return m, nil
@@ -472,18 +478,20 @@ func (m WarRoomModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.insertInputChar('g')
 
 	case "end":
-		if m.focus == focusScout {
+		switch m.focus {
+		case focusScout:
 			m.pinScoutBottom()
-		} else if m.focus == focusChallenger {
+		case focusChallenger:
 			m.pinChallengerBottom()
 		}
 		return m, nil
 
 	case "G":
 		if m.focus != focusInput {
-			if m.focus == focusScout {
+			switch m.focus {
+			case focusScout:
 				m.pinScoutBottom()
-			} else if m.focus == focusChallenger {
+			case focusChallenger:
 				m.pinChallengerBottom()
 			}
 			return m, nil
@@ -642,7 +650,7 @@ func streamAgentToChannel(
 		sendMsg(scoutErrorMsg{err: err}, challengerErrorMsg{err: err})
 		return
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // best-effort cleanup; stream is already fully consumed or being abandoned on error
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)

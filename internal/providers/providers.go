@@ -248,7 +248,7 @@ func chatAnthropic(ctx context.Context, req DirectChatRequest) (*DirectChatRespo
 
 	msgs := make([]anthropicMessage, len(req.Messages))
 	for i, m := range req.Messages {
-		msgs[i] = anthropicMessage{Role: m.Role, Content: m.Content}
+		msgs[i] = anthropicMessage(m)
 	}
 
 	body := anthropicRequest{
@@ -278,7 +278,7 @@ func chatAnthropic(ctx context.Context, req DirectChatRequest) (*DirectChatRespo
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: http request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // response body close error is not actionable after a completed read
 
 	if resp.StatusCode != http.StatusOK {
 		var errBody map[string]interface{}
@@ -336,7 +336,7 @@ type openAIResponse struct {
 func chatOpenAICompatible(ctx context.Context, req DirectChatRequest, endpoint string) (*DirectChatResponse, error) {
 	msgs := make([]openAIMessage, len(req.Messages))
 	for i, m := range req.Messages {
-		msgs[i] = openAIMessage{Role: m.Role, Content: m.Content}
+		msgs[i] = openAIMessage(m)
 	}
 
 	body := openAIRequest{
@@ -365,7 +365,7 @@ func chatOpenAICompatible(ctx context.Context, req DirectChatRequest, endpoint s
 	if err != nil {
 		return nil, fmt.Errorf("%s: http request: %w", req.Provider, err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // response body close error is not actionable after a completed read
 
 	if resp.StatusCode != http.StatusOK {
 		var errBody map[string]interface{}
@@ -477,7 +477,7 @@ func chatGoogle(ctx context.Context, req DirectChatRequest) (*DirectChatResponse
 	if err != nil {
 		return nil, fmt.Errorf("google: http request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // response body close error is not actionable after a completed read
 
 	if resp.StatusCode != http.StatusOK {
 		var errBody map[string]interface{}

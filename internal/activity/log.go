@@ -56,7 +56,7 @@ func Append(e Entry) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer f.Close() //nolint:errcheck // write result already captured via f.Write below; close failure on a best-effort activity log is not actionable
 
 	line, err := json.Marshal(e)
 	if err != nil {
@@ -99,7 +99,7 @@ func Recent(n int) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer data.Close()
+	defer data.Close() //nolint:errcheck // read-only fd; all data already consumed via scanner, close failure has nothing left to affect
 
 	var entries []Entry
 	scanner := bufio.NewScanner(data)

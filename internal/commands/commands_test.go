@@ -942,7 +942,7 @@ func readActivityLog(t *testing.T) []string {
 	if err != nil {
 		t.Fatalf("could not open activity log: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var summaries []string
 	sc := bufio.NewScanner(f)

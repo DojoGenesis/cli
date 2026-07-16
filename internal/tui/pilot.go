@@ -57,6 +57,7 @@ var (
 	styleSubtle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color(colorSubtle))
 
+	//nolint:unused // pending: generic bordered-panel style, superseded by per-panel border styles (stylePanelBorder etc.) but kept for a possible shared-border pass
 	styleBorder = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color(colorBorder))
@@ -194,6 +195,8 @@ func (m PilotModel) listenSSE() tea.Cmd {
 
 // waitForNext returns a Cmd that waits for the next message from the ongoing
 // SSE goroutine. We use a persistent channel stored on the model.
+//
+//nolint:unused // pending: persistent-channel streaming helper, superseded by the current per-event m.listenSSE() re-invocation pattern; kept in case that pattern is revisited
 func waitForNext(ch <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
 		return <-ch

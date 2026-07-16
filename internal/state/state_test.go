@@ -163,8 +163,7 @@ func TestRecentAgents(t *testing.T) {
 		t.Errorf("RecentAgents(0) len = %d; want 3", len(all))
 	}
 
-	// Verify that the file doesn't need to exist for state ops to work.
-	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), ".dojo", "state.json")); !os.IsNotExist(err) {
-		// File may or may not exist — this check just ensures no panic.
-	}
+	// Verify that the file doesn't need to exist for state ops to work — the
+	// file may or may not exist; this call just ensures no panic.
+	_, _ = os.Stat(filepath.Join(os.Getenv("HOME"), ".dojo", "state.json"))
 }

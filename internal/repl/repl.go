@@ -298,7 +298,7 @@ func (r *REPL) Run(ctx context.Context) error {
 		// Fallback to plain stdin if readline init fails (e.g. in pipes)
 		return r.runPlain(ctx)
 	}
-	defer rl.Close()
+	defer func() { _ = rl.Close() }()
 
 	for {
 		select {
@@ -790,7 +790,7 @@ func printWelcome(cfg *config.Config, session string, resumed bool) {
 		_ = os.MkdirAll(home+"/.dojo", 0o755)
 		f, ferr := os.Create(hintFile)
 		if ferr == nil {
-			f.Close()
+			_ = f.Close()
 		}
 	}
 

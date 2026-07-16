@@ -406,7 +406,7 @@ func TestMatcherGlob(t *testing.T) {
 	}
 
 	// Remove marker to reuse it.
-	os.Remove(markerFile)
+	_ = os.Remove(markerFile)
 
 	// Should NOT match: command is /health, not garden*
 	err = r.Fire(context.Background(), EventPreCommand, map[string]any{"command": "/health"})
@@ -478,7 +478,7 @@ func TestIfConditionEnvVar(t *testing.T) {
 	r := New(ps)
 
 	// Env var NOT set → hook should not fire.
-	os.Unsetenv(envVar)
+	_ = os.Unsetenv(envVar)
 	err := r.Fire(context.Background(), EventPreCommand, nil)
 	if err != nil {
 		t.Fatalf("Fire() returned error: %v", err)

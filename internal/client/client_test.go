@@ -199,7 +199,7 @@ func TestHealth_MockServer(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(want)
+		_ = json.NewEncoder(w).Encode(want)
 	}))
 	defer srv.Close()
 
@@ -265,7 +265,7 @@ func TestSeeds_MockServer(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(envelope)
+		_ = json.NewEncoder(w).Encode(envelope)
 	}))
 	defer srv.Close()
 
@@ -293,7 +293,7 @@ func TestSeeds_EmptyEnvelope(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(envelope)
+		_ = json.NewEncoder(w).Encode(envelope)
 	}))
 	defer srv.Close()
 
@@ -327,7 +327,7 @@ func TestAuthHeader_GetRequest(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(HealthResponse{Status: "ok"})
+		_ = json.NewEncoder(w).Encode(HealthResponse{Status: "ok"})
 	}))
 	defer srv.Close()
 
@@ -349,7 +349,7 @@ func TestAuthHeader_PostRequest(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"memory": Memory{ID: "m1", Content: "c"}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"memory": Memory{ID: "m1", Content: "c"}})
 	}))
 	defer srv.Close()
 
@@ -370,7 +370,7 @@ func TestAuthHeader_NoTokenOmitted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(HealthResponse{Status: "ok"})
+		_ = json.NewEncoder(w).Encode(HealthResponse{Status: "ok"})
 	}))
 	defer srv.Close()
 
@@ -675,7 +675,7 @@ func TestModels_Success(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -696,7 +696,7 @@ func TestProviders_Success(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -721,7 +721,7 @@ func TestMemories_Success(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -738,7 +738,7 @@ func TestMemories_Success(t *testing.T) {
 func TestGardenStats_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"total_seeds": 42})
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_seeds": 42})
 	}))
 	defer srv.Close()
 
@@ -790,7 +790,7 @@ func TestCreateAgent_Success(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(want)
+		_ = json.NewEncoder(w).Encode(want)
 	}))
 	defer srv.Close()
 
@@ -813,7 +813,7 @@ func TestAgents_Success(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -852,7 +852,7 @@ func TestSkillsAll_SinglePage(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -876,7 +876,7 @@ func TestSkillsAll_EmptyPage_StopsLoop(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 

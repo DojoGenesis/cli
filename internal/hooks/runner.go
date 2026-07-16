@@ -174,7 +174,7 @@ func runHTTPHook(ctx context.Context, url string, payload map[string]any) error 
 		log.Printf("[hooks] http hook: request error: %v", err)
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	log.Printf("[hooks] http hook: response status %s", resp.Status)
 	return nil
 }

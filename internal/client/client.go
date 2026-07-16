@@ -386,7 +386,7 @@ func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onChunk func(S
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
@@ -488,7 +488,7 @@ func (c *Client) PilotStream(ctx context.Context, clientID string, onChunk func(
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
@@ -565,7 +565,7 @@ func (c *Client) AgentChatStream(ctx context.Context, agentID string, req AgentC
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
@@ -649,7 +649,7 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
@@ -679,7 +679,7 @@ func (c *Client) post(ctx context.Context, path string, body any, out any) error
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
 		rb, _ := io.ReadAll(resp.Body)
@@ -706,7 +706,7 @@ func (c *Client) put(ctx context.Context, path string, body any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		rb, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("gateway %s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(rb)))
@@ -726,7 +726,7 @@ func (c *Client) delete(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		rb, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("gateway %s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(rb)))
@@ -746,7 +746,7 @@ func (c *Client) getRaw(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		rb, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("gateway %s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(rb)))
@@ -1063,7 +1063,7 @@ func (c *Client) WorkflowExecutionStream(ctx context.Context, runID string, onCh
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)

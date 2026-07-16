@@ -32,7 +32,7 @@ var (
 	bloomDim      = lipgloss.NewStyle().Foreground(lipgloss.Color("#64748b"))
 	bloomKoan     = lipgloss.NewStyle().Foreground(lipgloss.Color("#e8b04a")).Italic(true)
 	bloomNight    = lipgloss.NewStyle().Foreground(lipgloss.Color("#475569"))
-	bloomMedTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#e8b04a"))
+	bloomMedTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#e8b04a")) //nolint:unused // pending: medium-stage title heading, not yet wired into the bloom view
 )
 
 // ─── BloomModel ────────────────────────────────────────────────────────────

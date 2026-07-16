@@ -124,7 +124,7 @@ func RenderEventPanel(events []ParsedEvent, scroll, width, height int, focused b
 		default:
 			styledSummary = styleDim.Render(summary)
 		}
-		sb.WriteString(fmt.Sprintf(" %s  %s  %s", ts, evType, styledSummary))
+		fmt.Fprintf(&sb, " %s  %s  %s", ts, evType, styledSummary)
 		sb.WriteString("\n")
 	}
 

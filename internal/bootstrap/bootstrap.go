@@ -40,8 +40,10 @@ type Result struct {
 // Run executes the full bootstrap sequence and prints a summary.
 func Run(ctx context.Context, opts Options, gw *client.Client, w io.Writer) (*Result, error) {
 	dojoDir := config.DojoDir()
-	os.MkdirAll(dojoDir, 0700)
 	r := &Result{}
+	if err := os.MkdirAll(dojoDir, 0700); err != nil {
+		r.Errors = append(r.Errors, "mkdir: "+err.Error())
+	}
 
 	// 1. Settings
 	created, err := writeSettings(dojoDir, opts)
@@ -146,7 +148,9 @@ func copyPlugins(dojoDir string, opts Options) (copied, skipped int, errs []stri
 	}
 
 	destDir := filepath.Join(dojoDir, "plugins")
-	os.MkdirAll(destDir, 0755)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		errs = append(errs, fmt.Sprintf("create plugins dir: %s", err))
+	}
 
 	for _, name := range firstPartyPlugins {
 		src := filepath.Join(source, name)
@@ -167,7 +171,11 @@ func copyPlugins(dojoDir string, opts Options) (copied, skipped int, errs []stri
 
 		// Remove existing if force
 		if opts.Force {
-			os.RemoveAll(dst)
+			if err := os.RemoveAll(dst); err != nil {
+				errs = append(errs, fmt.Sprintf("remove %s: %s", name, err))
+				skipped++
+				continue
+			}
 		}
 
 		if err := copyDir(src, dst); err != nil {
@@ -245,7 +253,9 @@ initiative: moderate
 // writeDispositions writes the four YAML preset files to ~/.dojo/dispositions/.
 func writeDispositions(dojoDir string, force bool) (int, error) {
 	dir := filepath.Join(dojoDir, "dispositions")
-	os.MkdirAll(dir, 0755)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return 0, err
+	}
 	written := 0
 	for name, content := range dispositionPresets {
 		path := filepath.Join(dir, name)
@@ -345,51 +355,60 @@ func plantSeeds(ctx context.Context, gw *client.Client) (planted, skipped int, e
 
 // printSummary writes a formatted bootstrap summary to w.
 func printSummary(w io.Writer, r *Result) {
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, gcolor.HEX("#e8b04a").Sprint("  Dojo workspace initialized"))
-	fmt.Fprintln(w)
+	// w is process stdout or an in-memory test buffer; a write failure here
+	// has no better place to be reported, so it's intentionally swallowed.
+	fw := func(a ...any) {
+		fmt.Fprintln(w, a...) //nolint:errcheck // best-effort write
+	}
+	fwf := func(format string, a ...any) {
+		fmt.Fprintf(w, format, a...) //nolint:errcheck // best-effort write
+	}
+
+	fw()
+	fw(gcolor.HEX("#e8b04a").Sprint("  Dojo workspace initialized"))
+	fw()
 
 	check := gcolor.HEX("#7fb88c").Sprint("✓")
 	skip := gcolor.HEX("#94a3b8").Sprint("–")
 
 	if r.SettingsCreated {
-		fmt.Fprintf(w, "  %s  settings.json created\n", check)
+		fwf("  %s  settings.json created\n", check)
 	} else {
-		fmt.Fprintf(w, "  %s  settings.json (already exists)\n", skip)
+		fwf("  %s  settings.json (already exists)\n", skip)
 	}
 
 	if r.PluginsCopied > 0 {
-		fmt.Fprintf(w, "  %s  %d plugins installed\n", check, r.PluginsCopied)
+		fwf("  %s  %d plugins installed\n", check, r.PluginsCopied)
 	}
 	if r.PluginsSkipped > 0 {
-		fmt.Fprintf(w, "  %s  %d plugins skipped\n", skip, r.PluginsSkipped)
+		fwf("  %s  %d plugins skipped\n", skip, r.PluginsSkipped)
 	}
 
 	if r.DispositionsWritten > 0 {
-		fmt.Fprintf(w, "  %s  %d disposition presets written\n", check, r.DispositionsWritten)
+		fwf("  %s  %d disposition presets written\n", check, r.DispositionsWritten)
 	} else {
-		fmt.Fprintf(w, "  %s  dispositions (already exist)\n", skip)
+		fwf("  %s  dispositions (already exist)\n", skip)
 	}
 
 	if r.MCPConfigWritten {
-		fmt.Fprintf(w, "  %s  mcp.json created (7 servers)\n", check)
+		fwf("  %s  mcp.json created (7 servers)\n", check)
 	} else {
-		fmt.Fprintf(w, "  %s  mcp.json (already exists)\n", skip)
+		fwf("  %s  mcp.json (already exists)\n", skip)
 	}
 
 	if r.SeedsPlanted > 0 {
-		fmt.Fprintf(w, "  %s  %d starter seeds planted\n", check, r.SeedsPlanted)
+		fwf("  %s  %d starter seeds planted\n", check, r.SeedsPlanted)
 	}
 	if r.SeedsSkipped > 0 {
-		fmt.Fprintf(w, "  %s  %d seeds skipped\n", skip, r.SeedsSkipped)
+		fwf("  %s  %d seeds skipped\n", skip, r.SeedsSkipped)
 	}
 
 	if len(r.Errors) > 0 {
-		fmt.Fprintln(w)
+		fw()
 		for _, e := range r.Errors {
-			fmt.Fprintf(w, "  %s  %s\n", gcolor.HEX("#e8b04a").Sprint("!"), gcolor.HEX("#94a3b8").Sprint(e))
+			fwf("  %s  %s\n", gcolor.HEX("#e8b04a").Sprint("!"), gcolor.HEX("#94a3b8").Sprint(e))
 		}
 	}
 
-	fmt.Fprintln(w)
+	fw()
 }

@@ -15,7 +15,7 @@ func TestLoad_NoSettingsFile_ReturnsDefaults(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	// Clear env overrides that might bleed in from the test environment.
 	t.Setenv("DOJO_GATEWAY_URL", "")
@@ -50,7 +50,7 @@ func TestLoad_WithSettingsFile_AppliesOverrides(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	// Ensure no env overrides interfere.
 	t.Setenv("DOJO_GATEWAY_URL", "")
@@ -126,7 +126,7 @@ func TestLoad_EnvVar_GatewayURL(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	t.Setenv("DOJO_GATEWAY_URL", "http://env-override:9999")
 	t.Setenv("DOJO_GATEWAY_TOKEN", "")
@@ -149,7 +149,7 @@ func TestLoad_EnvVar_Token(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	t.Setenv("DOJO_GATEWAY_URL", "")
 	t.Setenv("DOJO_GATEWAY_TOKEN", "env-token-xyz")
@@ -172,7 +172,7 @@ func TestLoad_EnvVar_Provider(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	t.Setenv("DOJO_GATEWAY_URL", "")
 	t.Setenv("DOJO_GATEWAY_TOKEN", "")
@@ -195,7 +195,7 @@ func TestLoad_EnvVar_PluginsPath(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	customPluginsPath := filepath.Join(tmp, "myplugins")
 	t.Setenv("DOJO_GATEWAY_URL", "")
@@ -230,7 +230,7 @@ func TestLoad_InvalidJSON_ReturnsError(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	t.Setenv("DOJO_GATEWAY_URL", "")
 	t.Setenv("DOJO_GATEWAY_TOKEN", "")
@@ -241,8 +241,12 @@ func TestLoad_InvalidJSON_ReturnsError(t *testing.T) {
 	t.Setenv("DOJO_USER_ID", "")
 
 	dojoDir := filepath.Join(tmp, ".dojo")
-	os.MkdirAll(dojoDir, 0o755)
-	os.WriteFile(filepath.Join(dojoDir, "settings.json"), []byte("{invalid json"), 0o644)
+	if err := os.MkdirAll(dojoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dojoDir, "settings.json"), []byte("{invalid json"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
 	_, err := Load()
 	if err == nil {
@@ -345,7 +349,7 @@ func TestLoad_DispositionEnvOverride(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	t.Setenv("DOJO_GATEWAY_URL", "")
 	t.Setenv("DOJO_GATEWAY_TOKEN", "")
@@ -368,7 +372,7 @@ func TestLoad_ModelEnvOverride(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	t.Setenv("DOJO_GATEWAY_URL", "")
 	t.Setenv("DOJO_GATEWAY_TOKEN", "")
@@ -428,7 +432,7 @@ func TestLoad_UserIDEnvOverride(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	t.Setenv("DOJO_GATEWAY_URL", "")
 	t.Setenv("DOJO_GATEWAY_TOKEN", "")

@@ -31,7 +31,7 @@ func TestLoadPresets_MissingDir(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	// No ~/.dojo/dispositions/ directory exists — should return builtins.
 	presets, err := LoadDispositionPresets()
@@ -49,7 +49,7 @@ func TestSaveAndLoadPreset(t *testing.T) {
 	tmp := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmp)
-	defer func() { os.Setenv("HOME", origHome) }()
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
 
 	custom := DispositionPreset{
 		Name:       "custom",

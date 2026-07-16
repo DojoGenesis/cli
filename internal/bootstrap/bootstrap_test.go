@@ -14,6 +14,24 @@ import (
 	"github.com/DojoGenesis/cli/internal/client"
 )
 
+// mustMkdirAll creates dir (and any parents), failing the test on error.
+// Every call site in this file uses the same 0755 fixture permissions.
+func mustMkdirAll(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+}
+
+// mustWriteFile writes data to path, failing the test on error. Every call
+// site in this file uses the same 0644 fixture permissions.
+func mustWriteFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
 // ─── writeSettings ────────────────────────────────────────────────────────────
 
 func TestWriteSettings(t *testing.T) {
@@ -81,7 +99,9 @@ func TestWriteSettingsDefaultGatewayURL(t *testing.T) {
 
 	data, _ := os.ReadFile(filepath.Join(dir, "settings.json"))
 	var cfg map[string]any
-	json.Unmarshal(data, &cfg)
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal settings.json: %v", err)
+	}
 
 	gw := cfg["gateway"].(map[string]any)
 	if gw["url"] != "http://localhost:7340" {
@@ -123,7 +143,9 @@ func TestWriteSettingsForce(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{GatewayURL: "http://first:7340"}
 
-	writeSettings(dir, opts)
+	if _, err := writeSettings(dir, opts); err != nil {
+		t.Fatalf("writeSettings: %v", err)
+	}
 
 	opts.GatewayURL = "http://second:7340"
 	opts.Force = true
@@ -150,11 +172,11 @@ func makeFakePluginSource(t *testing.T, names []string) string {
 	srcRoot := t.TempDir()
 	for _, name := range names {
 		dir := filepath.Join(srcRoot, name)
-		os.MkdirAll(filepath.Join(dir, "skills", "example"), 0755)
+		mustMkdirAll(t, filepath.Join(dir, "skills", "example"))
 
 		pluginJSON := fmt.Sprintf(`{"name":%q,"version":"0.1.0"}`, name)
-		os.WriteFile(filepath.Join(dir, "plugin.json"), []byte(pluginJSON), 0644)
-		os.WriteFile(filepath.Join(dir, "skills", "example", "SKILL.md"), []byte("# Example\n"), 0644)
+		mustWriteFile(t, filepath.Join(dir, "plugin.json"), []byte(pluginJSON))
+		mustWriteFile(t, filepath.Join(dir, "skills", "example", "SKILL.md"), []byte("# Example\n"))
 	}
 	return srcRoot
 }
@@ -198,8 +220,8 @@ func TestCopyPluginsSkipExisting(t *testing.T) {
 
 	// Pre-create the destination plugin directory.
 	dstPlugin := filepath.Join(dojoDir, "plugins", "agent-orchestration")
-	os.MkdirAll(dstPlugin, 0755)
-	os.WriteFile(filepath.Join(dstPlugin, "plugin.json"), []byte(`{"name":"old"}`), 0644)
+	mustMkdirAll(t, dstPlugin)
+	mustWriteFile(t, filepath.Join(dstPlugin, "plugin.json"), []byte(`{"name":"old"}`))
 
 	opts := Options{PluginsSource: srcRoot}
 	copied, skipped, _ := copyPlugins(dojoDir, opts)
@@ -227,8 +249,8 @@ func TestCopyPluginsForce(t *testing.T) {
 
 	// Pre-create the destination with old content.
 	dstPlugin := filepath.Join(dojoDir, "plugins", "agent-orchestration")
-	os.MkdirAll(dstPlugin, 0755)
-	os.WriteFile(filepath.Join(dstPlugin, "plugin.json"), []byte(`{"name":"old"}`), 0644)
+	mustMkdirAll(t, dstPlugin)
+	mustWriteFile(t, filepath.Join(dstPlugin, "plugin.json"), []byte(`{"name":"old"}`))
 
 	opts := Options{PluginsSource: srcRoot, Force: true}
 	copied, _, _ := copyPlugins(dojoDir, opts)
@@ -342,7 +364,7 @@ func TestWriteMCPConfigIdempotent(t *testing.T) {
 	}
 
 	// Overwrite file with marker content.
-	os.WriteFile(filepath.Join(dojoDir, "mcp.json"), []byte(`{"marker":true}`), 0644)
+	mustWriteFile(t, filepath.Join(dojoDir, "mcp.json"), []byte(`{"marker":true}`))
 
 	wrote, _ = writeMCPConfig(dojoDir, false)
 	if wrote {
@@ -378,11 +400,17 @@ func newMockGateway(t *testing.T, existingNames []string) *httptest.Server {
 				"seeds":   seeds,
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(resp)
+			// Runs on the server's own goroutine — t.Errorf (not Fatalf) is
+			// the safe way to surface a failure from here.
+			if err := json.NewEncoder(w).Encode(resp); err != nil {
+				t.Errorf("encode seeds response: %v", err)
+			}
 
 		case http.MethodPost:
 			var req client.CreateSeedRequest
-			json.NewDecoder(r.Body).Decode(&req)
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode create-seed request: %v", err)
+			}
 			seed := map[string]any{
 				"seed": map[string]any{
 					"id":      "new-" + req.Name,
@@ -392,7 +420,9 @@ func newMockGateway(t *testing.T, existingNames []string) *httptest.Server {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			json.NewEncoder(w).Encode(seed)
+			if err := json.NewEncoder(w).Encode(seed); err != nil {
+				t.Errorf("encode create-seed response: %v", err)
+			}
 
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -491,11 +521,11 @@ func TestCopyDir(t *testing.T) {
 	dst := t.TempDir()
 
 	// Create a nested structure with a .git dir (should be skipped).
-	os.MkdirAll(filepath.Join(src, "sub"), 0755)
-	os.MkdirAll(filepath.Join(src, ".git"), 0755)
-	os.WriteFile(filepath.Join(src, "file.txt"), []byte("hello"), 0644)
-	os.WriteFile(filepath.Join(src, "sub", "nested.txt"), []byte("world"), 0644)
-	os.WriteFile(filepath.Join(src, ".git", "HEAD"), []byte("ref: refs/heads/main"), 0644)
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustMkdirAll(t, filepath.Join(src, ".git"))
+	mustWriteFile(t, filepath.Join(src, "file.txt"), []byte("hello"))
+	mustWriteFile(t, filepath.Join(src, "sub", "nested.txt"), []byte("world"))
+	mustWriteFile(t, filepath.Join(src, ".git", "HEAD"), []byte("ref: refs/heads/main"))
 
 	if err := copyDir(src, dst); err != nil {
 		t.Fatalf("copyDir: %v", err)

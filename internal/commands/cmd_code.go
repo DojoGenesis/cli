@@ -91,9 +91,8 @@ func codeRead(args []string) error {
 	if len(args) >= 2 {
 		if parts := strings.SplitN(args[1], ":", 2); len(parts) == 2 {
 			if n, err := fmt.Sscanf(parts[0], "%d", &startLine); n == 1 && err == nil {
-				if n, err := fmt.Sscanf(parts[1], "%d", &endLine); n == 1 && err == nil {
-					// Valid range.
-				}
+				// Valid start; also attempt to parse the end of the range.
+				_, _ = fmt.Sscanf(parts[1], "%d", &endLine)
 			}
 		}
 	}

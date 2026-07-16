@@ -124,7 +124,7 @@ func (s *Sink) Flush() error {
 	if err != nil {
 		return fmt.Errorf("POST %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // idiomatic best-effort close; status code is validated separately below
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("POST %s returned %d", url, resp.StatusCode)

@@ -251,7 +251,7 @@ func (r *Registry) craftClaudeMD(ctx context.Context, args []string) error {
 		if err != nil {
 			continue
 		}
-		combined.WriteString(fmt.Sprintf("\n## File: %s\n\n", rel))
+		fmt.Fprintf(&combined, "\n## File: %s\n\n", rel)
 		combined.Write(content)
 		combined.WriteString("\n")
 	}
