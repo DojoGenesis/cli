@@ -1,7 +1,8 @@
 package commands
 
 // cmd_doctor.go — /doctor: a read-only, one-screen diagnostic over gateway
-// reachability, per-provider status, active config, and loaded plugins/hooks.
+// reachability, per-provider status, active config, protocol state, and
+// loaded plugins/hooks/harnesses.
 // No mutations — this command never writes config, never calls a gateway
 // write endpoint, and never changes state.
 //
@@ -9,13 +10,16 @@ package commands
 // elsewhere in this package/tree as of this writing (Registry.cfg/gw/plgs,
 // client.Client.Health/Providers/FriendlyError, config.SettingsPath/
 // IsKnownDisposition/DefaultDisposition, and the package's existing
-// orDefault helper). It deliberately does NOT reference any Protocol config
-// fields — those are landing in config.go on a concurrent track.
+// orDefault helper). Protocol config (cfg.Protocol.Enabled/Path, landed on a
+// concurrent track) is now referenced by the PROTOCOL section below — the
+// "overrides must be visible" rule means a silenced protocol must show up
+// as a WARN here, not go invisible.
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/DojoGenesis/cli/internal/config"
@@ -28,7 +32,7 @@ func (r *Registry) doctorCmd() Command {
 	return Command{
 		Name:  "doctor",
 		Usage: "/doctor",
-		Short: "Read-only diagnostic: gateway, providers, config, plugins/hooks",
+		Short: "Read-only diagnostic: gateway, providers, config, plugins/hooks, protocol, harnesses",
 		Run: func(ctx context.Context, args []string) error {
 			fmt.Println()
 			gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Dojo Doctor"))
@@ -60,6 +64,12 @@ func (r *Registry) doctorCmd() Command {
 
 			section("PLUGINS/HOOKS")
 			r.doctorPlugins(check)
+
+			section("PROTOCOL")
+			r.doctorProtocol(check)
+
+			section("HARNESSES")
+			r.doctorHarnesses(check)
 
 			fmt.Println()
 			if warnCount == 0 {
@@ -152,8 +162,10 @@ func (r *Registry) doctorProviders(ctx context.Context, check doctorCheck) {
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
 
 // doctorConfig surfaces gateway.url, the active disposition, and the config
-// file path. Deliberately does not touch any Protocol config fields — see
-// the file-level comment.
+// file path. Deliberately does not touch any Protocol config fields — those
+// get their own visibility in the PROTOCOL section below (doctorProtocol),
+// so a disabled protocol WARNs on its own line instead of hiding inside a
+// generic config dump.
 func (r *Registry) doctorConfig(check doctorCheck) {
 	url := r.cfg.Gateway.URL
 	if url == "" {
@@ -188,4 +200,76 @@ func (r *Registry) doctorPlugins(check doctorCheck) {
 		hookRules += len(p.HookRules)
 	}
 	check(true, fmt.Sprintf("%d plugin(s) loaded, %d hook rule(s) registered", len(r.plgs), hookRules))
+}
+
+// ─── PROTOCOL ───────────────────────────────────────────────────────────────
+
+// doctorProtocol surfaces whether the workspace "genius protocol" (see
+// internal/protocol) is live for this session, and where its doc resolves
+// from. Enabled defaults to true and can be silenced two ways — a
+// settings.json "protocol": {"enabled": false}, or DOJO_PROTOCOL_DISABLED at
+// runtime — so per the "overrides must be visible" rule, a silenced
+// protocol must WARN here rather than disappear into a quiet default.
+//
+// The source check is a deliberately cheap approximation of
+// protocol.LoadOverlay's real precedence (project ./DOJO.md >
+// ~/.dojo/DOJO.md > embedded default): an explicit cfg.Protocol.Path always
+// wins outright (mirrors protocol.BuildSystemContext), so the cwd-override
+// note only applies — and is only checked — when Path is unset. It is a
+// bare os.Stat, not a content read, so an empty/whitespace-only DOJO.md
+// (which protocol.LoadOverlay treats as absent) is still reported here as
+// an override; that's an accepted gap for the cost of staying read-only and
+// dependency-free.
+func (r *Registry) doctorProtocol(check doctorCheck) {
+	if r.cfg.Protocol.Enabled {
+		check(true, "protocol.enabled = true")
+	} else {
+		check(false, "protocol disabled — set protocol.enabled or unset DOJO_PROTOCOL_DISABLED")
+	}
+
+	source := r.cfg.Protocol.Path
+	if source == "" {
+		source = "embedded default"
+		if cwd, err := os.Getwd(); err == nil {
+			if _, statErr := os.Stat(filepath.Join(cwd, "DOJO.md")); statErr == nil {
+				source = "embedded default — overridden by project ./DOJO.md"
+			}
+		}
+	}
+	check(true, "source = "+source)
+}
+
+// ─── HARNESSES ──────────────────────────────────────────────────────────────
+
+// harnessSuffix is the naming convention KE-fleet harness plugins share
+// (kata-harness today; build-dag-harness, convergence-harness, and
+// memory-garden-harness once their ADRs ratify and they ship as plugins —
+// see the Harness Rails table in the workspace CLAUDE.md). Recognizing any
+// loaded plugin by this suffix avoids hardcoding a name list that goes
+// stale the moment the next harness ratifies.
+const harnessSuffix = "-harness"
+
+// doctorHarnesses checks whether kata-harness — the only ratified harness as
+// of this writing (see firstPartyPlugins in internal/bootstrap/bootstrap.go)
+// — is installed under the plugins path, and reports how many of the
+// currently loaded plugins (r.plgs) are recognized as harnesses by name.
+// Absence isn't a hard requirement (kata-harness ships via /init, nothing
+// forces it into an existing ~/.dojo), but it must WARN rather than pass
+// silently — the same "genius protocol by default" visibility this doctor
+// enhancement exists to surface.
+func (r *Registry) doctorHarnesses(check doctorCheck) {
+	kataPath := filepath.Join(r.cfg.Plugins.Path, "kata-harness")
+	if info, err := os.Stat(kataPath); err == nil && info.IsDir() {
+		check(true, "kata-harness installed at "+kataPath)
+	} else {
+		check(false, "kata-harness not installed — run /init")
+	}
+
+	recognized := 0
+	for _, p := range r.plgs {
+		if strings.HasSuffix(p.Name, harnessSuffix) {
+			recognized++
+		}
+	}
+	check(true, fmt.Sprintf("%d of %d loaded plugin(s) recognized as harnesses", recognized, len(r.plgs)))
 }
