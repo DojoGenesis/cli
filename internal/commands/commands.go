@@ -156,6 +156,7 @@ func (r *Registry) register() {
 	r.add(r.projectCmd())
 	r.add(r.activityCmd())
 	r.add(r.pluginCmd())
+	r.add(r.protocolCmd())
 	r.add(r.dispositionCmd())
 	r.add(r.telemetryCmd())
 	r.add(r.senseiCmd())
