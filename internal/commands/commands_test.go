@@ -17,6 +17,25 @@ import (
 	"github.com/DojoGenesis/cli/internal/plugins"
 )
 
+// TestMain isolates every commands-package test from the real ~/.dojo. Several
+// commands (/disposition set, /model set, /settings set) call cfg.Save(), which
+// writes settings.json under $HOME. Without this, `go test ./...` clobbered the
+// developer's live config — it wrote gateway.url=http://test:7340 and
+// protocol.enabled=false over a real settings.json, which is what produced the
+// spurious "dial tcp: lookup test: no such host" failures during dogfooding.
+func TestMain(m *testing.M) {
+	tmp, err := os.MkdirTemp("", "dojo-commands-test-home")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("HOME", tmp); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(tmp)
+	os.Exit(code)
+}
+
 // testRegistry builds a minimal Registry suitable for tests that do not call gw.
 // gw is nil — only commands that are purely client-side (session, practice, help,
 // settings, trace, hooks ls, projects) are safe to dispatch in unit tests.
