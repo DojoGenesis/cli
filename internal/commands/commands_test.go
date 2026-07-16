@@ -135,6 +135,43 @@ func TestTruncateUnicode(t *testing.T) {
 	}
 }
 
+// ─── shortRef (crash regression: ref[:12] on a gateway-returned string) ───────
+
+func TestShortRefTruncatesLongRef(t *testing.T) {
+	got := shortRef("abcdefghijklmnopqrstuvwxyz")
+	if got != "abcdefghijkl" {
+		t.Errorf("shortRef(long) = %q; want first 12 chars 'abcdefghijkl'", got)
+	}
+	if len(got) != 12 {
+		t.Errorf("shortRef(long) length = %d; want 12", len(got))
+	}
+}
+
+func TestShortRefExactly12(t *testing.T) {
+	ref := "abcdefghijkl" // exactly 12 chars
+	got := shortRef(ref)
+	if got != ref {
+		t.Errorf("shortRef(exactly 12 chars) = %q; want unchanged %q", got, ref)
+	}
+}
+
+// TestShortRefShorterThan12DoesNotPanic is the direct crash regression test:
+// a gateway-returned ref shorter than 12 characters must not panic on an
+// unguarded ref[:12] slice.
+func TestShortRefShorterThan12DoesNotPanic(t *testing.T) {
+	got := shortRef("abc")
+	if got != "abc" {
+		t.Errorf("shortRef('abc') = %q; want 'abc' unchanged", got)
+	}
+}
+
+func TestShortRefEmpty(t *testing.T) {
+	got := shortRef("")
+	if got != "" {
+		t.Errorf("shortRef('') = %q; want empty string", got)
+	}
+}
+
 // ─── colorStatus ──────────────────────────────────────────────────────────────
 
 func TestColorStatusOk(t *testing.T) {
@@ -1153,6 +1190,66 @@ func TestDispatchProjectArtifactTooFewArgs(t *testing.T) {
 	err := r.Dispatch(context.Background(), "project artifact")
 	if err == nil {
 		t.Fatal("expected error for 'project artifact' with too few args, got nil")
+	}
+}
+
+// TestDispatchProjectArtifactPathTraversalRejected is an end-to-end security
+// regression test: a "/project artifact" filename containing "../" segments
+// must be rejected at the command boundary rather than reaching
+// artifacts.Save and escaping the ~/.dojo/projects/<id> sandbox. project.Create
+// and project.Switch are purely local-state (no gateway calls), so this is
+// safe to drive through Dispatch in a hermetic unit test.
+func TestDispatchProjectArtifactPathTraversalRejected(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	r, _ := testRegistry()
+	if err := r.Dispatch(context.Background(), "project init trav-test"); err != nil {
+		t.Fatalf("project init: %v", err)
+	}
+
+	err := r.Dispatch(context.Background(), "project artifact artifacts ../../../etc/passwd pwned")
+	if err == nil {
+		t.Fatal("expected error for a path-traversal filename in 'project artifact', got nil")
+	}
+	if !strings.Contains(err.Error(), "..") {
+		t.Errorf("error = %v; want it to reference the rejected \"..\" segment", err)
+	}
+}
+
+func TestDispatchProjectArtifactAbsolutePathRejected(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	r, _ := testRegistry()
+	if err := r.Dispatch(context.Background(), "project init trav-test-abs"); err != nil {
+		t.Fatalf("project init: %v", err)
+	}
+
+	err := r.Dispatch(context.Background(), "project artifact artifacts /etc/passwd pwned")
+	if err == nil {
+		t.Fatal("expected error for an absolute-path filename in 'project artifact', got nil")
+	}
+}
+
+// ─── hasParentTraversal ─────────────────────────────────────────────────────────
+
+func TestHasParentTraversalDetectsSegment(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"../../../etc/passwd", true},
+		{"foo/../bar", true},
+		{"..", true},
+		{"my-file.md", false},
+		{"sub/path/file.md", false},
+		{"v1..2-notes", false}, // ".." substring but not a path segment — must NOT be rejected
+		{"", false},
+	}
+	for _, tc := range cases {
+		got := hasParentTraversal(tc.path)
+		if got != tc.want {
+			t.Errorf("hasParentTraversal(%q) = %v; want %v", tc.path, got, tc.want)
+		}
 	}
 }
 

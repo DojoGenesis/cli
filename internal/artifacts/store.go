@@ -62,6 +62,31 @@ func ensureMDExt(filename string) string {
 	return filename + ".md"
 }
 
+// safeArtifactPath joins filename onto dir and guarantees the result cannot
+// escape dir via ".." traversal or a symlinked dir — the same root-boundary
+// pattern used in internal/commands/cmd_code.go (Clean/EvalSymlinks + prefix
+// check), adapted for a filename that may not exist yet (Save creates new
+// files, so only the already-created dir — not the leaf filename — can be
+// resolved through EvalSymlinks).
+//
+// filename is caller/agent-supplied (e.g. via "/project artifact <type>
+// <file> <content>"); without this check, a filename like "../../../x"
+// escapes the ~/.dojo/projects/<projectID>/<artifactType> sandbox and can
+// create or overwrite arbitrary files the process can write to (AtomicWriteFile
+// even MkdirAll's the escaped target's parent directory).
+func safeArtifactPath(dir, filename string) (string, error) {
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("artifacts: resolve dir %s: %w", dir, err)
+	}
+
+	joined := filepath.Clean(filepath.Join(resolvedDir, filename))
+	if joined != resolvedDir && !strings.HasPrefix(joined, resolvedDir+string(os.PathSeparator)) {
+		return "", fmt.Errorf("artifacts: filename %q escapes the artifacts root", filename)
+	}
+	return joined, nil
+}
+
 // Save writes content to ~/.dojo/projects/<projectID>/<artifactType>/<filename>.
 // Ensures .md extension. Creates directories as needed.
 // Returns the absolute path of the saved file.
@@ -71,7 +96,10 @@ func Save(projectID string, at ArtifactType, filename, content string) (string, 
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("artifacts: create directory %s: %w", dir, err)
 	}
-	path := filepath.Join(dir, filename)
+	path, err := safeArtifactPath(dir, filename)
+	if err != nil {
+		return "", err
+	}
 	if err := ioutilx.AtomicWriteFile(path, []byte(content), 0600); err != nil {
 		return "", fmt.Errorf("artifacts: write %s: %w", path, err)
 	}
@@ -151,7 +179,10 @@ func ListAll(projectID string) ([]ArtifactMeta, error) {
 // Read returns the content of a specific artifact file.
 func Read(projectID string, at ArtifactType, filename string) (string, error) {
 	filename = ensureMDExt(filename)
-	path := filepath.Join(Dir(projectID, at), filename)
+	path, err := safeArtifactPath(Dir(projectID, at), filename)
+	if err != nil {
+		return "", err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("artifacts: read %s: %w", path, err)
@@ -162,7 +193,10 @@ func Read(projectID string, at ArtifactType, filename string) (string, error) {
 // Delete removes an artifact file.
 func Delete(projectID string, at ArtifactType, filename string) error {
 	filename = ensureMDExt(filename)
-	path := filepath.Join(Dir(projectID, at), filename)
+	path, err := safeArtifactPath(Dir(projectID, at), filename)
+	if err != nil {
+		return err
+	}
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("artifacts: delete %s: %w", path, err)
 	}

@@ -7,6 +7,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -18,16 +19,16 @@ import (
 
 // projectCmd returns the /project command with all subcommands.
 //
-//   /project init <name> [--desc "..."]       — create a new project, set active
-//   /project status [@name]                   — phase indicator, tracks, activity, suggestion
-//   /project switch <name>                    — change active project
-//   /project list [--all]                     — list all projects with phase indicators
-//   /project archive <name>                   — archive a completed project
-//   /project phase <phase>                    — set phase manually
-//   /project track add <name> [--dep N,...]   — add a track to the active project
-//   /project track set <id> <status>          — update track status
-//   /project decision <text>                  — record a decision
-//   /project artifact <type> <file> <content> — save an artifact
+//	/project init <name> [--desc "..."]       — create a new project, set active
+//	/project status [@name]                   — phase indicator, tracks, activity, suggestion
+//	/project switch <name>                    — change active project
+//	/project list [--all]                     — list all projects with phase indicators
+//	/project archive <name>                   — archive a completed project
+//	/project phase <phase>                    — set phase manually
+//	/project track add <name> [--dep N,...]   — add a track to the active project
+//	/project track set <id> <status>          — update track status
+//	/project decision <text>                  — record a decision
+//	/project artifact <type> <file> <content> — save an artifact
 func (r *Registry) projectCmd() Command {
 	return Command{
 		Name:    "project",
@@ -556,6 +557,15 @@ func projectArtifact(args []string) error {
 	filename := args[1]
 	content := strings.Join(args[2:], " ")
 
+	// Reject path traversal / absolute paths at the command boundary so the
+	// user gets a clear, specific error immediately. artifacts.Save enforces
+	// the same containment itself (defense-in-depth — this call site is not
+	// the only path into Save), so this check is a fast, friendlier front
+	// door rather than the sole guard.
+	if filepath.IsAbs(filename) || hasParentTraversal(filename) {
+		return fmt.Errorf("project artifact: filename %q must be a relative path with no \"..\" segments", filename)
+	}
+
 	path, err := artifacts.Save(p.ID, artifactType, filename, content)
 	if err != nil {
 		return fmt.Errorf("project artifact: %w", err)
@@ -580,6 +590,18 @@ func projectArtifact(args []string) error {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// hasParentTraversal reports whether p contains a literal ".." path segment
+// (as opposed to merely containing the substring ".." inside a longer name,
+// e.g. "v1..2-notes", which is a legal filename and must not be rejected).
+func hasParentTraversal(p string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
 
 // requireActiveProject returns the active project or a clear error if none is set.
 func requireActiveProject() (*project.Project, error) {
