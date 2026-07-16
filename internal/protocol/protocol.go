@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/config"
@@ -145,4 +146,87 @@ func (in *Injector) Apply(req *client.ChatRequest) bool {
 	req.Message = in.context + injectDelimiter + req.Message
 	in.injected = true
 	return true
+}
+
+// ─── JIT tell-triggered injection ─────────────────────────────────────────────
+//
+// The protocol above leads a session once, up front. This section is the
+// complementary move: surface ONE situated gate at the exact moment a tell
+// appears, rather than reciting the whole doctrine. The only tell the CLI can
+// observe today is a failed chat turn's error text, and the one gate worth
+// interrupting for at that moment is the config-vs-code discriminator.
+
+// configVsCodeGate is the one-line config-vs-code discriminator — the single
+// most relevant operating gate when a turn fails at a boundary. It mirrors the
+// workspace CLAUDE.md "Config or code?" debugging gate: a total,
+// input-independent failure points at wiring (config/env/state), so settings
+// and env are the first place to look, not the code path. Surfaced verbatim by
+// TellFor.
+const configVsCodeGate = "Config or code? Total+input-independent failure → wiring: check settings/env FIRST."
+
+// wiringTells are lowercased substrings that mark an error as a boundary/wiring
+// failure — connection, DNS, auth, and dead-route signatures. Any match routes
+// to configVsCodeGate. Kept deliberately small and literal (no regex, no
+// scoring): this is a situated nudge, not a diagnosis engine. The compound
+// "model … not found" case is handled separately in TellFor so a bare
+// "not found" from some unrelated error can't trip the gate.
+var wiringTells = []string{
+	"connection refused",     // TCP connect rejected
+	"no such host",           // DNS lookup failure
+	"no route to host",       // network path down
+	"network is unreachable", // network path down
+	"dial tcp",               // generic transport dial failure
+	"401",                    // unauthorized
+	"403",                    // forbidden
+	"unauthorized",
+	"forbidden",
+	"404", // dead route / missing endpoint
+}
+
+// TellFor maps a failed turn's error text to the single most relevant protocol
+// gate, or ("", false) when the text carries no recognized tell. Today the only
+// mapping is the config-vs-code discriminator (configVsCodeGate), triggered by
+// connection, auth, and model/route signatures — the errors that most often
+// look like a code bug but are really wiring. The match is case-insensitive and
+// substring-based; unrelated text returns ok=false so the caller stays silent.
+func TellFor(errText string) (gate string, ok bool) {
+	lower := strings.ToLower(errText)
+	for _, tell := range wiringTells {
+		if strings.Contains(lower, tell) {
+			return configVsCodeGate, true
+		}
+	}
+	// A dead/unknown model endpoint reads like a code error ("model X not
+	// found") but is a config choice — route it to the same gate. Required to
+	// co-occur with "model" so a generic "not found" doesn't false-positive.
+	if strings.Contains(lower, "model") && strings.Contains(lower, "not found") {
+		return configVsCodeGate, true
+	}
+	return "", false
+}
+
+// Nudger tracks which protocol gates have already been surfaced this session so
+// a JIT nudge fires at most once per distinct gate — a recurring error never
+// nags. The zero value is ready to use; a caller (the REPL) holds one for the
+// life of the session. Not safe for concurrent use: the REPL drives it from its
+// single read loop.
+type Nudger struct {
+	shown map[string]bool
+}
+
+// NudgeFor returns the gate line to surface for errText and true when it should
+// be shown now — i.e. errText matches a tell (TellFor) AND that gate has not
+// been shown before. On a true return it records the gate as shown, so any
+// later error mapping to the same gate returns ok=false (the fire-once-per-gate
+// guarantee). Errors with no tell always return ("", false) and record nothing.
+func (n *Nudger) NudgeFor(errText string) (gate string, ok bool) {
+	g, matched := TellFor(errText)
+	if !matched || n.shown[g] {
+		return "", false
+	}
+	if n.shown == nil {
+		n.shown = make(map[string]bool)
+	}
+	n.shown[g] = true
+	return g, true
 }

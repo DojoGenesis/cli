@@ -22,6 +22,7 @@ type Config struct {
 	Plugins             PluginsConfig                `json:"plugins"`
 	Defaults            DefaultsConfig               `json:"defaults"`
 	Protocol            ProtocolConfig               `json:"protocol"`
+	Verify              VerifyConfig                 `json:"verify"`
 	Auth                AuthConfig                   `json:"auth,omitempty"`
 	DispositionProfiles map[string]DispositionPreset `json:"disposition_profiles,omitempty"`
 
@@ -44,6 +45,18 @@ type Config struct {
 type ProtocolConfig struct {
 	Enabled bool   `json:"enabled"`
 	Path    string `json:"path,omitempty"`
+}
+
+// VerifyConfig controls the opt-in "done means verified" gate that runs after a
+// successful /agent dispatch or /run in the interactive REPL. AfterAgent
+// defaults to FALSE — the loop is strictly opt-in — so a settings.json that
+// omits the whole block (or omits just "after_agent") leaves it off: unlike
+// ProtocolConfig.Enabled, the intended default here IS the zero value, so
+// defaults() need not pre-seed it. DOJO_VERIFY_AFTER_AGENT (any non-empty
+// value) flips it on for a single run, resolved in Load like the other env
+// knobs.
+type VerifyConfig struct {
+	AfterAgent bool `json:"after_agent"`
 }
 
 type AuthConfig struct {
@@ -174,6 +187,16 @@ func Load() (*Config, error) {
 			func(c *Config, v string) { c.Protocol.Path = v },
 			v)
 	}
+	// DOJO_VERIFY_AFTER_AGENT: any non-empty value opts into the post-agent
+	// verify loop for this run. Tracked via noteEnvOverride (not a plain
+	// assignment) so a one-off export never bakes into settings.json — same
+	// transient-override contract as DOJO_PROTOCOL_DISABLED; see Save().
+	if v := os.Getenv("DOJO_VERIFY_AFTER_AGENT"); v != "" {
+		noteEnvOverride(cfg,
+			func(c *Config) bool { return c.Verify.AfterAgent },
+			func(c *Config, v bool) { c.Verify.AfterAgent = v },
+			true)
+	}
 
 	// Gateway settings are load-bearing for connectivity — a malformed URL
 	// or timeout is a genuine configuration error, so it still stops
@@ -257,6 +280,9 @@ func (c *Config) Validate() error {
 	if err := c.validateProtocol(); err != nil {
 		return err
 	}
+	if err := c.validateVerify(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -266,6 +292,14 @@ func (c *Config) Validate() error {
 // bricking startup — mirroring the disposition degrade philosophy. Kept as a
 // hook so future hard constraints have a home without re-touching Validate.
 func (c *Config) validateProtocol() error {
+	return nil
+}
+
+// validateVerify has no fail-hard conditions: AfterAgent is a bool that is
+// valid either way, and a missing block is a valid (disabled) config. Kept as a
+// hook — symmetric with validateProtocol — so any future verify constraint has
+// a home without re-touching Validate.
+func (c *Config) validateVerify() error {
 	return nil
 }
 
@@ -324,6 +358,7 @@ func (c *Config) EffectiveString() string {
 	fmt.Fprintf(&b, "plugins.path = %s\n", c.Plugins.Path)
 	fmt.Fprintf(&b, "protocol.enabled = %t\n", c.Protocol.Enabled)
 	fmt.Fprintf(&b, "protocol.path = %s\n", defaultIfEmpty(c.Protocol.Path, "(embedded default)"))
+	fmt.Fprintf(&b, "verify.after_agent = %t\n", c.Verify.AfterAgent)
 	fmt.Fprintf(&b, "auth.user_id = %s\n", defaultIfEmpty(c.Auth.UserID, "(not set)"))
 	return b.String()
 }
@@ -421,6 +456,14 @@ func defaults() *Config {
 		// DOJO_PROTOCOL_DISABLED must be set, to turn it off.
 		Protocol: ProtocolConfig{
 			Enabled: true,
+		},
+		// Verify is opt-in and OFF by default: the zero value (AfterAgent:false)
+		// is the intended default, so an omitted block keeps the post-agent
+		// verify loop disabled. Stated explicitly for symmetry and to document
+		// intent at the defaults site; DOJO_VERIFY_AFTER_AGENT flips it on per
+		// run (see Load).
+		Verify: VerifyConfig{
+			AfterAgent: false,
 		},
 	}
 }

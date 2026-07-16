@@ -605,7 +605,7 @@ func clearProtocolEnv(t *testing.T) {
 	for _, k := range []string{
 		"DOJO_GATEWAY_URL", "DOJO_GATEWAY_TOKEN", "DOJO_PLUGINS_PATH",
 		"DOJO_PROVIDER", "DOJO_DISPOSITION", "DOJO_MODEL", "DOJO_USER_ID",
-		"DOJO_PROTOCOL_DISABLED", "DOJO_PROTOCOL_PATH",
+		"DOJO_PROTOCOL_DISABLED", "DOJO_PROTOCOL_PATH", "DOJO_VERIFY_AFTER_AGENT",
 	} {
 		t.Setenv(k, "")
 	}
@@ -717,6 +717,115 @@ func TestEffectiveString_IncludesProtocol(t *testing.T) {
 	}
 }
 
+// ─── Verify block (W6-PROTOCOL-ADV) ──────────────────────────────────────────
+
+// TestLoad_Verify_DefaultsFalse proves the opt-in verify loop is OFF by default:
+// a settings.json that omits the whole block leaves Verify.AfterAgent false.
+func TestLoad_Verify_DefaultsFalse(t *testing.T) {
+	clearProtocolEnv(t) // fresh HOME (no settings.json) + all DOJO_* knobs cleared
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Verify.AfterAgent {
+		t.Error("Verify.AfterAgent should default to false when settings.json omits the block")
+	}
+}
+
+// TestLoad_Verify_MissingBlockStaysFalse proves backward compatibility: an
+// existing settings.json written before the verify block existed (no "verify"
+// key at all) loads with the loop disabled, not with some accidental default.
+func TestLoad_Verify_MissingBlockStaysFalse(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	clearAllConfigEnv(t)
+
+	// A pre-existing config with no "verify" key.
+	settings := map[string]any{
+		"gateway": map[string]any{"url": "http://localhost:7340", "timeout": "60s"},
+	}
+	data, _ := json.Marshal(settings)
+	dojoDir := filepath.Join(tmp, ".dojo")
+	if err := os.MkdirAll(dojoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dojoDir, "settings.json"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Verify.AfterAgent {
+		t.Error("a settings.json with no verify block should load AfterAgent=false")
+	}
+}
+
+// TestLoad_Verify_EnvEnables proves DOJO_VERIFY_AFTER_AGENT (any non-empty
+// value) flips the loop on for the run.
+func TestLoad_Verify_EnvEnables(t *testing.T) {
+	clearProtocolEnv(t)
+	t.Setenv("DOJO_VERIFY_AFTER_AGENT", "1")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !cfg.Verify.AfterAgent {
+		t.Error("DOJO_VERIFY_AFTER_AGENT=1 should enable the post-agent verify loop")
+	}
+}
+
+// TestSave_StripsEnvOverride_VerifyAfterAgent proves the run-scoped env override
+// is not baked into settings.json — same transient-override contract that
+// protects DOJO_PROTOCOL_DISABLED (see envOverride and Config.Save()).
+func TestSave_StripsEnvOverride_VerifyAfterAgent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	clearAllConfigEnv(t)
+	t.Setenv("DOJO_VERIFY_AFTER_AGENT", "1")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !cfg.Verify.AfterAgent {
+		t.Fatal("sanity check failed: DOJO_VERIFY_AFTER_AGENT=1 should have enabled the verify loop")
+	}
+
+	// A command saves config for an unrelated reason (e.g. /model set).
+	cfg.Defaults.Model = "claude-sonnet-4-6"
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	// Re-load WITHOUT the env var: the transient override must not have persisted.
+	t.Setenv("DOJO_VERIFY_AFTER_AGENT", "")
+	reloaded, err := Load()
+	if err != nil {
+		t.Fatalf("reload Load() error: %v", err)
+	}
+	if reloaded.Verify.AfterAgent {
+		t.Error("DOJO_VERIFY_AFTER_AGENT leaked into settings.json — Save() should have stripped the run-scoped override")
+	}
+	if reloaded.Defaults.Model != "claude-sonnet-4-6" {
+		t.Errorf("the real edit should persist: Defaults.Model = %q, want %q", reloaded.Defaults.Model, "claude-sonnet-4-6")
+	}
+}
+
+// TestEffectiveString_IncludesVerify proves the verify state shows up in the
+// /settings effective dump alongside the other blocks.
+func TestEffectiveString_IncludesVerify(t *testing.T) {
+	cfg := &Config{
+		Gateway:  GatewayConfig{URL: "http://localhost:7340", Timeout: "60s"},
+		Defaults: DefaultsConfig{Disposition: "balanced"},
+		Verify:   VerifyConfig{AfterAgent: true},
+	}
+	if want := "verify.after_agent = true"; !strings.Contains(cfg.EffectiveString(), want) {
+		t.Errorf("EffectiveString() missing %q\ngot:\n%s", want, cfg.EffectiveString())
+	}
+}
+
 // ─── Auth.UserID env override ───────────────────────────────────────────────
 
 func TestLoad_UserIDEnvOverride(t *testing.T) {
@@ -797,7 +906,7 @@ func clearAllConfigEnv(t *testing.T) {
 	for _, k := range []string{
 		"DOJO_GATEWAY_URL", "DOJO_GATEWAY_TOKEN", "DOJO_PLUGINS_PATH",
 		"DOJO_PROVIDER", "DOJO_DISPOSITION", "DOJO_MODEL", "DOJO_USER_ID",
-		"DOJO_PROTOCOL_DISABLED", "DOJO_PROTOCOL_PATH",
+		"DOJO_PROTOCOL_DISABLED", "DOJO_PROTOCOL_PATH", "DOJO_VERIFY_AFTER_AGENT",
 	} {
 		t.Setenv(k, "")
 	}

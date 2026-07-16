@@ -9,7 +9,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +47,12 @@ type REPL struct {
 	// context only — never rendered into output. nil-safe: Apply is inert when
 	// the protocol is disabled.
 	protocol *protocol.Injector
+
+	// nudger tracks which JIT protocol gates have already been surfaced this
+	// session so the tell-triggered nudge (maybeProtocolNudge) fires at most once
+	// per distinct gate. Zero value is ready to use; driven only from the single
+	// read-loop goroutine, so it needs no lock.
+	nudger protocol.Nudger
 
 	mu         sync.Mutex         // guards turnCancel
 	turnCancel context.CancelFunc // cancels the in-flight streaming turn; nil when idle
@@ -551,6 +559,13 @@ func (r *REPL) handle(ctx context.Context, line string) error {
 
 				_ = spiritSt.Save()
 			}
+
+			// Done-means-verified: after a successful /agent dispatch or /run,
+			// run the opt-in build+test gate (Verify.AfterAgent, OFF by default).
+			// Best-effort — a red gate reports but never turns this into a failed
+			// command. REPL-only by construction: the one-shot path in
+			// cmd/dojo/main.go never calls handle(), so this can't fire there.
+			r.maybeVerifyAfterAgent(ctx, strings.ToLower(line))
 		}
 		return cmdErr
 	}
@@ -596,12 +611,14 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 	turnStart := time.Now()
 	var fullText strings.Builder
 	var sawError bool
+	var lastErrText string
 	var tokensIn, tokensOut int
 	var sawUsage bool
 	err := r.gw.ChatStream(turnCtx, req, func(chunk client.SSEChunk) {
 		ev := ClassifyChunk(chunk)
 		if ev.Type == EventError {
 			sawError = true
+			lastErrText = ev.Content
 		}
 		rendered := ev.Render(r.plain)
 		if rendered != "" {
@@ -637,6 +654,10 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 			// not a canned "stream interrupted". Combined with the error-event
 			// surfacing, the user now sees the actual cause.
 			gcolor.Red.Printf("  error: %s\n", r.gw.FriendlyError(err))
+			// JIT protocol nudge — pass the RAW error text, not FriendlyError's
+			// rewrite: FriendlyError collapses a "dial tcp … connection refused"
+			// into a URL-naming message that no longer carries the wiring tell.
+			r.maybeProtocolNudge(err.Error())
 			return nil
 		}
 	}
@@ -644,6 +665,7 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 	if sawError {
 		// Stream ended cleanly but carried a gateway error event; it was already
 		// rendered inline. Don't count it as a successful turn or award XP.
+		r.maybeProtocolNudge(lastErrText)
 		return nil
 	}
 
@@ -680,6 +702,128 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 
 	r.turns++
 	return nil
+}
+
+// ─── JIT tell-triggered protocol nudge ────────────────────────────────────────
+
+// maybeProtocolNudge surfaces the single most relevant protocol gate as a dim
+// one-line "[protocol] …" nudge when a failed chat turn's error text matches a
+// wiring/boundary tell (protocol.TellFor). It is JIT by design — situated to the
+// moment of failure rather than recited up front — and deliberately quiet:
+//   - skipped when the protocol is disabled (Protocol.Enabled false, which
+//     already reflects DOJO_PROTOCOL_DISABLED via config.Load),
+//   - skipped under --plain/--no-color (r.plain) so piped/CI stdout stays clean
+//     (--json is one-shot-only and never reaches this REPL chat path),
+//   - fired at most once per distinct gate per session (r.nudger) so a recurring
+//     error never nags.
+func (r *REPL) maybeProtocolNudge(errText string) {
+	if r.plain || r.cfg == nil || !r.cfg.Protocol.Enabled {
+		return
+	}
+	if gate, ok := r.nudger.NudgeFor(errText); ok {
+		fmt.Println(gcolor.HEX("#64748b").Sprintf("  [protocol] %s", gate))
+	}
+}
+
+// ─── Verify loop (done-means-verified) ────────────────────────────────────────
+
+// maybeVerifyAfterAgent runs the opt-in verify gate after a successful /agent
+// dispatch or /run, printing a single clearly-labeled "[verify] PASS" or
+// "[verify] FAIL: …" line. Gated on Verify.AfterAgent (OFF by default;
+// DOJO_VERIFY_AFTER_AGENT flips it on) and on the command being a verify
+// trigger. Deliberately best-effort and non-blocking: a FAIL is reported, never
+// returned, so a red gate never aborts the session.
+func (r *REPL) maybeVerifyAfterAgent(ctx context.Context, lowerLine string) {
+	if r.cfg == nil || !r.cfg.Verify.AfterAgent || !isVerifyTrigger(lowerLine) {
+		return
+	}
+	line, passed := verifyGate(ctx)
+	if r.plain {
+		fmt.Printf("  %s\n", line)
+		return
+	}
+	hex := "#22c55e" // green for PASS
+	if !passed {
+		hex = "#ef4444" // red for FAIL
+	}
+	fmt.Println(gcolor.HEX(hex).Sprintf("  %s", line))
+}
+
+// isVerifyTrigger reports whether a successfully-dispatched slash-command line
+// is one whose work may have changed code — a /agent dispatch or a /run — and
+// so should be followed by the verify gate. It matches the canonical forms plus
+// the /agents alias, on the already-lowercased, field-split line, so extra
+// spacing never defeats it. Bare "/agent" (no dispatch) does not trigger.
+func isVerifyTrigger(lowerLine string) bool {
+	f := strings.Fields(lowerLine)
+	if len(f) == 0 {
+		return false
+	}
+	if f[0] == "/run" {
+		return true
+	}
+	return (f[0] == "/agent" || f[0] == "/agents") && len(f) >= 2 && f[1] == "dispatch"
+}
+
+// verifyGate runs the build+test gate — go build ./... then go test ./... at the
+// module root — and returns a single PASS/FAIL summary line plus whether it
+// passed. It is best-effort: a missing go.mod, an absent go toolchain, or a
+// failing step all resolve to a "[verify] FAIL: …" line rather than a returned
+// error. Steps run under ctx so a session shutdown cancels them. This mirrors
+// the /code gate's exec pattern (internal/commands/cmd_code.go); that package's
+// runGoCmd/findGoModRoot are unexported and unreachable from here, so the small
+// amount of exec logic is reproduced locally.
+func verifyGate(ctx context.Context) (line string, passed bool) {
+	root, err := goModRoot()
+	if err != nil {
+		return "[verify] FAIL: " + err.Error(), false
+	}
+	for _, args := range [][]string{
+		{"build", "./..."},
+		{"test", "./..."},
+	} {
+		cmd := exec.CommandContext(ctx, "go", args...)
+		cmd.Dir = root
+		if out, cmdErr := cmd.CombinedOutput(); cmdErr != nil {
+			return fmt.Sprintf("[verify] FAIL: go %s — %s", strings.Join(args, " "), verifyFailDetail(out, cmdErr)), false
+		}
+	}
+	return "[verify] PASS", true
+}
+
+// goModRoot walks up from the current working directory to the nearest
+// directory containing a go.mod — the module root the verify gate builds and
+// tests from. Mirrors internal/commands' findGoModRoot, which is unexported and
+// so not reachable from this package.
+func goModRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, statErr := os.Stat(filepath.Join(dir, "go.mod")); statErr == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("no go.mod found from %s upward", dir)
+		}
+		dir = parent
+	}
+}
+
+// verifyFailDetail condenses a failed gate's combined output into one concise
+// line for the FAIL summary: the first non-empty output line (where the go
+// toolchain prints the actual error), falling back to the process error when
+// there is no captured output. Truncated so a wall of build errors never floods
+// the prompt.
+func verifyFailDetail(out []byte, err error) string {
+	for _, ln := range strings.Split(string(out), "\n") {
+		if s := strings.TrimSpace(ln); s != "" {
+			return truncateSSE(s, 200)
+		}
+	}
+	return err.Error()
 }
 
 // truncateSSE truncates a string to max characters for log output.

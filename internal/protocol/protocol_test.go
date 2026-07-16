@@ -274,6 +274,94 @@ func TestInjector_CwdOverlayOverridesDefault(t *testing.T) {
 	}
 }
 
+// ─── JIT tell-triggered injection: TellFor ────────────────────────────────────
+
+// TestTellFor_WiringSignaturesMapToConfigVsCodeGate proves every boundary/
+// wiring error class the CLI can observe routes to the one config-vs-code gate.
+func TestTellFor_WiringSignaturesMapToConfigVsCodeGate(t *testing.T) {
+	cases := []struct {
+		name string
+		err  string
+	}{
+		{"connection refused", `Post "http://localhost:9999/v1/chat": dial tcp 127.0.0.1:9999: connect: connection refused`},
+		{"no such host", `dial tcp: lookup nope.invalid: no such host`},
+		{"dial tcp bare", "dial tcp 10.0.0.1:7340: i/o timeout"},
+		{"auth 401", "gateway returned status 401 unauthorized"},
+		{"auth 403", "403 Forbidden"},
+		{"dead route 404", "404 page not found"},
+		{"model not found", `model "claude-x-9" not found`},
+		{"case-insensitive", "CONNECTION REFUSED"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gate, ok := TellFor(tc.err)
+			if !ok {
+				t.Fatalf("TellFor(%q) ok=false, want true", tc.err)
+			}
+			if gate != configVsCodeGate {
+				t.Errorf("TellFor(%q) gate = %q, want the config-vs-code gate %q", tc.err, gate, configVsCodeGate)
+			}
+		})
+	}
+}
+
+// TestTellFor_UnrelatedTextReturnsFalse proves ordinary, non-boundary error
+// text (or empty text) never trips the gate — the nudge stays silent.
+func TestTellFor_UnrelatedTextReturnsFalse(t *testing.T) {
+	for _, s := range []string{
+		"",
+		"the model produced an incomplete sentence", // has "model", not "not found"
+		"rate limit exceeded, please retry shortly",
+		"invalid JSON in your message payload",
+		"something unexpected happened while thinking",
+	} {
+		if gate, ok := TellFor(s); ok {
+			t.Errorf("TellFor(%q) = (%q, true), want ok=false", s, gate)
+		}
+	}
+}
+
+// ─── JIT tell-triggered injection: Nudger de-dupe ─────────────────────────────
+
+// TestNudger_FiresOncePerDistinctGate proves the fire-once-per-gate-per-session
+// guarantee: the first matching error surfaces the gate, and every later error
+// mapping to the SAME gate — even a different wiring signature — is suppressed.
+func TestNudger_FiresOncePerDistinctGate(t *testing.T) {
+	var n Nudger
+
+	gate, ok := n.NudgeFor(`dial tcp 127.0.0.1:9999: connect: connection refused`)
+	if !ok {
+		t.Fatal("first NudgeFor should fire for a wiring error")
+	}
+	if gate != configVsCodeGate {
+		t.Fatalf("first NudgeFor gate = %q, want %q", gate, configVsCodeGate)
+	}
+
+	// Same error again → deduped.
+	if g, ok := n.NudgeFor(`dial tcp 127.0.0.1:9999: connect: connection refused`); ok {
+		t.Errorf("second NudgeFor for the same error should dedupe, got (%q, true)", g)
+	}
+	// A DIFFERENT wiring error that maps to the same gate → also deduped
+	// (dedupe is per gate, not per error string).
+	if g, ok := n.NudgeFor("gateway returned 401 unauthorized"); ok {
+		t.Errorf("a different error mapping to an already-shown gate should dedupe, got (%q, true)", g)
+	}
+}
+
+// TestNudger_NoTellNoFire proves a Nudger stays silent — and records nothing —
+// for error text that carries no tell.
+func TestNudger_NoTellNoFire(t *testing.T) {
+	var n Nudger
+	if g, ok := n.NudgeFor("just a normal sentence with no boundary tell"); ok {
+		t.Errorf("NudgeFor should not fire without a tell, got (%q, true)", g)
+	}
+	// And a real tell afterwards must still fire — the no-tell call left no
+	// residue that would suppress it.
+	if _, ok := n.NudgeFor("connection refused"); !ok {
+		t.Error("NudgeFor should still fire for a real tell after a no-tell call")
+	}
+}
+
 // TestBuildSystemContext_EnvDisabled_Empty ties the DOJO_PROTOCOL_DISABLED env
 // override (resolved by config.Load) to an empty injection context — proving the
 // escape hatch reaches all the way through the request builder.
