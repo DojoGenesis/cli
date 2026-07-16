@@ -9,7 +9,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DojoGenesis/cli/internal/art"
@@ -36,6 +38,34 @@ type REPL struct {
 	turns    int    // number of successful chat turns
 	resumed  bool   // true when session was restored via --resume or /session resume
 	plain    bool   // true when --plain or --no-color is set; uses unstyled renderer output
+
+	mu         sync.Mutex         // guards turnCancel
+	turnCancel context.CancelFunc // cancels the in-flight streaming turn; nil when idle
+}
+
+// beginTurn registers the cancel func for the streaming turn about to start so a
+// SIGINT can cancel just that turn. The returned func clears the registration.
+func (r *REPL) beginTurn(cancel context.CancelFunc) func() {
+	r.mu.Lock()
+	r.turnCancel = cancel
+	r.mu.Unlock()
+	return func() {
+		r.mu.Lock()
+		r.turnCancel = nil
+		r.mu.Unlock()
+	}
+}
+
+// cancelActiveTurn cancels the in-flight streaming turn, if any. Returns true
+// when a turn was actually cancelled. Called from the SIGINT watcher.
+func (r *REPL) cancelActiveTurn() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.turnCancel != nil {
+		r.turnCancel()
+		return true
+	}
+	return false
 }
 
 // New creates a REPL bound to the given config and gateway client.
@@ -195,7 +225,7 @@ func (r *REPL) syncProviderKeys(ctx context.Context) {
 
 // Run starts the interactive loop. Returns when the user exits.
 func (r *REPL) Run(ctx context.Context) error {
-	printWelcome(r.cfg, r.session, r.resumed)
+	printWelcome(r.cfg, r.session, r.resumed, r.plain)
 
 	// Spirit: streak + session XP
 	if spiritSt, spiritErr := state.Load(); spiritErr == nil {
@@ -233,38 +263,43 @@ func (r *REPL) Run(ctx context.Context) error {
 
 		_ = spiritSt.Save()
 
-		// Display streak if > 1
-		if spiritSt.Spirit.StreakDays > 1 {
-			fmt.Printf("  %s%s\n",
-				gcolor.HEX("#94a3b8").Sprintf("%-16s", "streak:"),
-				gcolor.HEX("#ffd166").Sprintf("%d days", spiritSt.Spirit.StreakDays),
-			)
-		}
+		// Spirit visuals (streak, belt, promotions, achievements) are decorative —
+		// suppress them in plain/pipeline mode so stdout stays clean. XP state above
+		// is still recorded either way.
+		if !r.plain {
+			// Display streak if > 1
+			if spiritSt.Spirit.StreakDays > 1 {
+				fmt.Printf("  %s%s\n",
+					gcolor.HEX("#94a3b8").Sprintf("%-16s", "streak:"),
+					gcolor.HEX("#ffd166").Sprintf("%d days", spiritSt.Spirit.StreakDays),
+				)
+			}
 
-		// Display belt in welcome
-		belt := spirit.CurrentBelt(spiritSt.Spirit.XP)
-		if spiritSt.Spirit.XP > 0 {
-			fmt.Printf("  %s%s\n",
-				gcolor.HEX("#94a3b8").Sprintf("%-16s", "belt:"),
-				gcolor.HEX(belt.Color).Sprintf("%s %s (%d XP)", belt.Name, belt.Title, spiritSt.Spirit.XP),
-			)
-		}
+			// Display belt in welcome
+			belt := spirit.CurrentBelt(spiritSt.Spirit.XP)
+			if spiritSt.Spirit.XP > 0 {
+				fmt.Printf("  %s%s\n",
+					gcolor.HEX("#94a3b8").Sprintf("%-16s", "belt:"),
+					gcolor.HEX(belt.Color).Sprintf("%s %s (%d XP)", belt.Name, belt.Title, spiritSt.Spirit.XP),
+				)
+			}
 
-		if beltedUp {
-			fmt.Println()
-			fmt.Printf("  %s\n", gcolor.HEX("#ffd166").Sprint("BELT PROMOTION"))
-			fmt.Printf("  You are now: %s\n", gcolor.HEX(newBelt.Color).Sprintf("%s %s", newBelt.Name, newBelt.Title))
-			fmt.Printf("  %s\n", gcolor.HEX("#94a3b8").Sprintf("\"%s\"", spirit.BeltQuote(newBelt.Rank)))
+			if beltedUp {
+				fmt.Println()
+				fmt.Printf("  %s\n", gcolor.HEX("#ffd166").Sprint("BELT PROMOTION"))
+				fmt.Printf("  You are now: %s\n", gcolor.HEX(newBelt.Color).Sprintf("%s %s", newBelt.Name, newBelt.Title))
+				fmt.Printf("  %s\n", gcolor.HEX("#94a3b8").Sprintf("\"%s\"", spirit.BeltQuote(newBelt.Rank)))
+				fmt.Println()
+			}
+			for _, a := range newAchievements {
+				fmt.Printf("  %s %s %s\n",
+					gcolor.HEX("#ffd166").Sprint("Achievement:"),
+					gcolor.HEX("#f4a261").Sprint(a.Icon),
+					gcolor.HEX("#e8b04a").Sprint(a.Name),
+				)
+			}
 			fmt.Println()
 		}
-		for _, a := range newAchievements {
-			fmt.Printf("  %s %s %s\n",
-				gcolor.HEX("#ffd166").Sprint("Achievement:"),
-				gcolor.HEX("#f4a261").Sprint(a.Icon),
-				gcolor.HEX("#e8b04a").Sprint(a.Name),
-			)
-		}
-		fmt.Println()
 	}
 
 	// Push local API keys to the gateway so cloud providers get registered.
@@ -293,6 +328,25 @@ func (r *REPL) Run(ctx context.Context) error {
 		_ = st.Save()
 	}
 
+	// Two-tier interrupt: a SIGINT that arrives while a response is streaming
+	// cancels ONLY that turn (the base ctx from main is not SIGINT-bound, so the
+	// session survives and the loop returns to the prompt). At an idle prompt the
+	// terminal is in raw mode and Ctrl+C is delivered to readline as a byte —
+	// handled below as ErrInterrupt — so this watcher fires only mid-stream.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sigCh:
+				r.cancelActiveTurn()
+			}
+		}
+	}()
+
 	rl, err := newReadline(r.turns)
 	if err != nil {
 		// Fallback to plain stdin if readline init fails (e.g. in pipes)
@@ -313,6 +367,13 @@ func (r *REPL) Run(ctx context.Context) error {
 		line, err := rl.Readline()
 		if err != nil {
 			if err == readline.ErrInterrupt {
+				// Ctrl+C at the prompt clears a partial line; on an empty line
+				// (idle, or a second Ctrl+C right after cancelling a response)
+				// it quits cleanly.
+				if strings.TrimSpace(line) == "" {
+					fmt.Println("goodbye")
+					return nil
+				}
 				fmt.Println()
 				continue
 			}
@@ -467,12 +528,25 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 		WorkspaceRoot: workspaceRoot,
 	}
 
+	// Derive a per-turn context so a SIGINT cancels THIS response only (the
+	// watcher in Run calls cancelActiveTurn); the session's base ctx is untouched.
+	turnCtx, cancel := context.WithCancel(ctx)
+	clearTurn := r.beginTurn(cancel)
+	defer func() {
+		cancel()
+		clearTurn()
+	}()
+
 	fmt.Println()
 	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  dojo  "))
 
 	var fullText strings.Builder
-	err := r.gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
+	var sawError bool
+	err := r.gw.ChatStream(turnCtx, req, func(chunk client.SSEChunk) {
 		ev := ClassifyChunk(chunk)
+		if ev.Type == EventError {
+			sawError = true
+		}
 		rendered := ev.Render(r.plain)
 		if rendered != "" {
 			fmt.Print(rendered)
@@ -484,14 +558,26 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 	fmt.Println()
 
 	if err != nil {
-		if ctx.Err() != nil {
-			// User interrupted with Ctrl+C during streaming — not an error
-			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  [interrupted]"))
+		switch {
+		case ctx.Err() != nil:
+			// Base context ended (SIGTERM / shutdown) — let the loop exit.
+			return nil
+		case turnCtx.Err() != nil:
+			// Ctrl+C cancelled just this response; return to the prompt.
+			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  [cancelled]"))
+			return nil
+		default:
+			// Real failure (conn refused, DNS, auth, 5xx, stall) — show WHY,
+			// not a canned "stream interrupted". Combined with the error-event
+			// surfacing, the user now sees the actual cause.
+			gcolor.Red.Printf("  error: %s\n", r.gw.FriendlyError(err))
 			return nil
 		}
-		// Stream dropped unexpectedly
-		fmt.Println(gcolor.HEX("#e8b04a").Sprint("  [stream interrupted — response may be incomplete]"))
-		r.turns++ // still count it — partial response was shown
+	}
+
+	if sawError {
+		// Stream ended cleanly but carried a gateway error event; it was already
+		// rendered inline. Don't count it as a successful turn or award XP.
 		return nil
 	}
 
@@ -560,6 +646,11 @@ func (r *REPL) runPlain(ctx context.Context) error {
 	// Note: printWelcome is already called by Run() before fallback here.
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 		fmt.Print("> ")
 		if !scanner.Scan() {
 			return nil
@@ -739,14 +830,18 @@ func historyPath() string {
 
 // ─── Welcome banner ──────────────────────────────────────────────────────────
 
-func printWelcome(cfg *config.Config, session string, resumed bool) {
+func printWelcome(cfg *config.Config, session string, resumed bool, plain bool) {
 	fmt.Println()
 
-	// Bonsai sigil — zen visual anchor
-	fmt.Print(art.SmallBonsaiString())
+	// Decorative banner (bonsai + gradient wordmark) is interactive-only —
+	// piped/CI consumers get the plain session/gateway lines below, nothing more.
+	if !plain {
+		// Bonsai sigil — zen visual anchor
+		fmt.Print(art.SmallBonsaiString())
 
-	// Sunset gradient wordmark
-	fmt.Println(sunsetWordmark("  Dojo CLI"))
+		// Sunset gradient wordmark
+		fmt.Println(sunsetWordmark("  Dojo CLI"))
+	}
 
 	// Session line: label in cloud-gray, value in warm-amber, "(resumed)" tag if applicable
 	if resumed {
@@ -781,16 +876,20 @@ func printWelcome(cfg *config.Config, session string, resumed bool) {
 		}
 	}
 
-	// JetBrains Mono one-time tip
-	home, _ := os.UserHomeDir()
-	hintFile := home + "/.dojo/.mono-hint"
-	if _, err := os.Stat(hintFile); os.IsNotExist(err) {
-		gcolor.HEX("#94a3b8").Println("  tip: set terminal font to JetBrains Mono for best rendering")
-		// Create the marker file so the tip never shows again
-		_ = os.MkdirAll(home+"/.dojo", 0o755)
-		f, ferr := os.Create(hintFile)
-		if ferr == nil {
-			_ = f.Close()
+	// JetBrains Mono one-time tip — decorative, interactive-only. Skipping it in
+	// plain mode also leaves the marker uncreated, so it still shows on the next
+	// interactive run.
+	if !plain {
+		home, _ := os.UserHomeDir()
+		hintFile := home + "/.dojo/.mono-hint"
+		if _, err := os.Stat(hintFile); os.IsNotExist(err) {
+			gcolor.HEX("#94a3b8").Println("  tip: set terminal font to JetBrains Mono for best rendering")
+			// Create the marker file so the tip never shows again
+			_ = os.MkdirAll(home+"/.dojo", 0o755)
+			f, ferr := os.Create(hintFile)
+			if ferr == nil {
+				_ = f.Close()
+			}
 		}
 	}
 

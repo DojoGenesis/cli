@@ -12,10 +12,17 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/DojoGenesis/cli/internal/trace"
 )
+
+// streamStallTimeout is the maximum gap allowed between SSE chunks before the
+// stream is considered dead. It is a stall window, NOT a blanket deadline: a
+// slow-but-alive generation resets the watchdog on every chunk and survives
+// indefinitely. Declared as a var (not const) so tests can shorten it.
+var streamStallTimeout = 120 * time.Second
 
 // Client talks to an AgenticGateway instance.
 type Client struct {
@@ -41,6 +48,47 @@ func New(baseURL, token, timeout string) *Client {
 		streamHTTP: &http.Client{
 			Transport: trace.NewRoundTripper(nil, nil),
 		},
+	}
+}
+
+// BaseURL returns the gateway base URL this client targets.
+func (c *Client) BaseURL() string { return c.base }
+
+// FriendlyError turns a raw transport/HTTP error into a concise, actionable
+// message. Connection failures name the gateway URL and the three ways to point
+// the CLI at a live one; auth failures name the token knobs. Anything it does
+// not recognise is passed through unchanged so no detail is lost.
+func (c *Client) FriendlyError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	lower := strings.ToLower(msg)
+
+	switch {
+	case strings.Contains(msg, "401"),
+		strings.Contains(msg, "403"),
+		strings.Contains(lower, "unauthorized"),
+		strings.Contains(lower, "forbidden"):
+		return "gateway rejected auth — check gateway.token in ~/.dojo/settings.json, DOJO_GATEWAY_TOKEN, or --token"
+
+	case strings.Contains(lower, "connection refused"),
+		strings.Contains(lower, "no such host"),
+		strings.Contains(lower, "no route to host"),
+		strings.Contains(lower, "network is unreachable"),
+		strings.Contains(lower, "dial tcp"),
+		strings.Contains(lower, "connect: "),
+		strings.Contains(lower, "i/o timeout"),
+		strings.Contains(lower, "deadline exceeded"),
+		strings.Contains(lower, "eof"):
+		url := c.base
+		if url == "" {
+			url = "(unset)"
+		}
+		return fmt.Sprintf("cannot reach gateway at %s — is it running? set gateway.url in ~/.dojo/settings.json, DOJO_GATEWAY_URL, or --gateway", url)
+
+	default:
+		return msg
 	}
 }
 
@@ -399,11 +447,32 @@ func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onChunk func(S
 // parseSSE reads an SSE stream and calls onChunk for each data line.
 // Per SSE spec, the event field resets on blank lines (event dispatch boundary),
 // not after each data line. Buffer is raised to 1MB to handle large JSON payloads.
+//
+// A stall watchdog guards against a gateway that connects but then goes silent
+// (no bytes ever arrive): if no line is read for streamStallTimeout, the stream
+// is force-closed and a "gateway stalled" error is returned. The watchdog resets
+// on every line, so a slow-but-alive generation is never killed. When r is not an
+// io.Closer (e.g. a test strings.Reader) the watchdog is inert — it only matters
+// for real network streams that can block a Read indefinitely.
 func parseSSE(r io.Reader, onChunk func(SSEChunk)) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // up to 1MB lines
+
+	var stalled atomic.Bool
+	var watchdog *time.Timer
+	if closer, ok := r.(io.Closer); ok {
+		watchdog = time.AfterFunc(streamStallTimeout, func() {
+			stalled.Store(true)
+			_ = closer.Close() // unblock the in-flight Read
+		})
+		defer watchdog.Stop()
+	}
+
 	var event string
 	for scanner.Scan() {
+		if watchdog != nil {
+			watchdog.Reset(streamStallTimeout)
+		}
 		line := scanner.Text()
 		switch {
 		case strings.HasPrefix(line, "event:"):
@@ -418,6 +487,9 @@ func parseSSE(r io.Reader, onChunk func(SSEChunk)) error {
 			// SSE dispatch boundary — reset event for the next block
 			event = ""
 		}
+	}
+	if stalled.Load() {
+		return fmt.Errorf("gateway stalled (no data for %s)", streamStallTimeout)
 	}
 	return scanner.Err()
 }

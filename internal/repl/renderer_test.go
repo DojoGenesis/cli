@@ -246,11 +246,13 @@ func TestRender_Text_Styled(t *testing.T) {
 	}
 }
 
-func TestRender_Thinking_Plain(t *testing.T) {
+func TestRender_Thinking_Plain_Suppressed(t *testing.T) {
+	// Plain/pipeline mode suppresses the reasoning placeholder ("Processing your
+	// request…") so stdout carries only the real answer (EventText).
 	ev := RenderEvent{Type: EventThinking, Content: "hmm"}
 	got := ev.Render(true)
-	if got != "[thinking] hmm" {
-		t.Errorf("thinking plain: got %q, want %q", got, "[thinking] hmm")
+	if got != "" {
+		t.Errorf("thinking plain: got %q, want %q (suppressed)", got, "")
 	}
 }
 
@@ -375,6 +377,7 @@ func TestEventType_String(t *testing.T) {
 		{EventWarning, "warning"},
 		{EventDone, "done"},
 		{EventEmpty, "empty"},
+		{EventError, "error"},
 		{EventType(99), "unknown"},
 	}
 	for _, tt := range tests {
@@ -414,5 +417,114 @@ func TestClassifyChunk_MatchesExtractText(t *testing.T) {
 				t.Errorf("ClassifyChunk+Render(true) for %q: got %q, want %q", tc.data, rendered, tc.want)
 			}
 		})
+	}
+}
+
+// ─── Error events (P0: failures must be observable, never blank successes) ────
+
+func TestClassifyChunk_EventError_MapsToEventError(t *testing.T) {
+	// The failing-gateway repro: event:error / data:{"error":"...429..."}.
+	chunk := client.SSEChunk{Event: "error", Data: `{"error":"openai: 429 insufficient_quota"}`}
+	ev := ClassifyChunk(chunk)
+	if ev.Type != EventError {
+		t.Fatalf("event:error: got type %s, want error", ev.Type)
+	}
+	if ev.Content != "openai: 429 insufficient_quota" {
+		t.Errorf("event:error: got content %q, want the extracted error string", ev.Content)
+	}
+}
+
+func TestClassifyChunk_EventError_NestedMessage(t *testing.T) {
+	chunk := client.SSEChunk{Event: "error", Data: `{"error":{"message":"model not found (404)","code":"dead_model"}}`}
+	ev := ClassifyChunk(chunk)
+	if ev.Type != EventError {
+		t.Fatalf("nested error: got type %s, want error", ev.Type)
+	}
+	if ev.Content != "model not found (404)" {
+		t.Errorf("nested error: got content %q, want %q", ev.Content, "model not found (404)")
+	}
+}
+
+func TestClassifyChunk_EventError_NonJSONRaw(t *testing.T) {
+	chunk := client.SSEChunk{Event: "error", Data: "upstream exploded"}
+	ev := ClassifyChunk(chunk)
+	if ev.Type != EventError {
+		t.Fatalf("raw error: got type %s, want error", ev.Type)
+	}
+	if ev.Content != "upstream exploded" {
+		t.Errorf("raw error: got content %q, want raw passthrough", ev.Content)
+	}
+}
+
+func TestClassifyChunk_EventError_EmptyNeverBlank(t *testing.T) {
+	// An error event with no usable message must still classify as EventError
+	// with a non-empty, visible message — never a silent EventEmpty.
+	chunk := client.SSEChunk{Event: "error", Data: `{"error":""}`}
+	ev := ClassifyChunk(chunk)
+	if ev.Type != EventError {
+		t.Fatalf("empty error: got type %s, want error", ev.Type)
+	}
+	if ev.Content == "" {
+		t.Error("empty error: content must never be blank")
+	}
+}
+
+func TestRender_Error_Plain(t *testing.T) {
+	ev := RenderEvent{Type: EventError, Content: "429 quota exceeded"}
+	got := ev.Render(true)
+	if got != "error: 429 quota exceeded" {
+		t.Errorf("error plain: got %q, want %q", got, "error: 429 quota exceeded")
+	}
+}
+
+func TestRender_Error_Styled(t *testing.T) {
+	ev := RenderEvent{Type: EventError, Content: "429 quota exceeded"}
+	got := ev.Render(false)
+	if !strings.Contains(got, "error: 429 quota exceeded") {
+		t.Errorf("error styled: output %q does not contain the message", got)
+	}
+}
+
+func TestRenderJSON_Error_Emitted(t *testing.T) {
+	ev := RenderEvent{Type: EventError, Content: "boom"}
+	got := ev.RenderJSON()
+	if !strings.Contains(got, `"type":"error"`) || !strings.Contains(got, `"content":"boom"`) {
+		t.Errorf("error JSON: got %q, want a {type:error, content:boom} object", got)
+	}
+}
+
+func TestRenderJSON_Thinking_Suppressed(t *testing.T) {
+	// Reasoning placeholder must not pollute the --json pipeline.
+	ev := RenderEvent{Type: EventThinking, Content: "Processing your request..."}
+	if got := ev.RenderJSON(); got != "" {
+		t.Errorf("thinking JSON: got %q, want empty (suppressed)", got)
+	}
+}
+
+func TestClassifyChunk_RoutingTelemetry_Dropped(t *testing.T) {
+	for _, name := range []string{"intent_classified", "provider_selected"} {
+		chunk := client.SSEChunk{Event: name, Data: `{"intent":"chat","provider":"openai"}`}
+		ev := ClassifyChunk(chunk)
+		if ev.Type != EventEmpty {
+			t.Errorf("%s: got type %s, want empty (dropped as noise)", name, ev.Type)
+		}
+	}
+}
+
+func TestExtractError_Variants(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+		want string
+	}{
+		{"string error", `{"error":"boom"}`, "boom"},
+		{"nested message", `{"error":{"message":"nested boom"}}`, "nested boom"},
+		{"bare message", `{"message":"bare boom"}`, "bare boom"},
+		{"non-json", "plain boom", "plain boom"},
+	}
+	for _, tc := range cases {
+		if got := extractError(tc.data); got != tc.want {
+			t.Errorf("extractError(%q) = %q, want %q", tc.data, got, tc.want)
+		}
 	}
 }

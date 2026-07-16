@@ -48,6 +48,20 @@ func main() {
 		os.Exit(0)
 	}
 
+	// Bare positional subcommands: `dojo version` / `dojo help` behave like the
+	// --version / -h flags. Neither needs config or a gateway, so handle them
+	// before anything else rather than launching the REPL.
+	if args := flag.Args(); len(args) > 0 {
+		switch args[0] {
+		case "version":
+			fmt.Printf("dojo %s\n", version)
+			os.Exit(0)
+		case "help":
+			flag.Usage()
+			os.Exit(0)
+		}
+	}
+
 	// Load config
 	cfg, err := config.Load()
 	if err != nil {
@@ -73,12 +87,12 @@ func main() {
 	// Build gateway client
 	gw := client.New(cfg.Gateway.URL, cfg.Gateway.Token, cfg.Gateway.Timeout)
 
-	// Cancellable context — catches Ctrl+C
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// One-shot mode: send a single message and exit
+	// One-shot mode: send a single message and exit. Ctrl+C cancels the single
+	// turn and exits.
 	if *flagOneShot != "" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
 		workspaceRoot, _ := os.Getwd()
 		req := client.ChatRequest{
 			Message:       *flagOneShot,
@@ -87,8 +101,20 @@ func main() {
 			Stream:        true,
 			WorkspaceRoot: workspaceRoot,
 		}
-		err = gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
+
+		// Record the first gateway error event. Without this a failed stream
+		// (429 quota, 404 dead model, …) renders blank and the process exits 0,
+		// so every failure looks like a silent success. See repl.EventError.
+		var (
+			errSeen bool
+			errMsg  string
+		)
+		streamErr := gw.ChatStream(ctx, req, func(chunk client.SSEChunk) {
 			ev := repl.ClassifyChunk(chunk)
+			if ev.Type == repl.EventError && !errSeen {
+				errSeen = true
+				errMsg = ev.Content
+			}
 			if *flagJSON {
 				if out := ev.RenderJSON(); out != "" {
 					fmt.Println(out)
@@ -102,11 +128,36 @@ func main() {
 		if !*flagJSON {
 			fmt.Println()
 		}
-		if err != nil {
-			fatalf("one-shot error: %s", err)
+
+		// Transport-level failure (couldn't connect, stalled, non-200 status).
+		if streamErr != nil {
+			if ctx.Err() != nil {
+				fmt.Fprintln(os.Stderr, "dojo: cancelled")
+				os.Exit(130)
+			}
+			fmt.Fprintf(os.Stderr, "dojo: %s\n", gw.FriendlyError(streamErr))
+			os.Exit(1)
+		}
+		// Transport succeeded but the stream carried a gateway error event —
+		// exit non-zero so scripts and CI see the failure.
+		if errSeen {
+			fmt.Fprintf(os.Stderr, "dojo: gateway error: %s\n", errMsg)
+			os.Exit(1)
 		}
 		return
 	}
+
+	// --json is a one-shot-only pipeline flag; in interactive mode it is a silent
+	// no-op today, so say so on stderr rather than ignoring it quietly.
+	if *flagJSON {
+		fmt.Fprintln(os.Stderr, "dojo: --json only applies to --one-shot mode; ignoring")
+	}
+
+	// Interactive REPL. The base context is deliberately NOT bound to SIGINT: a
+	// single Ctrl+C during a streaming turn must cancel only that turn (handled
+	// inside the REPL), not end the whole session. SIGTERM still shuts down.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	defer stop()
 
 	// Run REPL (plugin scan happens inside repl.New)
 	r := repl.New(cfg, gw, *flagResume, *flagPlain || *flagNoColor)
