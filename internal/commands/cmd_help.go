@@ -35,6 +35,7 @@ func (r *Registry) helpCmd() Command {
 					{"/model direct <provider> <model> <msg>", "direct API call (bypass gateway)", ""},
 					{"/session", "show active session ID", ""},
 					{"/session new", "start a fresh session", ""},
+					{"/session ls", "list recent sessions", ""},
 					{"/session resume", "resume the most recent session", ""},
 					{"/session <id>", "switch to a session by ID (not verified against gateway)", ""},
 					{"/disposition", "show current disposition preset", ""},
@@ -113,6 +114,7 @@ func (r *Registry) helpCmd() Command {
 					{"/code build", "run go build ./...", ""},
 					{"/code vet", "run go vet ./...", ""},
 					{"/code gate", "run build + test + vet (full gate)", ""},
+					{"/code undo", "preview + revert unstaged changes to tracked files", ""},
 				}},
 				{"Practice", []helpEntry{
 					{"/practice", "daily reflection prompts (rotates by day of week)", ""},
@@ -134,6 +136,7 @@ func (r *Registry) helpCmd() Command {
 				}},
 				{"System", []helpEntry{
 					{"/health", "gateway health + stats", ""},
+					{"/doctor", "diagnostic: gateway, providers, config, plugins/hooks, protocol, harnesses", ""},
 					{"/settings", "show config and active settings", ""},
 					{"/settings effective", "show merged file + env + flag config", ""},
 					{"/settings providers", "show provider configuration", ""},
@@ -147,6 +150,12 @@ func (r *Registry) helpCmd() Command {
 					{"/activity clear", "clear the activity log", ""},
 					{"/tools", "list registered MCP tools, grouped by namespace", ""},
 					{"/doc <id>", "fetch and display a document", "beta"},
+				}},
+				{"Protocol", []helpEntry{
+					{"/protocol", "genius-protocol status + kata-harness install state", ""},
+					{"/protocol status", "same as /protocol", ""},
+					{"/protocol harnesses", "list the KE harness catalog — status, ratified, installed", ""},
+					{"/protocol install <name> [--yes]", "install a ratified, locally-available harness", ""},
 				}},
 				{"DojoCraft", []helpEntry{
 					{"/craft adr <title>", "write an ADR via the gateway", ""},
