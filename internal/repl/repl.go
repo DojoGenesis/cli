@@ -593,8 +593,11 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 	fmt.Println()
 	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  dojo  "))
 
+	turnStart := time.Now()
 	var fullText strings.Builder
 	var sawError bool
+	var tokensIn, tokensOut int
+	var sawUsage bool
 	err := r.gw.ChatStream(turnCtx, req, func(chunk client.SSEChunk) {
 		ev := ClassifyChunk(chunk)
 		if ev.Type == EventError {
@@ -604,6 +607,16 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 		if rendered != "" {
 			fmt.Print(rendered)
 			fullText.WriteString(ev.Content)
+		}
+		// Per-turn cost/token readout: opportunistically check every chunk for
+		// a usage payload (see extractUsage) rather than gating on a specific
+		// event name — in practice the gateway, if it sends usage at all, only
+		// attaches it to the terminal "done" event, but checking every chunk
+		// costs one cheap failed json.Unmarshal when absent and does not affect
+		// what gets rendered or how the stream proceeds.
+		if in, out, ok := extractUsage(chunk.Data); ok {
+			tokensIn, tokensOut = in, out
+			sawUsage = true
 		}
 	})
 
@@ -636,6 +649,27 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 
 	if fullText.Len() == 0 {
 		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  [no response — the gateway may have encountered an internal error]"))
+	}
+
+	// Per-turn cost/token readout — dim, interactive-only footer. Suppressed
+	// under --plain, which also covers --json: --json is a one-shot-only flag
+	// (cmd/dojo/main.go) that never reaches the REPL's chat() path at all, so
+	// gating on r.plain alone is sufficient here.
+	//
+	// As of this writing the gateway's /v1/chat stream never actually carries
+	// usage data: renderer.go's ClassifyChunk discards the "done" event's
+	// payload entirely, and both TestClassifyChunk_EventDone* fixtures in
+	// renderer_test.go model "done" data as either empty or a plain human
+	// string, never JSON. So sawUsage never flips true today and this block is
+	// a graceful no-op. It activates automatically — no further REPL changes
+	// needed — the moment the gateway attaches usage to any chunk, since
+	// extractUsage already recognizes every usage shape used elsewhere against
+	// this same gateway/providers (see extractUsage's doc comment).
+	if sawUsage && !r.plain {
+		total := tokensIn + tokensOut
+		fmt.Printf("  %s\n",
+			gcolor.HEX("#64748b").Sprintf("%s tokens · %.1fs", formatTokenCount(total), time.Since(turnStart).Seconds()),
+		)
 	}
 
 	// Spirit: award chat XP
@@ -694,6 +728,85 @@ func extractText(chunk client.SSEChunk) string {
 	return data
 }
 
+// extractUsage looks for token-usage counters in a raw SSE chunk payload
+// (client.SSEChunk.Data). client.SSEChunk carries no typed usage field —
+// Data is opaque JSON (or, per renderer_test.go's "done" fixtures, sometimes
+// not JSON at all) — so this is a best-effort, forward-compatible parse
+// rather than a decode against a known schema.
+//
+// It recognizes every usage shape already in use elsewhere against this same
+// gateway/providers, in this priority order:
+//   - {"usage": {"tokens_in": N, "tokens_out": N}} — the Dojo gateway's own
+//     naming, confirmed live on the /events "complete" entries consumed by
+//     internal/tui/pilot.go and the /api/telemetry/* rows in
+//     internal/commands/cmd_telemetry.go.
+//   - {"usage": {"input_tokens": N, "output_tokens": N}} — Anthropic's
+//     naming, used by the direct-API path in internal/providers/providers.go.
+//   - {"usage": {"prompt_tokens": N, "completion_tokens": N}} — OpenAI's
+//     naming, also used in internal/providers/providers.go.
+//
+// The same three key-pairs are also checked at the top level (no "usage"
+// wrapper), in case a future /v1/chat event flattens them. Returns
+// ok == false — a no-op for the caller — when data is empty, non-JSON, or
+// JSON that matches none of the above; that is the case for every "done"
+// payload seen in this codebase's tests today.
+func extractUsage(data string) (tokensIn, tokensOut int, ok bool) {
+	data = strings.TrimSpace(data)
+	if data == "" || data == "[DONE]" {
+		return 0, 0, false
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		return 0, 0, false
+	}
+
+	usage := m
+	if nested, isMap := m["usage"].(map[string]any); isMap {
+		usage = nested
+	}
+
+	pairs := [][2]string{
+		{"tokens_in", "tokens_out"},
+		{"input_tokens", "output_tokens"},
+		{"prompt_tokens", "completion_tokens"},
+	}
+	for _, p := range pairs {
+		in, inOK := numField(usage, p[0])
+		out, outOK := numField(usage, p[1])
+		if inOK || outOK {
+			return in, out, true
+		}
+	}
+	return 0, 0, false
+}
+
+// numField reads a numeric field out of a decoded-JSON object. encoding/json
+// decodes every JSON number into float64 when the target is map[string]any,
+// so this centralizes the float64→int conversion instead of repeating the
+// type assertion at each call site in extractUsage.
+func numField(m map[string]any, key string) (int, bool) {
+	v, ok := m[key].(float64)
+	if !ok {
+		return 0, false
+	}
+	return int(v), true
+}
+
+// formatTokenCount renders a token count as a compact, human-scannable
+// string for the per-turn footer. Under 1000 it prints the exact count
+// ("342"); at or above 1000 it prints a tilde-prefixed one-decimal "k"
+// figure ("~1.2k") — the tilde signals "approximate" without repeating the
+// word. A trailing ".0" is dropped so an even thousand reads "~1k", not
+// "~1.0k".
+func formatTokenCount(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	k := strings.TrimSuffix(fmt.Sprintf("%.1f", float64(n)/1000.0), ".0")
+	return "~" + k + "k"
+}
+
 // runPlain is the fallback when readline is unavailable (piped input, CI).
 func (r *REPL) runPlain(ctx context.Context) error {
 	// Note: printWelcome is already called by Run() before fallback here.
@@ -724,13 +837,27 @@ func (r *REPL) runPlain(ctx context.Context) error {
 // ─── readline setup ──────────────────────────────────────────────────────────
 
 func newReadline(turns int) (*readline.Instance, error) {
+	// /guide start's children are generated from guide.All (internal/guide)
+	// instead of hand-maintained: guide.All has grown to 17 guides over time
+	// but this completer only ever offered the original 4 (welcome, spirit,
+	// agents, memory), so a static list would just drift stale again the next
+	// time a guide is added. Reading the catalogue here keeps it correct by
+	// construction — internal/guide itself is untouched.
+	guideStartItems := make([]readline.PrefixCompleterInterface, 0, len(guide.All))
+	for _, g := range guide.All {
+		guideStartItems = append(guideStartItems, readline.PcItem(g.ID))
+	}
+
 	completer := readline.NewPrefixCompleter(
 		readline.PcItem("/help"),
 		readline.PcItem("/health"),
-		readline.PcItem("/home"),
+		readline.PcItem("/home",
+			readline.PcItem("plain"),
+		),
 		readline.PcItem("/model",
 			readline.PcItem("ls"),
 			readline.PcItem("set"),
+			readline.PcItem("direct"),
 		),
 		readline.PcItem("/tools"),
 		readline.PcItem("/agent",
@@ -756,13 +883,16 @@ func newReadline(turns int) (*readline.Instance, error) {
 		readline.PcItem("/workflow"),
 		readline.PcItem("/skill",
 			readline.PcItem("ls"),
+			readline.PcItem("search"),
 			readline.PcItem("get"),
 			readline.PcItem("inspect"),
 			readline.PcItem("tags"),
+			readline.PcItem("package-all"),
 		),
 		readline.PcItem("/doc"),
 		readline.PcItem("/session",
 			readline.PcItem("new"),
+			readline.PcItem("ls"),
 			readline.PcItem("resume"),
 		),
 		readline.PcItem("/run"),
@@ -770,7 +900,6 @@ func newReadline(turns int) (*readline.Instance, error) {
 			readline.PcItem("ls"),
 			readline.PcItem("stats"),
 			readline.PcItem("plant"),
-			readline.PcItem("harvest"),
 			readline.PcItem("search"),
 			readline.PcItem("rm"),
 		),
@@ -794,8 +923,15 @@ func newReadline(turns int) (*readline.Instance, error) {
 			readline.PcItem("fire"),
 		),
 		readline.PcItem("/settings",
+			readline.PcItem("effective"),
 			readline.PcItem("providers"),
 			readline.PcItem("set"),
+			readline.PcItem("profile",
+				readline.PcItem("ls"),
+				readline.PcItem("set"),
+				readline.PcItem("show"),
+				readline.PcItem("create"),
+			),
 		),
 		readline.PcItem("/init",
 			readline.PcItem("--force"),
@@ -804,13 +940,16 @@ func newReadline(turns int) (*readline.Instance, error) {
 			readline.PcItem("--skip-seeds"),
 		),
 		readline.PcItem("/practice"),
-		readline.PcItem("/projects",
-			readline.PcItem("ls"),
-		),
+		readline.PcItem("/projects"),
 		readline.PcItem("/plugin",
 			readline.PcItem("ls"),
 			readline.PcItem("install"),
 			readline.PcItem("rm"),
+		),
+		readline.PcItem("/protocol",
+			readline.PcItem("status"),
+			readline.PcItem("harnesses"),
+			readline.PcItem("install"),
 		),
 		readline.PcItem("/disposition",
 			readline.PcItem("ls"),
@@ -822,12 +961,7 @@ func newReadline(turns int) (*readline.Instance, error) {
 		readline.PcItem("/card"),
 		readline.PcItem("/guide",
 			readline.PcItem("ls"),
-			readline.PcItem("start",
-				readline.PcItem("welcome"),
-				readline.PcItem("spirit"),
-				readline.PcItem("agents"),
-				readline.PcItem("memory"),
-			),
+			readline.PcItem("start", guideStartItems...),
 			readline.PcItem("status"),
 			readline.PcItem("stop"),
 		),
@@ -863,7 +997,39 @@ func newReadline(turns int) (*readline.Instance, error) {
 			readline.PcItem("build"),
 			readline.PcItem("vet"),
 			readline.PcItem("gate"),
+			readline.PcItem("undo"),
 		),
+		readline.PcItem("/craft",
+			readline.PcItem("adr"),
+			readline.PcItem("scout"),
+			readline.PcItem("claude-md",
+				readline.PcItem("--fix"),
+			),
+			readline.PcItem("memory",
+				readline.PcItem("ls"),
+				readline.PcItem("add"),
+				readline.PcItem("rm"),
+				readline.PcItem("prune"),
+				readline.PcItem("search"),
+			),
+			readline.PcItem("seed",
+				readline.PcItem("ls"),
+				readline.PcItem("plant"),
+				readline.PcItem("harvest"),
+				readline.PcItem("search"),
+				readline.PcItem("elevate"),
+			),
+			readline.PcItem("view"),
+			readline.PcItem("scaffold",
+				readline.PcItem("go-service"),
+				readline.PcItem("fullstack"),
+				readline.PcItem("orchestration"),
+				readline.PcItem("plugin"),
+				readline.PcItem("minimal"),
+			),
+			readline.PcItem("converge"),
+		),
+		readline.PcItem("/doctor"),
 		readline.PcItem("exit"),
 	)
 
