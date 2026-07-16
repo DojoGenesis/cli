@@ -5,10 +5,13 @@ package repl
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/DojoGenesis/cli/internal/client"
+	"github.com/charmbracelet/glamour"
 	gcolor "github.com/gookit/color"
+	"golang.org/x/term"
 )
 
 // EventType classifies SSE chunks for rendering.
@@ -211,6 +214,56 @@ func (re RenderEvent) Render(plain bool) string {
 	}
 
 	return re.Content
+}
+
+// RenderMarkdown renders a FULLY ASSEMBLED assistant message as styled
+// markdown for terminal display (fenced code blocks, headings, lists, etc.).
+//
+// Callers must pass the complete message text, not an individual EventText
+// chunk. Assistant text arrives from the gateway as streaming chunks, and
+// glamour parses markdown structurally — it cannot render a partial
+// document — so this is deliberately NOT wired into the per-chunk Render()
+// path above; wiring it there would regress live streaming. The intended
+// call site is end-of-turn, once every EventText chunk for a response has
+// been concatenated into one string.
+//
+// When plain is true, full is returned verbatim: --plain/--json/piped
+// consumers must always see raw markdown text, never ANSI escapes.
+func RenderMarkdown(full string, plain bool) string {
+	if plain {
+		return full
+	}
+
+	mdRenderer, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(terminalWidth()),
+	)
+	if err != nil {
+		// Styling failure must never eat the response — fall back to raw text.
+		return full
+	}
+
+	out, err := mdRenderer.Render(full)
+	if err != nil {
+		return full
+	}
+
+	// glamour's document style brackets output in a blank-line block_prefix/
+	// suffix plus a left margin; trim the outer blank lines so the result
+	// composes cleanly with the caller's own spacing.
+	return strings.TrimSpace(out)
+}
+
+// terminalWidth returns the current terminal's column width for glamour's
+// word-wrap, falling back to a sane default when stdout isn't a TTY (piped
+// output, CI, or `go test`).
+func terminalWidth() int {
+	const fallbackWidth = 80
+	w, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || w <= 0 {
+		return fallbackWidth
+	}
+	return w
 }
 
 // ─── internal content extraction ─────────────────────────────────────────────
