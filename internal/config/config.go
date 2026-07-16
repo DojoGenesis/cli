@@ -24,6 +24,14 @@ type Config struct {
 	Protocol            ProtocolConfig               `json:"protocol"`
 	Auth                AuthConfig                   `json:"auth,omitempty"`
 	DispositionProfiles map[string]DispositionPreset `json:"disposition_profiles,omitempty"`
+
+	// envOverrides records which fields Load() populated from an environment
+	// variable (DOJO_GATEWAY_URL, DOJO_PROTOCOL_DISABLED, etc.), and what each
+	// field held immediately before that override was applied. Unexported so
+	// encoding/json never serializes it — Save() reads it to keep env-transient
+	// overrides out of settings.json. See envOverride and Save() for why this
+	// exists and noteEnvOverride() for how it's populated.
+	envOverrides []envOverride
 }
 
 // ProtocolConfig controls the workspace "genius protocol" carried onto every
@@ -58,6 +66,41 @@ type DefaultsConfig struct {
 	Model       string `json:"model"`
 }
 
+// envOverride records one Config field that Load() populated from an
+// environment variable: get/set read and write the field, preEnv is the
+// value the field held immediately before the override was applied (from
+// settings.json or defaults()), and envVal is the value the override wrote.
+//
+// Save() compares get(c) against envVal to tell "still env-controlled"
+// (nothing has touched the field since Load(), so persist preEnv instead)
+// apart from "explicitly changed since Load()" (e.g. /model set mutating
+// Defaults.Model directly — a real edit, so persist the new value as-is).
+// See Save() for the full rationale: this is what stops a one-off env var
+// like DOJO_PROTOCOL_DISABLED=1 from getting permanently baked into
+// settings.json the next time anything calls Save().
+type envOverride struct {
+	get    func(*Config) any
+	set    func(*Config, any)
+	preEnv any
+	envVal any
+}
+
+// noteEnvOverride applies newVal to a Config field via set, after
+// snapshotting the field's current (pre-override) value via get, and
+// records both on cfg.envOverrides for Save() to consult later. Call this
+// instead of assigning the field directly whenever Load() applies an env
+// var override — see envOverride and Save().
+func noteEnvOverride[T comparable](cfg *Config, get func(*Config) T, set func(*Config, T), newVal T) {
+	pre := get(cfg)
+	set(cfg, newVal)
+	cfg.envOverrides = append(cfg.envOverrides, envOverride{
+		get:    func(c *Config) any { return get(c) },
+		set:    func(c *Config, v any) { set(c, v.(T)) },
+		preEnv: pre,
+		envVal: newVal,
+	})
+}
+
 // Load reads ~/.dojo/settings.json, applying environment variable overrides.
 // Missing file is not an error — defaults are returned.
 func Load() (*Config, error) {
@@ -71,35 +114,65 @@ func Load() (*Config, error) {
 		}
 	}
 
-	// Environment overrides
+	// Environment overrides. Each is applied via noteEnvOverride (not a plain
+	// field assignment) so Save() can keep these transient, run-scoped values
+	// out of settings.json instead of silently baking them in permanently —
+	// see envOverride and Save().
 	if v := os.Getenv("DOJO_GATEWAY_URL"); v != "" {
-		cfg.Gateway.URL = v
+		noteEnvOverride(cfg,
+			func(c *Config) string { return c.Gateway.URL },
+			func(c *Config, v string) { c.Gateway.URL = v },
+			v)
 	}
 	if v := os.Getenv("DOJO_GATEWAY_TOKEN"); v != "" {
-		cfg.Gateway.Token = v
+		noteEnvOverride(cfg,
+			func(c *Config) string { return c.Gateway.Token },
+			func(c *Config, v string) { c.Gateway.Token = v },
+			v)
 	}
 	if v := os.Getenv("DOJO_PLUGINS_PATH"); v != "" {
-		cfg.Plugins.Path = v
+		noteEnvOverride(cfg,
+			func(c *Config) string { return c.Plugins.Path },
+			func(c *Config, v string) { c.Plugins.Path = v },
+			v)
 	}
 	if v := os.Getenv("DOJO_PROVIDER"); v != "" {
-		cfg.Defaults.Provider = v
+		noteEnvOverride(cfg,
+			func(c *Config) string { return c.Defaults.Provider },
+			func(c *Config, v string) { c.Defaults.Provider = v },
+			v)
 	}
 	if v := os.Getenv("DOJO_DISPOSITION"); v != "" {
-		cfg.Defaults.Disposition = v
+		noteEnvOverride(cfg,
+			func(c *Config) string { return c.Defaults.Disposition },
+			func(c *Config, v string) { c.Defaults.Disposition = v },
+			v)
 	}
 	if v := os.Getenv("DOJO_MODEL"); v != "" {
-		cfg.Defaults.Model = v
+		noteEnvOverride(cfg,
+			func(c *Config) string { return c.Defaults.Model },
+			func(c *Config, v string) { c.Defaults.Model = v },
+			v)
 	}
 	if v := os.Getenv("DOJO_USER_ID"); v != "" {
-		cfg.Auth.UserID = v
+		noteEnvOverride(cfg,
+			func(c *Config) string { return c.Auth.UserID },
+			func(c *Config, v string) { c.Auth.UserID = v },
+			v)
 	}
 	// DOJO_PROTOCOL_DISABLED: any non-empty value turns the protocol off. This
 	// is the escape hatch that must work even when settings.json says enabled.
 	if v := os.Getenv("DOJO_PROTOCOL_DISABLED"); v != "" {
-		cfg.Protocol.Enabled = false
+		noteEnvOverride(cfg,
+			func(c *Config) bool { return c.Protocol.Enabled },
+			func(c *Config, v bool) { c.Protocol.Enabled = v },
+			false)
 	}
 	if v := os.Getenv("DOJO_PROTOCOL_PATH"); v != "" {
-		cfg.Protocol.Path = v
+		noteEnvOverride(cfg,
+			func(c *Config) string { return c.Protocol.Path },
+			func(c *Config, v string) { c.Protocol.Path = v },
+			v)
 	}
 
 	// Gateway settings are load-bearing for connectivity — a malformed URL
@@ -275,8 +348,32 @@ func SettingsPath() string {
 }
 
 // Save writes the current config to ~/.dojo/settings.json atomically.
+//
+// Fields Load() populated from an environment variable (DOJO_GATEWAY_URL,
+// DOJO_PROTOCOL_DISABLED, ...) are transient by design — they override
+// settings.json for the current run, not rewrite it. Without this guard, any
+// such env var combined with any command that saves config (/model set,
+// /disposition set) would silently and permanently bake the override into
+// settings.json. This actually happened: a run with DOJO_PROTOCOL_DISABLED=1
+// that also triggered a save wrote protocol.enabled:false to disk, disabling
+// the protocol on every later run even with the env var unset.
+//
+// So for each field Load() env-overrode (tracked in c.envOverrides), Save()
+// checks whether the field still holds the exact value the override wrote:
+// if so, nothing has touched it since Load(), and the pre-override value
+// (from the file, or the default) is written instead of the transient one.
+// If the field has since been explicitly changed by application code (e.g.
+// /model set mutating Defaults.Model directly), that's a real user edit and
+// is kept as-is — this only strips values that are still purely env-sourced.
 func (c *Config) Save() error {
-	data, err := json.MarshalIndent(c, "", "  ")
+	out := *c
+	for _, ov := range c.envOverrides {
+		if ov.get(c) == ov.envVal {
+			ov.set(&out, ov.preEnv)
+		}
+	}
+
+	data, err := json.MarshalIndent(&out, "", "  ")
 	if err != nil {
 		return err
 	}

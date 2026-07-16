@@ -780,3 +780,211 @@ func TestEffectiveString_AuthNotSet(t *testing.T) {
 		t.Errorf("EffectiveString() missing %q\ngot:\n%s", want, out)
 	}
 }
+
+// ─── Save() strips transient env overrides ───────────────────────────────────
+//
+// Regression coverage for a real incident: Load() applies env var overrides
+// directly onto the runtime *Config it returns. Several commands (/model
+// set, /disposition set) later call cfg.Save() on that same *Config for an
+// unrelated reason. Before this fix, Save() serialized whatever the struct
+// held — so a purely run-scoped override like DOJO_PROTOCOL_DISABLED=1 got
+// baked into settings.json permanently the moment any save happened,
+// silently disabling the protocol on every later run even with the env var
+// unset. See envOverride and Config.Save() for the fix.
+
+func clearAllConfigEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"DOJO_GATEWAY_URL", "DOJO_GATEWAY_TOKEN", "DOJO_PLUGINS_PATH",
+		"DOJO_PROVIDER", "DOJO_DISPOSITION", "DOJO_MODEL", "DOJO_USER_ID",
+		"DOJO_PROTOCOL_DISABLED", "DOJO_PROTOCOL_PATH",
+	} {
+		t.Setenv(k, "")
+	}
+}
+
+func TestSave_StripsEnvOverride_ProtocolDisabled(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	clearAllConfigEnv(t)
+	t.Setenv("DOJO_PROTOCOL_DISABLED", "1")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Protocol.Enabled {
+		t.Fatal("sanity check failed: DOJO_PROTOCOL_DISABLED=1 should have disabled the protocol")
+	}
+
+	// Simulate a command that saves config for an unrelated reason — this is
+	// the actual trigger that leaked the env override to disk in the field
+	// (e.g. /model set calling cfg.Save() after changing Defaults.Model).
+	cfg.Defaults.Model = "claude-sonnet-4-6"
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	// Reload with the SAME settings.json but WITHOUT the env var. Before the
+	// fix this came back false — permanently stuck disabled.
+	t.Setenv("DOJO_PROTOCOL_DISABLED", "")
+	reloaded, err := Load()
+	if err != nil {
+		t.Fatalf("reload error: %v", err)
+	}
+	if !reloaded.Protocol.Enabled {
+		t.Error("Protocol.Enabled should be back to true after reload without DOJO_PROTOCOL_DISABLED — Save() must not persist a still-in-effect env override")
+	}
+	// The unrelated explicit change made before Save() must still have
+	// persisted normally.
+	if reloaded.Defaults.Model != "claude-sonnet-4-6" {
+		t.Errorf("Defaults.Model should have been saved: got %q, want %q", reloaded.Defaults.Model, "claude-sonnet-4-6")
+	}
+}
+
+func TestSave_StripsEnvOverride_GatewayURL(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	clearAllConfigEnv(t)
+	t.Setenv("DOJO_GATEWAY_URL", "http://env-transient:9999")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Gateway.URL != "http://env-transient:9999" {
+		t.Fatalf("sanity check failed: Gateway.URL = %q, want the env override", cfg.Gateway.URL)
+	}
+
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	t.Setenv("DOJO_GATEWAY_URL", "")
+	reloaded, err := Load()
+	if err != nil {
+		t.Fatalf("reload error: %v", err)
+	}
+	if reloaded.Gateway.URL != DefaultGatewayURL {
+		t.Errorf("Gateway.URL after reload: got %q, want default %q — Save() must not persist a still-in-effect env override", reloaded.Gateway.URL, DefaultGatewayURL)
+	}
+}
+
+// The realistic version of the incident: settings.json already holds a real,
+// non-default value on disk. Save() must restore THAT value, not just the
+// compiled-in default, when stripping a still-in-effect env override.
+func TestSave_StripsEnvOverride_RevertsToFileValueNotJustDefault(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	clearAllConfigEnv(t)
+
+	dojoDir := filepath.Join(tmp, ".dojo")
+	if err := os.MkdirAll(dojoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	seeded := map[string]any{"gateway": map[string]any{"url": "http://my-real-gateway:7340", "timeout": "60s"}}
+	data, _ := json.Marshal(seeded)
+	if err := os.WriteFile(filepath.Join(dojoDir, "settings.json"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// A one-off run overrides the gateway via env (e.g. pointing at a local
+	// test instance)...
+	t.Setenv("DOJO_GATEWAY_URL", "http://one-off-test-gateway:1234")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Gateway.URL != "http://one-off-test-gateway:1234" {
+		t.Fatalf("sanity check failed: Gateway.URL = %q", cfg.Gateway.URL)
+	}
+
+	// ...and that same run happens to also save config for an unrelated
+	// reason (/disposition set).
+	cfg.Defaults.Disposition = "focused"
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	// Next run, without the env var: must see the REAL gateway from the
+	// file, not the one-off test value.
+	t.Setenv("DOJO_GATEWAY_URL", "")
+	reloaded, err := Load()
+	if err != nil {
+		t.Fatalf("reload error: %v", err)
+	}
+	if reloaded.Gateway.URL != "http://my-real-gateway:7340" {
+		t.Errorf("Gateway.URL after reload: got %q, want the pre-existing file value %q", reloaded.Gateway.URL, "http://my-real-gateway:7340")
+	}
+	if reloaded.Defaults.Disposition != "focused" {
+		t.Errorf("Defaults.Disposition should have persisted the explicit change: got %q", reloaded.Defaults.Disposition)
+	}
+}
+
+// The other half of the fix: an explicit change to the SAME field an env var
+// overrode must win, not get reverted. This is what /model set does — set
+// Defaults.Model directly, then Save() — and it must not be treated as
+// "still env-controlled" just because DOJO_MODEL happened to be set too.
+func TestSave_ExplicitChangeToEnvOverriddenField_Wins(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	clearAllConfigEnv(t)
+	t.Setenv("DOJO_MODEL", "env-model")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Defaults.Model != "env-model" {
+		t.Fatalf("sanity check failed: Defaults.Model = %q", cfg.Defaults.Model)
+	}
+
+	// Exactly what cmd_model.go's /model set does: mutate the same field the
+	// env var had overridden, then Save().
+	cfg.Defaults.Model = "explicitly-chosen-model"
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	t.Setenv("DOJO_MODEL", "")
+	reloaded, err := Load()
+	if err != nil {
+		t.Fatalf("reload error: %v", err)
+	}
+	if reloaded.Defaults.Model != "explicitly-chosen-model" {
+		t.Errorf("Defaults.Model: got %q, want the explicitly-set value %q — an explicit change to an env-overridden field must survive Save(), not get reverted", reloaded.Defaults.Model, "explicitly-chosen-model")
+	}
+}
+
+// A Config built directly (not via Load()) has no envOverrides recorded at
+// all — Save() must be a plain, unmodified round-trip in that case, exactly
+// as it always was. Guards against the fix accidentally touching fields it
+// has no override record for.
+func TestSave_NoEnvOverrides_PlainRoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	cfg := &Config{
+		Gateway:  GatewayConfig{URL: "http://literal:7340", Timeout: "60s"},
+		Defaults: DefaultsConfig{Disposition: "balanced", Model: "literal-model"},
+		Protocol: ProtocolConfig{Enabled: false},
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	clearAllConfigEnv(t)
+	reloaded, err := Load()
+	if err != nil {
+		t.Fatalf("reload error: %v", err)
+	}
+	if reloaded.Gateway.URL != "http://literal:7340" {
+		t.Errorf("Gateway.URL: got %q, want %q", reloaded.Gateway.URL, "http://literal:7340")
+	}
+	if reloaded.Defaults.Model != "literal-model" {
+		t.Errorf("Defaults.Model: got %q, want %q", reloaded.Defaults.Model, "literal-model")
+	}
+	if reloaded.Protocol.Enabled {
+		t.Error("Protocol.Enabled: got true, want false (the literal value written) — no env override was ever in play")
+	}
+}
