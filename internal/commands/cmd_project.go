@@ -18,13 +18,25 @@ import (
 func (r *Registry) projectsCmd() Command {
 	return Command{
 		Name:  "projects",
-		Usage: "/projects ls",
-		Short: "Local workspace view — cwd, plugins, session",
+		Usage: "/projects",
+		Short: "Shows the local workspace view — cwd, plugins, session (takes no arguments)",
 		Run: func(ctx context.Context, args []string) error {
 			fmt.Println()
 			gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Projects — local workspace"))
 			fmt.Println()
 			fmt.Println()
+
+			// /projects takes no arguments — earlier versions silently ignored
+			// anything passed here (e.g. "/projects ls" and "/projects xyz" were
+			// identical to bare "/projects"). Say so instead of pretending the
+			// argument did something.
+			if len(args) > 0 {
+				fmt.Println(gcolor.HEX("#94a3b8").Sprintf(
+					"  note: /projects takes no arguments — ignoring %q. Showing the local workspace view below.",
+					strings.Join(args, " "),
+				))
+				fmt.Println()
+			}
 
 			// Current working directory name as the project
 			cwd, err := os.Getwd()

@@ -18,7 +18,7 @@ func (r *Registry) gardenCmd() Command {
 	return Command{
 		Name:    "garden",
 		Aliases: []string{"seeds", "memory"},
-		Usage:   "/garden [ls|stats|plant <text>|harvest]",
+		Usage:   "/garden [ls|stats|plant <text>|search <query>|rm <id>]",
 		Short:   "Memory garden — list seeds, show stats, or plant new seeds",
 		Run: func(ctx context.Context, args []string) error {
 			sub := "ls"
@@ -103,9 +103,10 @@ func (r *Registry) gardenCmd() Command {
 				fmt.Println(gcolor.HEX("#7fb88c").Sprint("  Seed deleted"))
 				fmt.Println()
 
-			case "harvest": // alias for ls
-				fallthrough
-			default: // ls
+			default: // ls — also catches unrecognized subcommands (e.g. the
+				// former "harvest" verb, which was a silent no-op alias for
+				// this same branch; dropped rather than documented as if it
+				// were a distinct, intentional action).
 				seeds, err := r.gw.Seeds(ctx)
 				if err != nil {
 					return fmt.Errorf("could not fetch seeds: %w", err)
