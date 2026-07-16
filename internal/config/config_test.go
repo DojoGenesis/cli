@@ -391,6 +391,175 @@ func TestLoad_ModelEnvOverride(t *testing.T) {
 	}
 }
 
+// ─── Load() disposition graceful degradation (never brick startup) ──────────
+
+func TestLoad_UnknownDisposition_DegradesToDefault(t *testing.T) {
+	tmp := t.TempDir()
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", tmp)
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
+
+	t.Setenv("DOJO_GATEWAY_URL", "")
+	t.Setenv("DOJO_GATEWAY_TOKEN", "")
+	t.Setenv("DOJO_PLUGINS_PATH", "")
+	t.Setenv("DOJO_PROVIDER", "")
+	t.Setenv("DOJO_DISPOSITION", "")
+	t.Setenv("DOJO_MODEL", "")
+	t.Setenv("DOJO_USER_ID", "")
+
+	dojoDir := filepath.Join(tmp, ".dojo")
+	if err := os.MkdirAll(dojoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// A disposition that resolves nowhere: not a builtin, not a config
+	// profile, and (no dispositions dir exists) not a file preset either.
+	// Before the fix, this made Load() return an error — bricking every
+	// subsequent `dojo` invocation until settings.json was hand-edited.
+	settings := map[string]any{
+		"defaults": map[string]any{"disposition": "typo-d-name"},
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(dojoDir, "settings.json"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() should degrade, not error, on an unknown disposition: %v", err)
+	}
+	if cfg.Defaults.Disposition != DefaultDisposition {
+		t.Errorf("Defaults.Disposition after degrade: got %q, want %q", cfg.Defaults.Disposition, DefaultDisposition)
+	}
+}
+
+func TestLoad_FilePresetDisposition_ResolvesWithoutReset(t *testing.T) {
+	tmp := t.TempDir()
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", tmp)
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
+
+	t.Setenv("DOJO_GATEWAY_URL", "")
+	t.Setenv("DOJO_GATEWAY_TOKEN", "")
+	t.Setenv("DOJO_PLUGINS_PATH", "")
+	t.Setenv("DOJO_PROVIDER", "")
+	t.Setenv("DOJO_DISPOSITION", "")
+	t.Setenv("DOJO_MODEL", "")
+	t.Setenv("DOJO_USER_ID", "")
+
+	// A disposition saved only as a file-based preset (~/.dojo/dispositions/*.json)
+	// — NOT a builtin, NOT in DispositionProfiles. validateDisposition() alone
+	// would reject this; Load() must accept it via IsKnownDisposition instead
+	// of silently overwriting it with the default. This is the other half of
+	// the brick fix: a legitimate file-preset name must resolve cleanly, not
+	// just avoid a hard error.
+	if err := SaveDispositionPreset(DispositionPreset{
+		Name: "custom-file-preset", Pacing: "swift", Depth: "concise", Tone: "direct", Initiative: "reactive",
+	}); err != nil {
+		t.Fatalf("SaveDispositionPreset() error: %v", err)
+	}
+
+	dojoDir := filepath.Join(tmp, ".dojo")
+	settings := map[string]any{
+		"defaults": map[string]any{"disposition": "custom-file-preset"},
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(dojoDir, "settings.json"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error for a valid file-preset disposition: %v", err)
+	}
+	if cfg.Defaults.Disposition != "custom-file-preset" {
+		t.Errorf("Defaults.Disposition: got %q, want %q (should not have been reset to the default)", cfg.Defaults.Disposition, "custom-file-preset")
+	}
+}
+
+func TestLoad_BadGatewayURL_StillHardFails(t *testing.T) {
+	// Gateway errors are real wiring problems and must still stop startup —
+	// the degrade-gracefully behavior is specific to disposition.
+	tmp := t.TempDir()
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", tmp)
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
+
+	t.Setenv("DOJO_GATEWAY_URL", "")
+	t.Setenv("DOJO_GATEWAY_TOKEN", "")
+	t.Setenv("DOJO_PLUGINS_PATH", "")
+	t.Setenv("DOJO_PROVIDER", "")
+	t.Setenv("DOJO_DISPOSITION", "")
+	t.Setenv("DOJO_MODEL", "")
+	t.Setenv("DOJO_USER_ID", "")
+
+	dojoDir := filepath.Join(tmp, ".dojo")
+	if err := os.MkdirAll(dojoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	settings := map[string]any{
+		"gateway": map[string]any{"url": "not a url"},
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(dojoDir, "settings.json"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() should still fail on a malformed gateway.url — only disposition degrades")
+	}
+}
+
+// ─── IsKnownDisposition ───────────────────────────────────────────────────────
+
+func TestIsKnownDisposition_Builtin(t *testing.T) {
+	if !IsKnownDisposition("balanced", nil) {
+		t.Error(`IsKnownDisposition("balanced", nil) should be true — it's a builtin`)
+	}
+}
+
+func TestIsKnownDisposition_Empty(t *testing.T) {
+	if !IsKnownDisposition("", nil) {
+		t.Error(`IsKnownDisposition("", nil) should be true — empty means "unset"`)
+	}
+}
+
+func TestIsKnownDisposition_ConfigProfile(t *testing.T) {
+	profiles := map[string]DispositionPreset{
+		"sprint": {Name: "sprint", Pacing: "swift", Depth: "concise", Tone: "direct", Initiative: "reactive"},
+	}
+	if !IsKnownDisposition("sprint", profiles) {
+		t.Error("IsKnownDisposition should recognize a config-resident profile")
+	}
+}
+
+func TestIsKnownDisposition_FilePreset(t *testing.T) {
+	tmp := t.TempDir()
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", tmp)
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
+
+	if err := SaveDispositionPreset(DispositionPreset{
+		Name: "file-only", Pacing: "measured", Depth: "thorough", Tone: "warm", Initiative: "proactive",
+	}); err != nil {
+		t.Fatalf("SaveDispositionPreset() error: %v", err)
+	}
+
+	if !IsKnownDisposition("file-only", nil) {
+		t.Error("IsKnownDisposition should recognize a file-based preset under ~/.dojo/dispositions/")
+	}
+}
+
+func TestIsKnownDisposition_Unknown(t *testing.T) {
+	tmp := t.TempDir()
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", tmp)
+	defer func() { _ = os.Setenv("HOME", origHome) }() // test cleanup; restore is best-effort, t.Setenv already restores on test end
+
+	if IsKnownDisposition("totally-made-up", nil) {
+		t.Error("IsKnownDisposition should reject a name that matches nothing")
+	}
+}
+
 // ─── EffectiveString ─────────────────────────────────────────────────────────
 
 func TestEffectiveString_ContainsAllFields(t *testing.T) {

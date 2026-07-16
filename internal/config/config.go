@@ -18,11 +18,11 @@ const DefaultGatewayURL = "http://localhost:7340"
 
 // Config is the dojo CLI configuration, loaded from ~/.dojo/settings.json.
 type Config struct {
-	Gateway             GatewayConfig                 `json:"gateway"`
-	Plugins             PluginsConfig                 `json:"plugins"`
-	Defaults            DefaultsConfig                `json:"defaults"`
-	Auth                AuthConfig                    `json:"auth,omitempty"`
-	DispositionProfiles map[string]DispositionPreset  `json:"disposition_profiles,omitempty"`
+	Gateway             GatewayConfig                `json:"gateway"`
+	Plugins             PluginsConfig                `json:"plugins"`
+	Defaults            DefaultsConfig               `json:"defaults"`
+	Auth                AuthConfig                   `json:"auth,omitempty"`
+	DispositionProfiles map[string]DispositionPreset `json:"disposition_profiles,omitempty"`
 }
 
 type AuthConfig struct {
@@ -81,12 +81,36 @@ func Load() (*Config, error) {
 		cfg.Auth.UserID = v
 	}
 
-	if err := cfg.Validate(); err != nil {
+	// Gateway settings are load-bearing for connectivity — a malformed URL
+	// or timeout is a genuine configuration error, so it still stops
+	// startup (fixing it requires hand-editing settings.json regardless).
+	if err := cfg.validateGateway(); err != nil {
 		return nil, err
+	}
+
+	// A saved disposition must NEVER brick startup — see validateDisposition
+	// for why Validate() alone isn't enough here. If it doesn't check out,
+	// try the fuller merged set (builtins + config profiles + file-based
+	// presets under ~/.dojo/dispositions/*.json — the same set /disposition
+	// ls shows) before giving up; only degrade to the default if the name is
+	// unknown there too. This closes the brick: setting a listed file-preset
+	// name used to save fine via /disposition set, then fail right here on
+	// the very next startup because Validate() only knows about builtins +
+	// DispositionProfiles, not the file-based presets /disposition ls reads.
+	if err := cfg.validateDisposition(); err != nil {
+		if !IsKnownDisposition(cfg.Defaults.Disposition, cfg.DispositionProfiles) {
+			fmt.Fprintf(os.Stderr, "dojo: warning: %s — falling back to default disposition %q\n", err, DefaultDisposition)
+			cfg.Defaults.Disposition = DefaultDisposition
+		}
 	}
 
 	return cfg, nil
 }
+
+// DefaultDisposition is the disposition Load() falls back to when the saved
+// value can't be resolved against any known preset. Named so defaults() and
+// the degrade path in Load() can't drift apart.
+const DefaultDisposition = "balanced"
 
 // validDispositions lists the allowed values for Defaults.Disposition.
 var validDispositions = map[string]bool{
@@ -97,9 +121,50 @@ var validDispositions = map[string]bool{
 	"deliberate":  true,
 }
 
+// IsKnownDisposition reports whether name resolves to something real: a
+// builtin, a config-resident profile in configProfiles, or a file-based
+// preset under DispositionsDir(). This is the same merged set /disposition
+// ls displays (LoadDispositionPresets + MergeConfigProfiles) — it is the
+// single source of truth callers should use before trusting a disposition
+// name. Validate() alone only knows about builtins + configProfiles and
+// deliberately skips the disk read that checking file-based presets needs.
+//
+// A file-read error while checking presets is treated as "not known" so
+// callers (Load, in particular) degrade safely instead of propagating an
+// unrelated I/O error.
+func IsKnownDisposition(name string, configProfiles map[string]DispositionPreset) bool {
+	if validDispositions[name] {
+		return true
+	}
+	if _, ok := configProfiles[name]; ok {
+		return true
+	}
+	filePresets, err := LoadDispositionPresets()
+	if err != nil {
+		return false
+	}
+	for _, p := range filePresets {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // Validate checks that the config values are well-formed.
 // It returns a descriptive error for the first invalid field found.
 func (c *Config) Validate() error {
+	if err := c.validateGateway(); err != nil {
+		return err
+	}
+	if err := c.validateDisposition(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateGateway checks that Gateway.URL and Gateway.Timeout are well-formed.
+func (c *Config) validateGateway() error {
 	// Gateway URL must be parseable.
 	if c.Gateway.URL != "" {
 		if _, err := url.ParseRequestURI(c.Gateway.URL); err != nil {
@@ -113,8 +178,18 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid gateway.timeout %q: %w", c.Gateway.Timeout, err)
 		}
 	}
+	return nil
+}
 
-	// Disposition must be a builtin OR a known custom profile (or empty).
+// validateDisposition checks that Defaults.Disposition is a builtin or a
+// known config-resident custom profile (or empty). It does NOT check
+// file-based presets under DispositionsDir() — that needs a disk read, which
+// this function intentionally avoids so Validate() stays a pure, fast check
+// that's safe to call from anywhere (including tests with no ~/.dojo on
+// disk). Callers that need the fuller picture before giving up — namely
+// Load(), which must never brick startup over a disposition name — should
+// use IsKnownDisposition instead.
+func (c *Config) validateDisposition() error {
 	if !validDispositions[c.Defaults.Disposition] {
 		if _, ok := c.DispositionProfiles[c.Defaults.Disposition]; !ok {
 			return fmt.Errorf(
@@ -123,7 +198,6 @@ func (c *Config) Validate() error {
 			)
 		}
 	}
-
 	return nil
 }
 
@@ -206,7 +280,7 @@ func defaults() *Config {
 		},
 		Defaults: DefaultsConfig{
 			Provider:    "",
-			Disposition: "balanced",
+			Disposition: DefaultDisposition,
 			Model:       "",
 		},
 	}

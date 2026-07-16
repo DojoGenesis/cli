@@ -352,6 +352,101 @@ func TestStart_ContextCancel_Exits(t *testing.T) {
 	}
 }
 
+// ---- DOJO_TELEMETRY_DISABLED kill switch -------------------------------------
+
+func TestNew_DisabledEnv_SetsDisabledField(t *testing.T) {
+	t.Setenv("DOJO_TELEMETRY_URL", "http://unused")
+	t.Setenv("DOJO_TELEMETRY_DISABLED", "1")
+	s := New("s-disabled")
+	if !s.disabled {
+		t.Error("New() with DOJO_TELEMETRY_DISABLED set should produce a disabled Sink")
+	}
+}
+
+func TestNew_DisabledEnvUnset_NotDisabled(t *testing.T) {
+	t.Setenv("DOJO_TELEMETRY_URL", "http://unused")
+	t.Setenv("DOJO_TELEMETRY_DISABLED", "")
+	s := New("s-enabled")
+	if s.disabled {
+		t.Error("New() without DOJO_TELEMETRY_DISABLED should not produce a disabled Sink")
+	}
+}
+
+func TestIngest_Disabled_DoesNotBuffer(t *testing.T) {
+	t.Setenv("DOJO_TELEMETRY_URL", "http://unused")
+	t.Setenv("DOJO_TELEMETRY_DISABLED", "1")
+	s := New("s-disabled-ingest")
+
+	s.Ingest("should.not.buffer", 1, nil)
+
+	s.mu.Lock()
+	n := len(s.buffer)
+	s.mu.Unlock()
+	if n != 0 {
+		t.Errorf("Ingest() on a disabled Sink should not buffer events, got %d buffered", n)
+	}
+}
+
+func TestFlush_Disabled_NeverPosts(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	t.Setenv("DOJO_TELEMETRY_URL", srv.URL)
+	t.Setenv("DOJO_TELEMETRY_DISABLED", "1")
+	s := New("s-disabled-flush")
+
+	// Populate the buffer directly (bypassing Ingest's own no-op) so this
+	// test isolates Flush()'s no-op as the backstop, not Ingest()'s.
+	s.mu.Lock()
+	s.buffer = append(s.buffer, TelemetryEvent{Type: "manual", Ts: 1})
+	s.mu.Unlock()
+
+	if err := s.Flush(); err != nil {
+		t.Errorf("Flush() on a disabled Sink should return nil, got %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("Flush() on a disabled Sink should never POST; server got %d calls", calls)
+	}
+}
+
+func TestStart_Disabled_NoGoroutineNoPost(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	t.Setenv("DOJO_TELEMETRY_URL", srv.URL)
+	t.Setenv("DOJO_TELEMETRY_DISABLED", "1")
+	s := New("s-disabled-start")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.Start(ctx)
+	s.Ingest("ignored", 1, nil)
+
+	// Give a disabled ticker (if one were mistakenly started anyway) a
+	// window to fire before asserting nothing happened.
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 0 {
+		t.Errorf("Start() on a disabled Sink should never POST; server got %d calls", got)
+	}
+}
+
 func TestStart_ManualFlushAfterStart(t *testing.T) {
 	var (
 		mu    sync.Mutex

@@ -80,6 +80,16 @@ func (r *Registry) dispositionList() error {
 }
 
 func (r *Registry) dispositionSet(name string) error {
+	// Validate against the same merged set /disposition ls shows (builtins +
+	// config profiles + file-based presets under ~/.dojo/dispositions/*.json)
+	// before saving. Without this, a typo'd or stale name saved fine here and
+	// only surfaced on the NEXT startup, when config.Load()'s stricter check
+	// (which doesn't know about file-based presets) rejected it and refused
+	// to start.
+	if !config.IsKnownDisposition(name, r.cfg.DispositionProfiles) {
+		return fmt.Errorf("unknown disposition %q — run /disposition ls to see available presets", name)
+	}
+
 	r.cfg.Defaults.Disposition = name
 	_ = r.cfg.Save()
 	activity.Log(activity.CommandRun, "disposition -> "+name)

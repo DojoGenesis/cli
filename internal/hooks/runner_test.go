@@ -451,6 +451,54 @@ func TestIfConditionFalse(t *testing.T) {
 	}
 }
 
+// ─── shellFor (Windows vs POSIX shell selection) ──────────────────────────────
+
+func TestShellFor(t *testing.T) {
+	cases := []struct {
+		goos     string
+		wantExe  string
+		wantFlag string
+	}{
+		{"windows", "cmd", "/C"},
+		{"linux", "sh", "-c"},
+		{"darwin", "sh", "-c"},
+		{"freebsd", "sh", "-c"},
+	}
+	for _, tc := range cases {
+		exe, flag := shellFor(tc.goos)
+		if exe != tc.wantExe || flag != tc.wantFlag {
+			t.Errorf("shellFor(%q) = (%q, %q), want (%q, %q)", tc.goos, exe, flag, tc.wantExe, tc.wantFlag)
+		}
+	}
+}
+
+// ─── matcherMatches: malformed glob is handled, not silently swallowed ───────
+
+func TestMatcherMatches_BadPattern_ReturnsFalseNotPanic(t *testing.T) {
+	// "[" is an unterminated character class — path.Match returns
+	// ErrBadPattern. Before the fix this was swallowed via
+	// `matched, _ := path.Match(...)`, so a malformed matcher just never
+	// fired with zero signal to the plugin author. The observable contract
+	// (no match, no panic) is unchanged by the fix — what changed is that
+	// it's now logged instead of silently disappearing; this test pins the
+	// safe-default behavior since matcherMatches has no injectable logger
+	// to assert the log line itself against.
+	if matcherMatches("[", map[string]any{"command": "/garden ls"}) {
+		t.Error("matcherMatches with a malformed glob should return false, not match")
+	}
+}
+
+func TestMatcherMatches_ValidPattern_StillWorks(t *testing.T) {
+	// Sanity check alongside the bad-pattern test: a well-formed glob is
+	// unaffected by checking the path.Match error.
+	if !matcherMatches("garden*", map[string]any{"command": "/garden ls"}) {
+		t.Error("matcherMatches(\"garden*\", .../garden ls) should match")
+	}
+	if matcherMatches("garden*", map[string]any{"command": "/health"}) {
+		t.Error("matcherMatches(\"garden*\", .../health) should not match")
+	}
+}
+
 // ─── "if" condition: env var ──────────────────────────────────────────────────
 
 func TestIfConditionEnvVar(t *testing.T) {
