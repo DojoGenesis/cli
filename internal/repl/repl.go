@@ -21,6 +21,7 @@ import (
 	"github.com/DojoGenesis/cli/internal/guide"
 	"github.com/DojoGenesis/cli/internal/hooks"
 	"github.com/DojoGenesis/cli/internal/plugins"
+	"github.com/DojoGenesis/cli/internal/protocol"
 	"github.com/DojoGenesis/cli/internal/providers"
 	"github.com/DojoGenesis/cli/internal/spirit"
 	"github.com/DojoGenesis/cli/internal/state"
@@ -38,6 +39,12 @@ type REPL struct {
 	turns    int    // number of successful chat turns
 	resumed  bool   // true when session was restored via --resume or /session resume
 	plain    bool   // true when --plain or --no-color is set; uses unstyled renderer output
+
+	// protocol injects the workspace genius protocol into the first chat turn of
+	// the session (and sets ChatRequest.SystemPrompt). Once-per-session, request
+	// context only — never rendered into output. nil-safe: Apply is inert when
+	// the protocol is disabled.
+	protocol *protocol.Injector
 
 	mu         sync.Mutex         // guards turnCancel
 	turnCancel context.CancelFunc // cancels the in-flight streaming turn; nil when idle
@@ -86,11 +93,14 @@ func New(cfg *config.Config, gw *client.Client, resume bool, plain bool) *REPL {
 	}
 
 	r := &REPL{
-		cfg:      cfg,
-		gw:       gw,
-		turns:    0,
-		resumed:  false,
-		plain:    plain,
+		cfg:     cfg,
+		gw:      gw,
+		turns:   0,
+		resumed: false,
+		plain:   plain,
+		// Resolve the protocol context once at session start (project ./DOJO.md
+		// > ~/.dojo/DOJO.md > embedded default; empty when disabled).
+		protocol: protocol.NewInjector(cfg),
 	}
 
 	if resume {
@@ -527,6 +537,11 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 		Stream:        true,
 		WorkspaceRoot: workspaceRoot,
 	}
+	// Carry the genius protocol on the FIRST turn only (once-per-session guard
+	// lives in the Injector). This mutates req.Message (immediate effect) and
+	// sets req.SystemPrompt (forward-compat) before the request goes out; it is
+	// request context, never echoed into the rendered response.
+	r.protocol.Apply(&req)
 
 	// Derive a per-turn context so a SIGINT cancels THIS response only (the
 	// watcher in Run calls cancelActiveTurn); the session's base ctx is untouched.

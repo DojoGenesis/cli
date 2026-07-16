@@ -1148,3 +1148,34 @@ func TestFriendlyError_Nil(t *testing.T) {
 		t.Errorf("nil error: got %q, want empty", msg)
 	}
 }
+
+// ─── ChatRequest.SystemPrompt wire field ─────────────────────────────────────
+
+func TestChatRequest_SystemPrompt_Marshals(t *testing.T) {
+	req := ChatRequest{
+		Message:      "hello",
+		SessionID:    "sess-1",
+		SystemPrompt: "GENIUS PROTOCOL DOC",
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(b)
+	if !strings.Contains(got, `"system_prompt":"GENIUS PROTOCOL DOC"`) {
+		t.Errorf("expected system_prompt in wire body, got: %s", got)
+	}
+}
+
+func TestChatRequest_SystemPrompt_OmittedWhenEmpty(t *testing.T) {
+	// omitempty: a request that carries no protocol context must not emit the
+	// field, so existing callers and the current gateway see no change.
+	req := ChatRequest{Message: "hello", SessionID: "sess-1"}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "system_prompt") {
+		t.Errorf("empty SystemPrompt should be omitted, got: %s", string(b))
+	}
+}

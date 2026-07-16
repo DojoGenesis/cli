@@ -12,6 +12,7 @@ import (
 
 	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/protocol"
 	"github.com/DojoGenesis/cli/internal/repl"
 	gcolor "github.com/gookit/color"
 )
@@ -101,6 +102,9 @@ func main() {
 			Stream:        true,
 			WorkspaceRoot: workspaceRoot,
 		}
+		// Carry the genius protocol on this single turn (prepends req.Message and
+		// sets req.SystemPrompt when enabled; inert under DOJO_PROTOCOL_DISABLED).
+		protocol.NewInjector(cfg).Apply(&req)
 
 		// Record the first gateway error event. Without this a failed stream
 		// (429 quota, 404 dead model, …) renders blank and the process exits 0,

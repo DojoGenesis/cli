@@ -21,8 +21,21 @@ type Config struct {
 	Gateway             GatewayConfig                `json:"gateway"`
 	Plugins             PluginsConfig                `json:"plugins"`
 	Defaults            DefaultsConfig               `json:"defaults"`
+	Protocol            ProtocolConfig               `json:"protocol"`
 	Auth                AuthConfig                   `json:"auth,omitempty"`
 	DispositionProfiles map[string]DispositionPreset `json:"disposition_profiles,omitempty"`
+}
+
+// ProtocolConfig controls the workspace "genius protocol" carried onto every
+// chat/agent turn. Enabled defaults to TRUE (set in defaults(), merged over by
+// any settings.json value): because defaults() pre-seeds true and json.Unmarshal
+// only overwrites keys that are present, a settings.json that omits the whole
+// block — or omits just "enabled" — keeps the protocol on. Path optionally
+// points at an explicit override doc; empty means "resolve ./DOJO.md, then
+// ~/.dojo/DOJO.md, then the embedded default".
+type ProtocolConfig struct {
+	Enabled bool   `json:"enabled"`
+	Path    string `json:"path,omitempty"`
 }
 
 type AuthConfig struct {
@@ -79,6 +92,14 @@ func Load() (*Config, error) {
 	}
 	if v := os.Getenv("DOJO_USER_ID"); v != "" {
 		cfg.Auth.UserID = v
+	}
+	// DOJO_PROTOCOL_DISABLED: any non-empty value turns the protocol off. This
+	// is the escape hatch that must work even when settings.json says enabled.
+	if v := os.Getenv("DOJO_PROTOCOL_DISABLED"); v != "" {
+		cfg.Protocol.Enabled = false
+	}
+	if v := os.Getenv("DOJO_PROTOCOL_PATH"); v != "" {
+		cfg.Protocol.Path = v
 	}
 
 	// Gateway settings are load-bearing for connectivity — a malformed URL
@@ -160,6 +181,18 @@ func (c *Config) Validate() error {
 	if err := c.validateDisposition(); err != nil {
 		return err
 	}
+	if err := c.validateProtocol(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateProtocol is intentionally lenient: the protocol has no fail-hard
+// conditions. A missing or unreadable override Path degrades to the embedded
+// default at build-context time (see protocol.BuildSystemContext) rather than
+// bricking startup — mirroring the disposition degrade philosophy. Kept as a
+// hook so future hard constraints have a home without re-touching Validate.
+func (c *Config) validateProtocol() error {
 	return nil
 }
 
@@ -216,6 +249,8 @@ func (c *Config) EffectiveString() string {
 	fmt.Fprintf(&b, "defaults.model = %s\n", defaultIfEmpty(c.Defaults.Model, "(not set)"))
 	fmt.Fprintf(&b, "defaults.disposition = %s\n", defaultIfEmpty(c.Defaults.Disposition, "(not set)"))
 	fmt.Fprintf(&b, "plugins.path = %s\n", c.Plugins.Path)
+	fmt.Fprintf(&b, "protocol.enabled = %t\n", c.Protocol.Enabled)
+	fmt.Fprintf(&b, "protocol.path = %s\n", defaultIfEmpty(c.Protocol.Path, "(embedded default)"))
 	fmt.Fprintf(&b, "auth.user_id = %s\n", defaultIfEmpty(c.Auth.UserID, "(not set)"))
 	return b.String()
 }
@@ -282,6 +317,13 @@ func defaults() *Config {
 			Provider:    "",
 			Disposition: DefaultDisposition,
 			Model:       "",
+		},
+		// Protocol on by default. Pre-seeding true here is what makes the
+		// "absent block / absent enabled key stays enabled" merge behavior work
+		// (see ProtocolConfig doc) — a settings.json must say enabled:false, or
+		// DOJO_PROTOCOL_DISABLED must be set, to turn it off.
+		Protocol: ProtocolConfig{
+			Enabled: true,
 		},
 	}
 }

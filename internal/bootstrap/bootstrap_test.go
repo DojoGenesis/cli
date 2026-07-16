@@ -188,17 +188,19 @@ func TestCopyPlugins(t *testing.T) {
 	opts := Options{PluginsSource: srcRoot}
 	copied, skipped, errs := copyPlugins(dojoDir, opts)
 
-	// 2 found, 6 missing (logged as skipped with errors)
-	if copied != 2 {
-		t.Errorf("expected copied=2, got %d", copied)
+	// 2 provided in source; the rest of firstPartyPlugins are missing and get
+	// logged as skipped-with-errors. Derive the counts from the canonical list
+	// so adding a first-party plugin never silently breaks this test.
+	const provided = 2 // agent-orchestration, skill-forge
+	missing := len(firstPartyPlugins) - provided
+	if copied != provided {
+		t.Errorf("expected copied=%d, got %d", provided, copied)
 	}
-	// 6 plugins not present in source → skipped
-	if skipped != 6 {
-		t.Errorf("expected skipped=6 (missing sources), got %d", skipped)
+	if skipped != missing {
+		t.Errorf("expected skipped=%d (missing sources), got %d", missing, skipped)
 	}
-	// 6 errors about missing sources
-	if len(errs) != 6 {
-		t.Errorf("expected 6 source-not-found errors, got %d: %v", len(errs), errs)
+	if len(errs) != missing {
+		t.Errorf("expected %d source-not-found errors, got %d: %v", missing, len(errs), errs)
 	}
 
 	// Verify the two copied plugins landed correctly.
@@ -230,8 +232,9 @@ func TestCopyPluginsSkipExisting(t *testing.T) {
 	if copied != 0 {
 		t.Errorf("expected copied=0, got %d", copied)
 	}
-	// 1 skipped (exists) + 7 missing from source
-	expectedSkipped := 8
+	// 1 skipped (dst exists) + the remaining firstPartyPlugins missing from
+	// source = the whole list. Derive from the canonical list, not a literal.
+	expectedSkipped := len(firstPartyPlugins)
 	if skipped != expectedSkipped {
 		t.Errorf("expected skipped=%d, got %d", expectedSkipped, skipped)
 	}

@@ -595,6 +595,128 @@ func TestEffectiveString_ContainsAllFields(t *testing.T) {
 	}
 }
 
+// ─── Protocol block ──────────────────────────────────────────────────────────
+
+// clearProtocolEnv wipes every DOJO_* knob so a stray shell value can't skew a
+// Load() under test, and points HOME at a fresh temp so there is no settings.json.
+func clearProtocolEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	for _, k := range []string{
+		"DOJO_GATEWAY_URL", "DOJO_GATEWAY_TOKEN", "DOJO_PLUGINS_PATH",
+		"DOJO_PROVIDER", "DOJO_DISPOSITION", "DOJO_MODEL", "DOJO_USER_ID",
+		"DOJO_PROTOCOL_DISABLED", "DOJO_PROTOCOL_PATH",
+	} {
+		t.Setenv(k, "")
+	}
+}
+
+func TestLoad_Protocol_EnabledByDefault(t *testing.T) {
+	clearProtocolEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !cfg.Protocol.Enabled {
+		t.Error("Protocol.Enabled should default to true when settings.json omits the block")
+	}
+	if cfg.Protocol.Path != "" {
+		t.Errorf("Protocol.Path should default empty, got %q", cfg.Protocol.Path)
+	}
+}
+
+func TestLoad_Protocol_EnvDisables(t *testing.T) {
+	clearProtocolEnv(t)
+	t.Setenv("DOJO_PROTOCOL_DISABLED", "1")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Protocol.Enabled {
+		t.Error("DOJO_PROTOCOL_DISABLED=1 should disable the protocol")
+	}
+}
+
+func TestLoad_Protocol_EnvPathOverride(t *testing.T) {
+	clearProtocolEnv(t)
+	t.Setenv("DOJO_PROTOCOL_PATH", "/tmp/custom-protocol.md")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Protocol.Path != "/tmp/custom-protocol.md" {
+		t.Errorf("Protocol.Path: got %q, want %q", cfg.Protocol.Path, "/tmp/custom-protocol.md")
+	}
+	// Path override alone must not flip Enabled off.
+	if !cfg.Protocol.Enabled {
+		t.Error("setting DOJO_PROTOCOL_PATH should leave the protocol enabled")
+	}
+}
+
+// A settings.json that omits "enabled" inside a present "protocol" block must
+// still resolve to enabled — the defaults()+merge contract that ProtocolConfig
+// depends on. This is the subtle case that a plain zero-value bool would break.
+func TestLoad_Protocol_PresentBlockWithoutEnabled_StaysOn(t *testing.T) {
+	clearProtocolEnv(t)
+	dojoDir := filepath.Join(os.Getenv("HOME"), ".dojo")
+	if err := os.MkdirAll(dojoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	settings := map[string]any{
+		"protocol": map[string]any{"path": "/some/where.md"}, // no "enabled" key
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(dojoDir, "settings.json"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !cfg.Protocol.Enabled {
+		t.Error("a protocol block without an 'enabled' key must keep the default (true)")
+	}
+	if cfg.Protocol.Path != "/some/where.md" {
+		t.Errorf("Protocol.Path from settings: got %q", cfg.Protocol.Path)
+	}
+}
+
+func TestLoad_Protocol_SettingsDisables(t *testing.T) {
+	clearProtocolEnv(t)
+	dojoDir := filepath.Join(os.Getenv("HOME"), ".dojo")
+	if err := os.MkdirAll(dojoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	settings := map[string]any{
+		"protocol": map[string]any{"enabled": false},
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(dojoDir, "settings.json"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Protocol.Enabled {
+		t.Error(`settings.json "protocol":{"enabled":false} should disable`)
+	}
+}
+
+func TestEffectiveString_IncludesProtocol(t *testing.T) {
+	cfg := &Config{
+		Gateway:  GatewayConfig{URL: "http://localhost:7340", Timeout: "60s"},
+		Defaults: DefaultsConfig{Disposition: "balanced"},
+		Protocol: ProtocolConfig{Enabled: true},
+	}
+	out := cfg.EffectiveString()
+	for _, want := range []string{"protocol.enabled = true", "protocol.path = (embedded default)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("EffectiveString() missing %q\ngot:\n%s", want, out)
+		}
+	}
+}
+
 // ─── Auth.UserID env override ───────────────────────────────────────────────
 
 func TestLoad_UserIDEnvOverride(t *testing.T) {

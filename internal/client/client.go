@@ -402,6 +402,12 @@ type ChatRequest struct {
 	UserID        string `json:"user_id,omitempty"`
 	ProjectID     string `json:"project_id,omitempty"`
 	WorkspaceRoot string `json:"workspace_root,omitempty"` // User's CWD for file tool path resolution
+	// SystemPrompt carries session-level operating context (e.g. the genius
+	// protocol). Forward-compat: today's gateway /v1/chat has no system_prompt
+	// field and ignores it, so callers that need immediate effect also inline
+	// the context into the first Message (see internal/protocol.Injector). Once
+	// the gateway honors this field, the inline prepend can be retired.
+	SystemPrompt string `json:"system_prompt,omitempty"`
 }
 
 // SSEChunk is a parsed line from the SSE stream.

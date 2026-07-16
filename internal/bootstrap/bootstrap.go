@@ -13,6 +13,7 @@ import (
 	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/config"
 	"github.com/DojoGenesis/cli/internal/ioutilx"
+	"github.com/DojoGenesis/cli/internal/protocol"
 	"github.com/DojoGenesis/cli/internal/state"
 	gcolor "github.com/gookit/color"
 )
@@ -27,14 +28,15 @@ type Options struct {
 
 // Result summarises what was created or skipped.
 type Result struct {
-	SettingsCreated     bool
-	PluginsCopied       int
-	PluginsSkipped      int
-	DispositionsWritten int
-	MCPConfigWritten    bool
-	SeedsPlanted        int
-	SeedsSkipped        int
-	Errors              []string
+	SettingsCreated        bool
+	PluginsCopied          int
+	PluginsSkipped         int
+	DispositionsWritten    int
+	MCPConfigWritten       bool
+	ProtocolOverlayWritten bool
+	SeedsPlanted           int
+	SeedsSkipped           int
+	Errors                 []string
 }
 
 // Run executes the full bootstrap sequence and prints a summary.
@@ -71,6 +73,19 @@ func Run(ctx context.Context, opts Options, gw *client.Client, w io.Writer) (*Re
 		r.Errors = append(r.Errors, "mcp: "+err.Error())
 	}
 	r.MCPConfigWritten = mcpWritten
+
+	// 4b. Protocol overlay — drop an editable ~/.dojo/DOJO.md from the embedded
+	// default so the operator can see and override the genius protocol. NEVER
+	// clobbers an existing overlay (WriteDefaultOverlay is a no-op when present),
+	// so we stat first to report whether this run actually wrote it.
+	overlayPath := filepath.Join(dojoDir, "DOJO.md")
+	_, overlayStatErr := os.Stat(overlayPath)
+	overlayExisted := overlayStatErr == nil
+	if err := protocol.WriteDefaultOverlay(dojoDir); err != nil {
+		r.Errors = append(r.Errors, "protocol overlay: "+err.Error())
+	} else {
+		r.ProtocolOverlayWritten = !overlayExisted
+	}
 
 	// 5. Seeds (if gateway available)
 	if !opts.SkipSeeds && gw != nil {
@@ -123,10 +138,18 @@ func writeSettings(dojoDir string, opts Options) (bool, error) {
 	return true, ioutilx.AtomicWriteFile(path, data, 0600)
 }
 
-// firstPartyPlugins is the canonical list of first-party Dojo plugins.
+// firstPartyPlugins is the canonical list of first-party Dojo plugins installed
+// by /init. kata-harness is the ONLY ratified harness (kata-harness RATIFIED
+// 2026-07-13) and must ship by default; bring-loop, community-skills, and
+// dojo-craft are first-party companions that were previously omitted. All four
+// live alongside the originals in CoworkPluginsByDojoGenesis/plugins/.
 var firstPartyPlugins = []string{
 	"agent-orchestration",
+	"bring-loop",
+	"community-skills",
 	"continuous-learning",
+	"dojo-craft",
+	"kata-harness",
 	"pretext-pdf",
 	"skill-forge",
 	"specification-driven-development",
@@ -395,6 +418,16 @@ func printSummary(w io.Writer, r *Result) {
 	} else {
 		fwf("  %s  mcp.json (already exists)\n", skip)
 	}
+
+	// Protocol is on by default and carried onto every chat/agent turn. Say so,
+	// and name both override paths in one line so the operator never has to hunt.
+	if r.ProtocolOverlayWritten {
+		fwf("  %s  DOJO.md protocol overlay created\n", check)
+	} else {
+		fwf("  %s  DOJO.md protocol overlay (already exists)\n", skip)
+	}
+	fwf("  %s  genius protocol active — override with project ./DOJO.md, or DOJO_PROTOCOL_DISABLED=1 to disable\n",
+		gcolor.HEX("#7fb88c").Sprint("›"))
 
 	if r.SeedsPlanted > 0 {
 		fwf("  %s  %d starter seeds planted\n", check, r.SeedsPlanted)
