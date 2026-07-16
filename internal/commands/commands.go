@@ -132,6 +132,7 @@ func (r *Registry) add(cmd Command) {
 func (r *Registry) register() {
 	r.add(r.helpCmd())
 	r.add(r.healthCmd())
+	r.add(r.doctorCmd())
 	r.add(r.homeCmd())
 	r.add(r.modelCmd())
 	r.add(r.toolsCmd())
