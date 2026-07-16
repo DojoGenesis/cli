@@ -14,6 +14,7 @@ import (
 	"github.com/DojoGenesis/cli/internal/config"
 	"github.com/DojoGenesis/cli/internal/protocol"
 	"github.com/DojoGenesis/cli/internal/repl"
+	"github.com/DojoGenesis/cli/internal/state"
 	gcolor "github.com/gookit/color"
 )
 
@@ -29,6 +30,7 @@ func main() {
 		flagOneShot     = flag.String("one-shot", "", "Execute a single message and exit (non-interactive)")
 		flagCompletion  = flag.String("completion", "", "Generate shell completions (bash|zsh|fish)")
 		flagResume      = flag.Bool("resume", false, "Resume the most recent session instead of starting fresh")
+		flagSession     = flag.String("session", "", "Resume a specific session ID instead of the most recent one (implies --resume; see /session ls)")
 		flagJSON        = flag.Bool("json", false, "Output JSON lines in one-shot mode (for scripted pipelines)")
 		flagPlain       = flag.Bool("plain", false, "Plain text output (no ANSI colors, for piped/CI usage)")
 	)
@@ -172,8 +174,23 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
 
+	// --session <id> resumes one SPECIFIC session (Claude-Code-style
+	// resume-by-id), vs. --resume's "whatever was last active". repl.New's
+	// signature is unchanged (owned by a sibling change — see
+	// internal/repl/repl.go): its resume bool contract is "load
+	// state.LastSessionID and restore it verbatim". --session piggybacks on
+	// that exact contract instead of widening it: persist the requested id
+	// as the last session BEFORE constructing the REPL, then force
+	// resume=true so repl.New picks it up. Bare --resume (no --session) is
+	// untouched — same bool passthrough as before.
+	resume := *flagResume
+	if *flagSession != "" {
+		state.SaveSession(*flagSession)
+		resume = true
+	}
+
 	// Run REPL (plugin scan happens inside repl.New)
-	r := repl.New(cfg, gw, *flagResume, *flagPlain || *flagNoColor)
+	r := repl.New(cfg, gw, resume, *flagPlain || *flagNoColor)
 	if err := r.Run(ctx); err != nil {
 		fatalf("repl error: %s", err)
 	}
