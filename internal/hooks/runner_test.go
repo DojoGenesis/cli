@@ -105,6 +105,45 @@ func TestFire_CommandHook_ExecutesScript(t *testing.T) {
 	}
 }
 
+// ─── Fire() with SessionStart event (W4-LIFECYCLE) ────────────────────────────
+
+// TestFire_SessionStartHook_ExecutesScript proves the new EventSessionStart
+// constant flows through Runner.Fire() exactly like the pre-existing events
+// (matching is purely string-based in Fire(); nothing event-specific is
+// hardcoded there). The REPL fires this event once at startup — see
+// internal/repl.REPL.fireSessionStart — so this is the mechanism a
+// kata-harness-shaped SessionStart hook now relies on to actually run.
+func TestFire_SessionStartHook_ExecutesScript(t *testing.T) {
+	tmp := t.TempDir()
+	markerFile := filepath.Join(tmp, "session-start-ran.txt")
+
+	ps := []plugins.Plugin{
+		{
+			Name:    "session-start-plugin",
+			Version: "1.0",
+			Path:    tmp,
+			HookRules: []plugins.HookRule{
+				{
+					Event: EventSessionStart,
+					Hooks: []plugins.HookDef{
+						{Type: "command", Command: "touch " + markerFile},
+					},
+				},
+			},
+		},
+	}
+
+	r := New(ps)
+	err := r.Fire(context.Background(), EventSessionStart, map[string]any{"session": "dojo-cli-test", "resumed": false})
+	if err != nil {
+		t.Fatalf("Fire() returned error: %v", err)
+	}
+
+	if _, statErr := os.Stat(markerFile); os.IsNotExist(statErr) {
+		t.Errorf("SessionStart hook did not run: marker file %q was not created", markerFile)
+	}
+}
+
 // ─── Fire() with async hook ───────────────────────────────────────────────────
 
 func TestFire_AsyncHook_ReturnsBeforeCompletion(t *testing.T) {

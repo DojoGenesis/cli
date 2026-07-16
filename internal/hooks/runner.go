@@ -20,11 +20,12 @@ import (
 
 // Event names that dojo-cli fires.
 const (
-	EventPreCommand  = "PreCommand"
-	EventPostCommand = "PostCommand"
-	EventPostSkill   = "PostSkill"
-	EventPostAgent   = "PostAgent"
-	EventSessionEnd  = "SessionEnd"
+	EventPreCommand   = "PreCommand"
+	EventPostCommand  = "PostCommand"
+	EventPostSkill    = "PostSkill"
+	EventPostAgent    = "PostAgent"
+	EventSessionStart = "SessionStart"
+	EventSessionEnd   = "SessionEnd"
 )
 
 // Runner executes hook rules for a given event.

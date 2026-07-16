@@ -116,12 +116,16 @@ func New(cfg *config.Config, gw *client.Client, resume bool, plain bool) *REPL {
 		}
 	} else {
 		r.session = fmt.Sprintf("dojo-cli-%s", time.Now().Format("20060102-150405"))
-		// Show last session hint (cosmetic only) when not resuming
-		if st, loadErr := state.Load(); loadErr == nil && st.LastSessionID != "" {
-			fmt.Printf("\n  %s %s\n",
-				gcolor.HEX("#94a3b8").Sprint("Last session:"),
-				gcolor.HEX("#e8b04a").Sprint(st.LastSessionID),
-			)
+		// Show last session hint (cosmetic only) when not resuming. Gated
+		// behind !plain like the welcome banner in printWelcome — piped/CI
+		// consumers under --plain get no decorative lines here either.
+		if !plain {
+			if st, loadErr := state.Load(); loadErr == nil && st.LastSessionID != "" {
+				fmt.Printf("\n  %s %s\n",
+					gcolor.HEX("#94a3b8").Sprint("Last session:"),
+					gcolor.HEX("#e8b04a").Sprint(st.LastSessionID),
+				)
+			}
 		}
 	}
 
@@ -233,6 +237,34 @@ func (r *REPL) syncProviderKeys(ctx context.Context) {
 	}
 }
 
+// fireSessionStart fires the SessionStart hooks. Called once from Run(),
+// after session/config setup completes and before the read loop begins, so
+// a plugin's startup hook (e.g. kata-harness's roll-status-injector, whose
+// entire job is injecting status at session start) sees a fully-initialized
+// session. Hook errors are logged, not fatal — same idiom as PreCommand/
+// PostCommand in handle().
+func (r *REPL) fireSessionStart(ctx context.Context) {
+	payload := map[string]any{"session": r.session, "resumed": r.resumed}
+	if err := r.runner.Fire(ctx, hooks.EventSessionStart, payload); err != nil {
+		log.Printf("[hooks] SessionStart error: %v", err)
+	}
+}
+
+// fireSessionEnd fires the SessionEnd hooks. Called via defer from Run() so
+// it runs on every exit path — normal exit, SIGTERM, a readline EOF/error,
+// or falling through to runPlain. Deliberately uses context.Background()
+// rather than Run()'s ctx: by the time Run() returns because ctx itself was
+// cancelled (SIGTERM), firing a "command" hook with that same cancelled ctx
+// would race exec.CommandContext's kill-watcher goroutine (see runCommand in
+// internal/hooks/runner.go) and could truncate or skip the hook entirely —
+// SessionEnd should still get a chance to complete.
+func (r *REPL) fireSessionEnd() {
+	payload := map[string]any{"session": r.session, "resumed": r.resumed}
+	if err := r.runner.Fire(context.Background(), hooks.EventSessionEnd, payload); err != nil {
+		log.Printf("[hooks] SessionEnd error: %v", err)
+	}
+}
+
 // Run starts the interactive loop. Returns when the user exits.
 func (r *REPL) Run(ctx context.Context) error {
 	printWelcome(r.cfg, r.session, r.resumed, r.plain)
@@ -337,6 +369,12 @@ func (r *REPL) Run(ctx context.Context) error {
 		st.LastSessionID = r.session
 		_ = st.Save()
 	}
+
+	// Session/config setup is complete as of the state save above — fire
+	// SessionStart now, before the read loop starts. SessionEnd fires via
+	// defer so it covers every return path out of Run() below.
+	r.fireSessionStart(ctx)
+	defer r.fireSessionEnd()
 
 	// Two-tier interrupt: a SIGINT that arrives while a response is streaming
 	// cancels ONLY that turn (the base ctx from main is not SIGINT-bound, so the

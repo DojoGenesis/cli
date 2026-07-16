@@ -90,6 +90,15 @@ func main() {
 
 	// One-shot mode: send a single message and exit. Ctrl+C cancels the single
 	// turn and exits.
+	//
+	// NOTE (SessionStart/SessionEnd, W4-LIFECYCLE): deliberately NOT fired
+	// here. It would need its own plugin scan + hooks.Runner (this path never
+	// builds a repl.REPL, so there's nothing to reuse), but the actual
+	// blocker is that "prompt"/"agent" type hooks write straight to stdout
+	// via fmt.Printf regardless of --json (see runHook in
+	// internal/hooks/runner.go) — that would corrupt the JSON-lines contract
+	// --json promises to scripted/CI consumers of --one-shot. Revisit if/when
+	// hook stdout output is made --json-aware.
 	if *flagOneShot != "" {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()

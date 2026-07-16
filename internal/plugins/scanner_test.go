@@ -272,15 +272,16 @@ func TestScan_WrappedClaudeCodeHooksSchema_MapsToDojoEventNames(t *testing.T) {
 	}
 }
 
-// TestScan_WrappedSchema_KataHarnessShape_NoDojoEquivalent_SkippedNotPseudoRule
+// TestScan_WrappedSchema_KataHarnessShape_SessionStart_MapsToEventSessionStart
 // mirrors kata-harness's actual plugin/hooks/hooks.json byte-for-byte in
-// shape: the wrapper schema with a single SessionStart hook. dojo-cli has
-// no beginning-of-session event among its 5, so SessionStart has no honest
-// dojo equivalent (see ccEventToDojo's doc comment for why it must NOT be
-// mismapped to SessionEnd). The correct outcome is zero rules — never a
-// rule with Event=="hooks", and never a rule that fires at the wrong
-// lifecycle point.
-func TestScan_WrappedSchema_KataHarnessShape_NoDojoEquivalent_SkippedNotPseudoRule(t *testing.T) {
+// shape: the wrapper schema with a single SessionStart hook. Before
+// W4-LIFECYCLE, dojo-cli had no beginning-of-session event, so this hook
+// parsed but could never fire (see the superseded test name this replaces).
+// Now that dojo-cli fires EventSessionStart at REPL startup, this same
+// kata-harness-shaped hooks.json must resolve to exactly one rule with
+// Event=="SessionStart" — never a pseudo-rule with Event=="hooks", and never
+// zero rules (that would mean the fix regressed).
+func TestScan_WrappedSchema_KataHarnessShape_SessionStart_MapsToEventSessionStart(t *testing.T) {
 	root := t.TempDir()
 	pluginDir := filepath.Join(root, "kata-harness-shaped")
 	mustMkdir(t, pluginDir)
@@ -322,8 +323,14 @@ func TestScan_WrappedSchema_KataHarnessShape_NoDojoEquivalent_SkippedNotPseudoRu
 			t.Fatalf("got pseudo-rule with Event==\"hooks\" — this is exactly the bug the wrapper-schema fix must prevent: %+v", r)
 		}
 	}
-	if len(rules) != 0 {
-		t.Errorf("expected 0 rules (SessionStart has no dojo equivalent, so it should be skipped with a logged note), got %d: %+v", len(rules), rules)
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule (SessionStart now maps to EventSessionStart), got %d: %+v", len(rules), rules)
+	}
+	if rules[0].Event != "SessionStart" {
+		t.Errorf("HookRules[0].Event: got %q, want %q — a kata-harness-shaped SessionStart hook must resolve to dojo's SessionStart event to ever fire", rules[0].Event, "SessionStart")
+	}
+	if len(rules[0].Hooks) != 1 || rules[0].Hooks[0].Type != "command" {
+		t.Errorf("HookRules[0].Hooks: got %+v, want a single command-type hook (the roll-status-injector)", rules[0].Hooks)
 	}
 }
 
@@ -373,9 +380,9 @@ func TestCcEventToDojo(t *testing.T) {
 		{"PostToolUse", "PostCommand", true},
 		{"SubagentStop", "PostAgent", true},
 		{"SessionEnd", "SessionEnd", true},
-		{"PreCommand", "PreCommand", true}, // dojo-native identity passthrough
-		{"PostSkill", "PostSkill", true},   // dojo-native identity passthrough
-		{"SessionStart", "", false},        // no dojo equivalent — see doc comment
+		{"PreCommand", "PreCommand", true},     // dojo-native identity passthrough
+		{"PostSkill", "PostSkill", true},       // dojo-native identity passthrough
+		{"SessionStart", "SessionStart", true}, // W4-LIFECYCLE: now mapped — dojo-cli fires it at REPL startup
 		{"Notification", "", false},
 		{"UserPromptSubmit", "", false},
 		{"Stop", "", false},

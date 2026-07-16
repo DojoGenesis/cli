@@ -136,11 +136,12 @@ func loadPluginMeta(dir string) (pluginMeta, bool) {
 // direction would create a cycle. Keep these in sync with the Event*
 // constants in internal/hooks/runner.go.
 const (
-	dojoEventPreCommand  = "PreCommand"
-	dojoEventPostCommand = "PostCommand"
-	dojoEventPostSkill   = "PostSkill"
-	dojoEventPostAgent   = "PostAgent"
-	dojoEventSessionEnd  = "SessionEnd"
+	dojoEventPreCommand   = "PreCommand"
+	dojoEventPostCommand  = "PostCommand"
+	dojoEventPostSkill    = "PostSkill"
+	dojoEventPostAgent    = "PostAgent"
+	dojoEventSessionStart = "SessionStart"
+	dojoEventSessionEnd   = "SessionEnd"
 )
 
 // loadHooks reads hooks/hooks.json and converts it into []HookRule.
@@ -247,22 +248,28 @@ func parseHooksJSON(data []byte) (eventMap map[string][]hookEntry, wrapped bool,
 //	PreToolUse   -> PreCommand   (about to run a tool/command)
 //	PostToolUse  -> PostCommand  (a tool/command just finished)
 //	SubagentStop -> PostAgent    (a dispatched subagent finished)
+//	SessionStart -> SessionStart (same concept, dojo has it natively —
+//	                              covered by the identity case below)
 //	SessionEnd   -> SessionEnd   (same concept, dojo has it natively —
 //	                              covered by the identity case below)
 //
-// Deliberately NOT mapped: SessionStart. dojo-cli has no "beginning of
-// session" event among its 5 (PreCommand/PostCommand/PostSkill/PostAgent/
-// SessionEnd) — SessionEnd is a false friend for it, not "the closest":
-// mapping SessionStart -> SessionEnd would fire a startup hook (e.g.
+// SessionStart used to be deliberately unmapped: dojo-cli had no "beginning
+// of session" event among its 5 (PreCommand/PostCommand/PostSkill/PostAgent/
+// SessionEnd), and SessionEnd was a false friend for it, not "the closest" —
+// mapping SessionStart -> SessionEnd would have fired a startup hook (e.g.
 // kata-harness's roll-status-injector, whose entire job is injecting status
 // at session start) at the END of the session instead — wrong, not just
-// imprecise. Also left unmapped for the same reason (no honest dojo
-// lifecycle counterpart): Notification, UserPromptSubmit, Stop, PreCompact.
-// Callers report these as "no dojo equivalent" and skip them rather than
-// silently mismapping them.
+// imprecise. Now that dojo-cli fires its own EventSessionStart at REPL
+// startup (see internal/repl.REPL.fireSessionStart), the identity mapping
+// below is honest, not a guess.
+//
+// Still deliberately NOT mapped, for the same reason SessionStart used to be
+// (no honest dojo lifecycle counterpart): Notification, UserPromptSubmit,
+// Stop, PreCompact. Callers report these as "no dojo equivalent" and skip
+// them rather than silently mismapping them.
 func ccEventToDojo(event string) (string, bool) {
 	switch event {
-	case dojoEventPreCommand, dojoEventPostCommand, dojoEventPostSkill, dojoEventPostAgent, dojoEventSessionEnd:
+	case dojoEventPreCommand, dojoEventPostCommand, dojoEventPostSkill, dojoEventPostAgent, dojoEventSessionStart, dojoEventSessionEnd:
 		return event, true
 	case "PreToolUse":
 		return dojoEventPreCommand, true

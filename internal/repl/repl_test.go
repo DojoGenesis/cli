@@ -1,10 +1,15 @@
 package repl
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/DojoGenesis/cli/internal/client"
+	"github.com/DojoGenesis/cli/internal/hooks"
+	"github.com/DojoGenesis/cli/internal/plugins"
 )
 
 // ─── vitalityPrompt ──────────────────────────────────────────────────────────
@@ -206,4 +211,93 @@ func TestExtractText_ChoiceTextFallback(t *testing.T) {
 	if got != "non-streaming text" {
 		t.Errorf("extractText choices[0].text: got %q, want %q", got, "non-streaming text")
 	}
+}
+
+// ─── fireSessionStart / fireSessionEnd (W4-LIFECYCLE) ─────────────────────────
+//
+// Run() itself is not unit-tested here — it owns signal handling, a
+// blocking readline loop, a background SSE goroutine, and real ~/.dojo state
+// writes, none of which are hermetic. Instead these tests exercise the exact
+// two methods Run() calls at the exact points described in their doc
+// comments (fireSessionStart after session/config setup and before the read
+// loop; fireSessionEnd via defer on every exit path), by constructing a bare
+// REPL with only the fields those methods touch (runner, session, resumed).
+
+func TestFireSessionStart_FiresConfiguredHook(t *testing.T) {
+	tmp := t.TempDir()
+	marker := filepath.Join(tmp, "session-start-ran.txt")
+
+	ps := []plugins.Plugin{
+		{
+			Name: "kata-harness-shaped",
+			Path: tmp,
+			HookRules: []plugins.HookRule{
+				{
+					Event: hooks.EventSessionStart,
+					Hooks: []plugins.HookDef{
+						{Type: "command", Command: "touch " + marker},
+					},
+				},
+			},
+		},
+	}
+
+	r := &REPL{
+		runner:  hooks.New(ps),
+		session: "dojo-cli-test-session",
+		resumed: true,
+	}
+	r.fireSessionStart(context.Background())
+
+	if _, err := os.Stat(marker); os.IsNotExist(err) {
+		t.Errorf("fireSessionStart did not run the configured SessionStart hook; marker %q was not created", marker)
+	}
+}
+
+func TestFireSessionStart_NoMatchingHooks_NoPanic(t *testing.T) {
+	// A REPL whose runner has no SessionStart rules (the common case — most
+	// plugins don't define one) must be a silent no-op, not a panic.
+	r := &REPL{runner: hooks.New(nil), session: "dojo-cli-test-session"}
+	r.fireSessionStart(context.Background())
+}
+
+func TestFireSessionEnd_FiresConfiguredHook(t *testing.T) {
+	tmp := t.TempDir()
+	marker := filepath.Join(tmp, "session-end-ran.txt")
+
+	ps := []plugins.Plugin{
+		{
+			Name: "cleanup-plugin",
+			Path: tmp,
+			HookRules: []plugins.HookRule{
+				{
+					Event: hooks.EventSessionEnd,
+					Hooks: []plugins.HookDef{
+						{Type: "command", Command: "touch " + marker},
+					},
+				},
+			},
+		},
+	}
+
+	r := &REPL{
+		runner:  hooks.New(ps),
+		session: "dojo-cli-test-session",
+	}
+	r.fireSessionEnd()
+
+	if _, err := os.Stat(marker); os.IsNotExist(err) {
+		t.Errorf("fireSessionEnd did not run the configured SessionEnd hook; marker %q was not created", marker)
+	}
+}
+
+func TestFireSessionEnd_NoMatchingHooks_NoPanic(t *testing.T) {
+	// Symmetric with TestFireSessionStart_NoMatchingHooks_NoPanic: a REPL
+	// whose runner has no SessionEnd rules must be a silent no-op. Also
+	// exercises fireSessionEnd's no-ctx-parameter signature — it always
+	// fires against context.Background() internally (see its doc comment:
+	// this is deliberate so it still runs a hook to completion even when
+	// Run()'s own ctx was already cancelled, e.g. the SIGTERM-shutdown case).
+	r := &REPL{runner: hooks.New(nil), session: "dojo-cli-test-session"}
+	r.fireSessionEnd()
 }
