@@ -17,6 +17,7 @@ import (
 
 	"github.com/DojoGenesis/cli/internal/art"
 	"github.com/DojoGenesis/cli/internal/client"
+	"github.com/DojoGenesis/cli/internal/mdrender"
 	"github.com/DojoGenesis/cli/internal/orchestration"
 	"github.com/DojoGenesis/cli/internal/skills"
 	"github.com/DojoGenesis/cli/internal/tui"
@@ -330,6 +331,20 @@ func (r *Registry) docCmd() Command {
 			fmt.Println()
 			gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Document: %s\n\n", id))
 			for k, v := range doc {
+				// "content" is the conventional document-body field (same name
+				// CASGetContent uses for a skill body above) — render it as
+				// markdown instead of a raw dump so headings, lists, and code
+				// fences display properly. Every other field is metadata and
+				// keeps the plain key-value / JSON rendering below.
+				if k == "content" {
+					if s, ok := v.(string); ok {
+						fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  %-24s", k))
+						fmt.Println()
+						fmt.Println(mdrender.RenderMarkdown(s))
+						fmt.Println()
+						continue
+					}
+				}
 				switch val := v.(type) {
 				case map[string]any, []any:
 					b, jsonErr := json.MarshalIndent(val, "    ", "  ")
@@ -535,7 +550,7 @@ func (r *Registry) skillCmd() Command {
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Skill: %s @ %s\n\n", tag.Name, tag.Version))
 				printKV("ref", tag.Ref)
 				fmt.Println()
-				fmt.Println(gcolor.White.Sprint(string(content)))
+				fmt.Println(mdrender.RenderMarkdown(string(content)))
 				fmt.Println()
 				return nil
 
