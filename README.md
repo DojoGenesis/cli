@@ -355,15 +355,36 @@ Templates for `/craft scaffold`: `go-service`, `fullstack`, `orchestration`, `pl
 
 ```
 cli/
-├── cmd/           # Cobra command tree
+├── cmd/dojo/            # Entrypoint (main.go): flags, one-shot mode, REPL launch
 ├── internal/
-│   ├── repl/      # Interactive REPL and TUI panels
-│   ├── client/    # Gateway HTTP + SSE client
-│   ├── plugin/    # Plugin loader and hook runner
-│   ├── skill/     # Skill and CAS commands
-│   └── spirit/    # Belt, XP, achievements, koans
-├── desktop/       # Desktop app (Wails v2 + Svelte 5)
-└── scripts/       # Install and release scripts
+│   ├── activity/        # Timestamped NDJSON activity log (~/.dojo/activity.log)
+│   ├── art/             # ASCII art assets
+│   ├── artifacts/       # Skill output + workflow result store (~/.dojo/projects/)
+│   ├── bootstrap/       # First-run setup: ~/.dojo dir, plugins, MCP config, seeds
+│   ├── client/          # Gateway HTTP + SSE client
+│   ├── commands/        # Slash command Registry + Dispatch (own dispatcher, not Cobra)
+│   ├── config/          # ~/.dojo/settings.json loader/validator + disposition presets
+│   ├── guardrail/       # Advisory REPL circuit breaker (warn/hard-stop on repeat failures)
+│   ├── guide/           # Interactive step-by-step feature guides + XP
+│   ├── hooks/           # Runs hook rules from loaded plugins
+│   ├── ioutilx/         # Filesystem utilities not in the stdlib
+│   ├── mdrender/        # Markdown document rendering for the terminal
+│   ├── orchestration/   # DAG execution plans: built-in templates + heuristic NL parsing
+│   ├── permissions/     # Action-permission gate (silent / confirm / refuse)
+│   ├── plugins/         # Plugin scanner + git-based installer
+│   ├── project/         # Project lifecycle: phases, tracks, decisions, artifacts
+│   ├── protocol/        # Injects the "genius protocol" doctrine into chat/agent turns
+│   ├── providers/       # Static provider/model catalog + direct gateway-bypass chat clients
+│   ├── repl/            # Interactive REPL and TUI panels
+│   ├── skills/          # Skill and CAS commands, semantic clustering
+│   ├── spirit/          # Belt, XP, achievements, koans
+│   ├── state/           # Session/agent state across REPL invocations (~/.dojo/state.json)
+│   ├── telemetry/       # Batched async telemetry sink (SSE events to D1 ingest API)
+│   ├── trace/           # Lightweight HTTP tracing for the gateway client
+│   └── tui/             # Bubbletea terminal UI dashboards
+├── desktop/             # Desktop app (Wails v2 + Svelte 5) — HIBERNATED
+├── scripts/             # Install and release scripts
+└── docs/                # Audits, improvement plans, testing-loop notes
 ```
 
 ## Desktop App
