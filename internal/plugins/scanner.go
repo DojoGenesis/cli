@@ -29,10 +29,12 @@ type HookRule struct {
 	// Blocking marks this rule as requiring synchronous completion (as
 	// opposed to the per-HookDef Async flag, which controls fire-and-forget
 	// vs. block-until-done for one individual hook action within the rule).
-	// Field only for now: Fire() (internal/hooks/runner.go) does not yet
-	// read it, and loadHooks below does not yet populate it from
-	// hooks.json's "blocking" key — both are left to whoever implements the
-	// blocking-hook behavior.
+	// When true, a command-type hook in this rule that fails or exits non-zero
+	// vetoes the caller's action: hooks.Runner.FireChecked returns a Blocked
+	// result and the REPL aborts the command (PreCommand) or the send
+	// (UserPromptSubmit). Only command hooks can block — http is fire-and-forget
+	// and prompt/agent are no-ops. Populated from hooks.json's "blocking" key by
+	// loadHooks below; consumed by FireChecked in internal/hooks/runner.go.
 	Blocking bool `json:"blocking,omitempty"`
 }
 
@@ -55,9 +57,10 @@ type pluginMeta struct {
 
 // hookEntry is one element inside an event's array in hooks.json.
 type hookEntry struct {
-	Matcher string    `json:"matcher"`
-	If      string    `json:"if"`
-	Hooks   []HookDef `json:"hooks"`
+	Matcher  string    `json:"matcher"`
+	If       string    `json:"if"`
+	Blocking bool      `json:"blocking,omitempty"`
+	Hooks    []HookDef `json:"hooks"`
 }
 
 // Scan reads a plugins root directory and returns all discovered plugins.
@@ -211,10 +214,11 @@ func loadHooks(pluginDir, pluginName string) []HookRule {
 		}
 		for _, entry := range entries {
 			rules = append(rules, HookRule{
-				Event:   ruleEvent,
-				Matcher: entry.Matcher,
-				If:      entry.If,
-				Hooks:   entry.Hooks,
+				Event:    ruleEvent,
+				Matcher:  entry.Matcher,
+				If:       entry.If,
+				Blocking: entry.Blocking,
+				Hooks:    entry.Hooks,
 			})
 		}
 	}
