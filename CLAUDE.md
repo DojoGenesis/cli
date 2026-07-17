@@ -75,19 +75,31 @@ Place in map: one of four active DojoGenesis products; `desktop/` subdir is HIBE
 cli/
   cmd/dojo/main.go       -- entrypoint; flags + one-shot + REPL launch
   internal/
+    activity/            -- timestamped NDJSON activity log (~/.dojo/activity.log)
+    art/                 -- ASCII art assets
+    artifacts/           -- skill output + workflow result store (~/.dojo/projects/)
+    bootstrap/           -- first-run setup: ~/.dojo dir, plugins, MCP config, seeds
     client/              -- Gateway HTTP + SSE client
-    repl/                -- interactive REPL and TUI
-    commands/            -- slash command handlers
-    skills/              -- /skill commands + CAS bridge
-    plugins/             -- plugin scanner + installer
+    commands/            -- slash command Registry + Dispatch (own dispatcher, not Cobra)
+    config/              -- ~/.dojo/settings.json loader/validator + disposition presets
+    guardrail/           -- advisory REPL circuit breaker (warn/hard-stop on repeat failures)
+    guide/               -- interactive step-by-step feature guides + XP
     hooks/               -- PreCommand/PostCommand hook runner
-    orchestration/       -- /run + DAG (nlparse.go)
+    ioutilx/             -- filesystem utilities not in the stdlib
+    mdrender/            -- markdown document rendering for the terminal
+    orchestration/       -- DAG execution plans: built-in templates + heuristic NL parsing (nlparse.go)
+    permissions/         -- action-permission gate (silent / confirm / refuse)
+    plugins/             -- plugin scanner + installer
     project/             -- /project lifecycle
+    protocol/            -- injects the "genius protocol" doctrine into chat/agent turns
+    providers/           -- static provider/model catalog + direct gateway-bypass chat clients
+    repl/                -- interactive REPL and TUI
+    skills/              -- /skill commands + CAS bridge, semantic clustering
     spirit/              -- belt, XP, achievements, koans
-    providers/           -- model provider routing (last modified 2026-06-08)
-    artifacts/           -- artifact store (last modified 2026-06-09)
-    config/              -- ~/.dojo/settings.json loader + DojoDir()
     state/               -- ~/.dojo/state.json (sessions, agents, XP)
+    telemetry/           -- batched async telemetry sink (SSE events to D1 ingest API)
+    trace/               -- lightweight HTTP tracing for the gateway client
+    tui/                 -- Bubbletea terminal UI dashboards
   desktop/               -- HIBERNATED Wails v2 + Svelte 5 scaffold
   scripts/               -- install.sh + release helpers
   Makefile               -- build / test / vet / install targets

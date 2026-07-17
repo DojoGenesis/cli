@@ -11,8 +11,54 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/DojoGenesis/cli/internal/permissions"
 	gcolor "github.com/gookit/color"
 )
+
+// ─── permissions gate (shared by cmd_code.go, cmd_craft.go, cmd_plugin.go) ────
+
+// permissionsModeAllowed returns the permission mode and allowlist from the
+// registry config, tolerating a nil registry or nil cfg (zero Registry values
+// appear in tests) by falling back to default-mode semantics.
+func (r *Registry) permissionsModeAllowed() (string, []string) {
+	if r == nil || r.cfg == nil {
+		return "", nil
+	}
+	return r.cfg.Permissions.Mode, r.cfg.Permissions.Allowed
+}
+
+// permissionGate evaluates action (a dot-path like "code.undo") against
+// cfg.Permissions and reports whether the caller may proceed. It implements
+// the standard gate flow for risky write/exec commands:
+//
+//   - Allow (yolo, or matched by permissions.allowed): proceed silently.
+//   - Deny (allowlist mode, unmatched): print the one-line deny message and
+//     stop — callers return nil, the same clean exit other handlers use for
+//     user-facing cancellations.
+//   - Confirm (default mode, unmatched): prompt via
+//     permissions.ConfirmInteractive; a declined or non-interactive (no TTY)
+//     prompt prints the same deny message.
+//
+// preConfirmed marks consent the user already gave inline (e.g. the
+// --yes / -y flag on /plugin install): it satisfies the Confirm case without
+// re-prompting, but never overrides a Deny — an allowlist-mode refusal is
+// policy, not a question.
+func (r *Registry) permissionGate(action, detail string, preConfirmed bool) bool {
+	mode, allowed := r.permissionsModeAllowed()
+	switch permissions.Check(mode, allowed, action) {
+	case permissions.Allow:
+		return true
+	case permissions.Confirm:
+		if preConfirmed || permissions.ConfirmInteractive(action, detail) {
+			return true
+		}
+	}
+	// Deny, or a Confirm that was declined / had no terminal to ask on.
+	fmt.Println()
+	fmt.Println("  " + permissions.Explain(action))
+	fmt.Println()
+	return false
+}
 
 func (r *Registry) codeCmd() Command {
 	return Command{
@@ -40,7 +86,20 @@ func (r *Registry) codeCmd() Command {
 			case "gate":
 				return codeGate()
 			case "undo":
-				return codeUndo()
+				// Permission gate: "code.undo" reverts working-tree changes.
+				// Allow (allowlisted / yolo) skips the in-function y/N prompt
+				// too — the gate already carries the consent; Confirm asks
+				// once here and then proceeds prompt-free, so no mode ever
+				// double-prompts. Direct codeUndo() calls (tests, future
+				// callers) keep the legacy prompt-below-preview behavior.
+				cwd, cwdErr := os.Getwd()
+				if cwdErr != nil || cwd == "" {
+					cwd = "the current directory"
+				}
+				if !r.permissionGate("code.undo", "revert all unstaged changes in "+cwd, false) {
+					return nil
+				}
+				return codeUndoPreconfirmed()
 			default:
 				return fmt.Errorf("unknown subcommand %q — try: read, diff, test, build, vet, gate, undo", sub)
 			}
@@ -189,6 +248,21 @@ func codeGate() error {
 // codeRead enforces for file reads). Neither step ever leaves that scope
 // or the enclosing git repository.
 func codeUndo() error {
+	return codeUndoRun(false)
+}
+
+// codeUndoPreconfirmed is codeUndo with the in-function y/N prompt skipped:
+// the /code dispatch path calls it after the "code.undo" permission gate has
+// already carried the user's consent (Allow via allowlist/yolo, or an
+// answered Confirm). Skipping the prompt here is what keeps every mode at
+// one prompt maximum.
+func codeUndoPreconfirmed() error {
+	return codeUndoRun(true)
+}
+
+// codeUndoRun holds the shared preview + revert flow. preconfirmed=false is
+// the legacy direct-call behavior: prompt below the preview via craftConfirm.
+func codeUndoRun(preconfirmed bool) error {
 	if _, err := exec.LookPath("git"); err != nil {
 		return fmt.Errorf("git not found in PATH — /code undo requires git")
 	}
@@ -225,7 +299,8 @@ func codeUndo() error {
 	// Reuses the same y/N stdin idiom as plugins.InstallConfirmed (see
 	// cmd_plugin.go) — craftConfirm lives in cmd_craft.go but is
 	// package-visible, so no duplicate confirm helper is needed here.
-	if !craftConfirm("Revert these unstaged changes?") {
+	// Skipped when the "code.undo" permission gate already confirmed.
+	if !preconfirmed && !craftConfirm("Revert these unstaged changes?") {
 		gcolor.HEX("#94a3b8").Print("  Cancelled — no changes made.")
 		fmt.Println()
 		fmt.Println()

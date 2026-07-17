@@ -582,6 +582,10 @@ func (c *Client) PilotStream(ctx context.Context, clientID string, onChunk func(
 type CreateAgentRequest struct {
 	WorkspaceRoot string `json:"workspace_root"`
 	ActiveMode    string `json:"active_mode,omitempty"` // "focused"|"balanced"|"exploratory"|"deliberate"
+	// Model requests a specific model to back this agent. Forward-compat:
+	// today's gateway POST /v1/gateway/agents has no model field and ignores
+	// it — same caveat as ChatRequest.SystemPrompt above.
+	Model string `json:"model,omitempty"`
 }
 
 // CreateAgentResponse is the response from POST /v1/gateway/agents.
@@ -616,6 +620,10 @@ type AgentChatRequest struct {
 	DocumentID      string `json:"document_id,omitempty"`
 	DocumentContent string `json:"document_content,omitempty"`
 	Stream          bool   `json:"stream"`
+	// Model requests a specific model for this chat turn. Forward-compat:
+	// today's gateway POST /v1/gateway/agents/:id/chat has no model field
+	// and ignores it — same caveat as ChatRequest.SystemPrompt above.
+	Model string `json:"model,omitempty"`
 }
 
 // AgentChatStream sends a message to a specific agent and streams the SSE response.

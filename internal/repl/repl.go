@@ -65,6 +65,11 @@ type REPL struct {
 	lastErrSig string
 	errRepeat  int
 
+	// streamGuard watches classified stream events for repeated identical
+	// tool failures (advisory only — see StreamGuard in renderer.go).
+	// nil-safe: Observe on a nil guard is inert.
+	streamGuard *StreamGuard
+
 	mu         sync.Mutex         // guards turnCancel
 	turnCancel context.CancelFunc // cancels the in-flight streaming turn; nil when idle
 }
@@ -119,7 +124,8 @@ func New(cfg *config.Config, gw *client.Client, resume bool, plain bool) *REPL {
 		plain:   plain,
 		// Resolve the protocol context once at session start (project ./DOJO.md
 		// > ~/.dojo/DOJO.md > embedded default; empty when disabled).
-		protocol: protocol.NewInjector(cfg),
+		protocol:    protocol.NewInjector(cfg),
+		streamGuard: NewStreamGuard(cfg),
 	}
 
 	if resume {
@@ -477,8 +483,17 @@ func (r *REPL) handle(ctx context.Context, line string) error {
 	if strings.HasPrefix(line, "/") {
 		payload := map[string]any{"command": line}
 
-		if err := r.runner.Fire(ctx, hooks.EventPreCommand, payload); err != nil {
-			log.Printf("[hooks] PreCommand error: %v", err)
+		// PreCommand is the one place a hook can veto a command. A Blocking:true
+		// command hook that fails aborts BEFORE dispatch, naming the offending
+		// plugin+hook; a non-blocking failure logs and continues (the command
+		// still runs) — the pre-Blocking behavior.
+		res := r.runner.FireChecked(ctx, hooks.EventPreCommand, payload)
+		if res.Blocked {
+			r.printHookBlock(res)
+			return nil
+		}
+		if res.Err != nil {
+			log.Printf("[hooks] PreCommand error: %v", res.Err)
 		}
 
 		cmdErr := r.registry.Dispatch(ctx, line[1:])
@@ -591,6 +606,14 @@ func (r *REPL) handle(ctx context.Context, line string) error {
 
 // chat sends a freeform message to the gateway and streams the response.
 func (r *REPL) chat(ctx context.Context, message string) error {
+	// UserPromptSubmit fires before anything leaves for the gateway. A
+	// Blocking:true command hook that fails vetoes the send — return to the
+	// prompt without contacting the gateway (the REPL stays alive); non-blocking
+	// failures log and continue.
+	if r.fireUserPromptSubmit(ctx, message) {
+		return nil
+	}
+
 	workspaceRoot, _ := os.Getwd()
 	req := client.ChatRequest{
 		Message:       message,
@@ -635,6 +658,11 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 		if rendered != "" {
 			fmt.Print(rendered)
 			fullText.WriteString(ev.Content)
+		}
+		// Advisory tool-loop guardrail: purely additive — the original event
+		// was already rendered above, untouched (see StreamGuard in renderer.go).
+		if adv, ok := r.streamGuard.Observe(ev); ok {
+			fmt.Printf("\n%s\n", adv.Render(r.plain))
 		}
 		// Per-turn cost/token readout: opportunistically check every chunk for
 		// a usage payload (see extractUsage) rather than gating on a specific
@@ -718,6 +746,45 @@ func (r *REPL) chat(ctx context.Context, message string) error {
 
 	r.turns++
 	return nil
+}
+
+// ─── Hook blocking (PreCommand veto + UserPromptSubmit veto) ──────────────────
+
+// printHookBlock prints the standard one-line "[hooks] blocked by …" message
+// when a Blocking hook vetoes a command or a chat send. This is critical user
+// feedback, not decoration, so it prints in plain mode too — just without the
+// red styling.
+func (r *REPL) printHookBlock(res hooks.FireResult) {
+	if r.plain {
+		fmt.Printf("  %s\n", res.Message())
+		return
+	}
+	fmt.Println(gcolor.HEX("#ef4444").Sprintf("  %s", res.Message()))
+}
+
+// fireUserPromptSubmit fires the UserPromptSubmit hooks for a free-text chat
+// message just before it is sent to the gateway, and reports whether a Blocking
+// rule vetoed the send. On a veto it prints the block line and returns true —
+// chat() then returns to the prompt without sending, leaving the REPL running.
+// A non-blocking hook failure is logged and returns false (the send proceeds).
+//
+// This event has no command name, so its rules are matched against the literal
+// "chat" (matcherMatches reads payload["command"]); the prompt text rides in
+// payload["prompt"], which the runner exposes to command hooks as $DOJO_PROMPT
+// (never interpolated into the command — see hooks.runCommand).
+func (r *REPL) fireUserPromptSubmit(ctx context.Context, message string) (blocked bool) {
+	res := r.runner.FireChecked(ctx, hooks.EventUserPromptSubmit, map[string]any{
+		"command": "chat",
+		"prompt":  message,
+	})
+	if res.Blocked {
+		r.printHookBlock(res)
+		return true
+	}
+	if res.Err != nil {
+		log.Printf("[hooks] UserPromptSubmit error: %v", res.Err)
+	}
+	return false
 }
 
 // ─── JIT tell-triggered protocol nudge ────────────────────────────────────────

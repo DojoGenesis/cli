@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/DojoGenesis/cli/internal/client"
+	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/guardrail"
 	gcolor "github.com/gookit/color"
 )
 
@@ -211,6 +213,118 @@ func (re RenderEvent) Render(plain bool) string {
 	}
 
 	return re.Content
+}
+
+// ─── stream guardrail (advisory repeated-tool-failure watch) ─────────────────
+
+// streamGuardWindow is how many leading bytes of a tool result are examined,
+// both for the failure heuristic and for the signature handed to
+// guardrail.Signature (which further truncates to 80 bytes).
+const streamGuardWindow = 200
+
+// failureMarkers are the case-insensitive substrings that mark a tool result
+// as failing when any appears within the first streamGuardWindow bytes.
+// Deliberately conservative and advisory-only: a missed failure costs nothing,
+// while over-triggering would train the user to ignore the guardrail.
+var failureMarkers = []string{"error", "failed", "exception"}
+
+// StreamGuard watches classified agent-stream events for repeated identical
+// tool failures and escalates advisory notices through a guardrail.Tracker
+// (internal/guardrail — warn at WarnAfter, hard at/after HardAfter, per
+// cfg.Guardrails). It never mutates, drops, or reorders the original events:
+// Observe only ever returns an ADDITIONAL synthetic warning for the caller to
+// render through the normal EventWarning path.
+//
+// Scope choice: chunk classification here is stateless free functions with no
+// renderer instance to hang state on, so the guard lives one-per-REPL (a
+// field set in repl.New) — one interactive session lifetime, letting failure
+// streaks span turns the way the Registry's command guard does. It is driven
+// only from the single ChatStream callback goroutine, so the small
+// bookkeeping fields need no lock (the Tracker inside is mutex-guarded
+// anyway).
+type StreamGuard struct {
+	tracker *guardrail.Tracker
+
+	// pendingTool is the tool name from the most recent EventToolCall; the
+	// next EventToolResult is attributed to it. Results follow their calls on
+	// this stream and the SSE protocol carries no call-id on results, so this
+	// simple last-call pairing is the best available attribution.
+	pendingTool string
+
+	// lastFailSig remembers, per tool, the signature of its most recent
+	// failure. Tracker keys embed the failure signature, so a SUCCESSFUL
+	// result cannot rebuild the failing key from its own (healthy) content —
+	// instead the reset replays the remembered key with failed=false, then
+	// forgets it. A success for a tool with nothing remembered is a no-op.
+	lastFailSig map[string]string
+}
+
+// NewStreamGuard builds a StreamGuard from cfg.Guardrails; a nil cfg is
+// treated as disabled (the Tracker short-circuits every Record call).
+func NewStreamGuard(cfg *config.Config) *StreamGuard {
+	enabled := false
+	warnAfter, hardAfter := 0, 0
+	if cfg != nil {
+		enabled = cfg.Guardrails.Enabled
+		warnAfter = cfg.Guardrails.WarnAfter
+		hardAfter = cfg.Guardrails.HardAfter
+	}
+	return &StreamGuard{
+		tracker:     guardrail.New(warnAfter, hardAfter, enabled),
+		lastFailSig: make(map[string]string),
+	}
+}
+
+// Observe feeds one classified event through the guard. When the tracker
+// escalates it returns (synthetic EventWarning event, true); otherwise
+// (zero RenderEvent, false). The input event is never modified. A nil
+// receiver is inert, so tests that build bare REPL literals stay safe.
+func (g *StreamGuard) Observe(ev RenderEvent) (RenderEvent, bool) {
+	if g == nil || g.tracker == nil {
+		return RenderEvent{}, false
+	}
+	switch ev.Type {
+	case EventToolCall:
+		name := ev.Meta["tool"]
+		if name == "" {
+			name = "unknown"
+		}
+		g.pendingTool = name
+
+	case EventToolResult:
+		tool := g.pendingTool
+		if tool == "" {
+			tool = "unknown"
+		}
+		window := ev.Content
+		if len(window) > streamGuardWindow {
+			window = window[:streamGuardWindow]
+		}
+		if looksFailing(window) {
+			sig := guardrail.Signature(window)
+			g.lastFailSig[tool] = sig
+			adv := g.tracker.Record("tool:"+tool+"|"+sig, true)
+			if adv.Level != guardrail.None {
+				return RenderEvent{Type: EventWarning, Content: adv.Msg}, true
+			}
+		} else if sig, ok := g.lastFailSig[tool]; ok {
+			g.tracker.Record("tool:"+tool+"|"+sig, false)
+			delete(g.lastFailSig, tool)
+		}
+	}
+	return RenderEvent{}, false
+}
+
+// looksFailing reports whether the already window-truncated tool-result
+// prefix carries any failureMarkers substring, case-insensitively.
+func looksFailing(window string) bool {
+	lower := strings.ToLower(window)
+	for _, m := range failureMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // ─── internal content extraction ─────────────────────────────────────────────

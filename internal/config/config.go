@@ -24,6 +24,10 @@ type Config struct {
 	Protocol            ProtocolConfig               `json:"protocol"`
 	Verify              VerifyConfig                 `json:"verify"`
 	Auth                AuthConfig                   `json:"auth,omitempty"`
+	Permissions         PermissionsConfig            `json:"permissions"`
+	Delegation          DelegationConfig             `json:"delegation"`
+	Guardrails          GuardrailsConfig             `json:"guardrails"`
+	Skills              SkillsConfig                 `json:"skills"`
 	DispositionProfiles map[string]DispositionPreset `json:"disposition_profiles,omitempty"`
 
 	// envOverrides records which fields Load() populated from an environment
@@ -77,6 +81,59 @@ type DefaultsConfig struct {
 	Provider    string `json:"provider"`
 	Disposition string `json:"disposition"`
 	Model       string `json:"model"`
+}
+
+// PermissionsConfig controls the CLI's action-permission gate: which command
+// patterns require an interactive prompt before running. Mode selects the
+// gating strategy — "default" prompts per the harness's normal per-command
+// rules, "allowlist" skips the prompt only for patterns listed in Allowed,
+// "yolo" skips every prompt. Mode defaults to "default" (pre-seeded in
+// defaults()); Allowed holds glob-style command patterns, e.g. "code.undo",
+// "plugin.install", "craft.*". See --yolo in cmd/dojo/main.go, which sets
+// Mode to "yolo" in memory for the run only and never persists it via
+// Save() — the same transient-override discipline as the env-overridden
+// fields below (see envOverride and Save()), just triggered by a flag
+// instead of an environment variable.
+type PermissionsConfig struct {
+	Mode    string   `json:"mode"`
+	Allowed []string `json:"allowed"`
+}
+
+// DelegationConfig controls the default model used for agent dispatch (the
+// cheap lane for sub-agent work) — distinct from Defaults.Model, which is
+// the interactive chat default. Model defaults to "" (unset): an empty
+// value means dispatch call sites fall back to their own default rather
+// than a config-pinned one.
+type DelegationConfig struct {
+	Model string `json:"model"`
+}
+
+// GuardrailsConfig controls the repeated-failure nudge (warn, then hard
+// stop) surfaced during long-running command loops. Enabled is a plain bool
+// — not *bool — so it can reuse the exact "pre-seed true in defaults(), let
+// json.Unmarshal only overwrite keys actually present" merge trick already
+// documented on ProtocolConfig, rather than introduce a second optional-bool
+// convention in this file (a *bool field literally named Enabled would also
+// collide with an Enabled() accessor method — Go forbids a type having both
+// a field and a method of the same name). A settings.json that omits the
+// whole block, or omits just "enabled", keeps guardrails on; only an
+// explicit "enabled": false turns them off. WarnAfter/HardAfter default to
+// 3/5, also pre-seeded in defaults().
+type GuardrailsConfig struct {
+	Enabled   bool `json:"enabled"`
+	WarnAfter int  `json:"warn_after"`
+	HardAfter int  `json:"hard_after"`
+}
+
+// SkillsConfig controls skill discovery beyond the gateway-hosted CAS skill
+// set. ExternalDirs lists additional local directories to scan for
+// SKILL.md-bearing skill folders, defaulting to [".claude/skills"]
+// (pre-seeded in defaults()). This is a different knob from DOJO_SKILLS_PATH
+// (see internal/commands/cmd_workflow.go's `/skill package-all`), which
+// names a single directory to push to the gateway CAS, not a discovery
+// search path — no config section existed for skills before this one.
+type SkillsConfig struct {
+	ExternalDirs []string `json:"external_dirs"`
 }
 
 // envOverride records one Config field that Load() populated from an
@@ -197,6 +254,23 @@ func Load() (*Config, error) {
 			func(c *Config, v bool) { c.Verify.AfterAgent = v },
 			true)
 	}
+	// DOJO_PERMISSIONS_MODE / DOJO_DELEGATION_MODEL: same transient,
+	// run-scoped override contract as the knobs above — tracked via
+	// noteEnvOverride so an unrelated Save() (e.g. /model set) never bakes
+	// either one into settings.json. Guardrails and Skills.ExternalDirs
+	// deliberately have no env override (not requested).
+	if v := os.Getenv("DOJO_PERMISSIONS_MODE"); v != "" {
+		noteEnvOverride(cfg,
+			func(c *Config) string { return c.Permissions.Mode },
+			func(c *Config, v string) { c.Permissions.Mode = v },
+			v)
+	}
+	if v := os.Getenv("DOJO_DELEGATION_MODEL"); v != "" {
+		noteEnvOverride(cfg,
+			func(c *Config) string { return c.Delegation.Model },
+			func(c *Config, v string) { c.Delegation.Model = v },
+			v)
+	}
 
 	// Gateway settings are load-bearing for connectivity — a malformed URL
 	// or timeout is a genuine configuration error, so it still stops
@@ -283,6 +357,9 @@ func (c *Config) Validate() error {
 	if err := c.validateVerify(); err != nil {
 		return err
 	}
+	if err := c.validatePermissions(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -337,6 +414,28 @@ func (c *Config) validateDisposition() error {
 				c.Defaults.Disposition,
 			)
 		}
+	}
+	return nil
+}
+
+// validPermissionsModes lists the allowed values for Permissions.Mode. ""
+// is valid (mirrors validDispositions) and means "unset" — Load()/defaults()
+// normalize it to "default" before any real use.
+var validPermissionsModes = map[string]bool{
+	"":          true,
+	"default":   true,
+	"allowlist": true,
+	"yolo":      true,
+}
+
+// validatePermissions checks that Permissions.Mode is one of the known
+// gating strategies (or empty).
+func (c *Config) validatePermissions() error {
+	if !validPermissionsModes[c.Permissions.Mode] {
+		return fmt.Errorf(
+			"invalid permissions.mode %q: must be one of default, allowlist, yolo",
+			c.Permissions.Mode,
+		)
 	}
 	return nil
 }
@@ -464,6 +563,31 @@ func defaults() *Config {
 		// run (see Load).
 		Verify: VerifyConfig{
 			AfterAgent: false,
+		},
+		// Permissions.Mode defaults to "default" — normal per-command prompt
+		// rules apply until a settings.json or DOJO_PERMISSIONS_MODE (or
+		// --yolo, in-memory only) says otherwise.
+		Permissions: PermissionsConfig{
+			Mode: "default",
+		},
+		// Delegation.Model defaults to "" (unset), stated explicitly for
+		// symmetry with DefaultsConfig above.
+		Delegation: DelegationConfig{
+			Model: "",
+		},
+		// Guardrails on by default, same pre-seed-true trick as
+		// Protocol.Enabled above (see GuardrailsConfig doc). WarnAfter/
+		// HardAfter need pre-seeding too since their zero value (0) is not
+		// the intended default.
+		Guardrails: GuardrailsConfig{
+			Enabled:   true,
+			WarnAfter: 3,
+			HardAfter: 5,
+		},
+		// Skills.ExternalDirs defaults to the conventional Claude Code
+		// project skills directory.
+		Skills: SkillsConfig{
+			ExternalDirs: []string{".claude/skills"},
 		},
 	}
 }

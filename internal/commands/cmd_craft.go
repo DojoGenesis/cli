@@ -50,7 +50,7 @@ func (r *Registry) craftCmd() Command {
 			case "view":
 				return craftView(rest)
 			case "scaffold":
-				return craftScaffold(rest)
+				return r.craftScaffold(rest)
 			case "converge":
 				return r.craftConverge(ctx)
 			default:
@@ -151,9 +151,10 @@ Be concise and precise. Focus on the decision, not the technology overview.`, ne
 
 	fmt.Println()
 	gcolor.HEX("#94a3b8").Printf("  target: %s\n\n", path)
-	if !craftConfirm(fmt.Sprintf("Write ADR to %s?", path)) {
-		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — ADR not written."))
-		fmt.Println()
+	// Permission gate "craft.adr" replaces the old ad-hoc y/N confirm at the
+	// same site: the write is the risky part, so the generated ADR streams to
+	// screen regardless and only the file write is gated (one prompt max).
+	if !r.permissionGate("craft.adr", "write "+path, false) {
 		return nil
 	}
 
@@ -375,9 +376,13 @@ Be specific. Do not suggest generic "add more documentation".`
 	}
 	fmt.Println()
 
-	if !craftConfirm(fmt.Sprintf("Write %d fixed file(s)?", len(relPaths))) {
-		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — no files modified."))
-		fmt.Println()
+	// Permission gate "craft.claude-md" replaces the old ad-hoc y/N confirm
+	// at the same site. Only the --fix write path is gated — the analysis
+	// above is read-only and prints for every mode, exactly like a run
+	// without --fix.
+	if !r.permissionGate("craft.claude-md",
+		fmt.Sprintf("rewrite %d CLAUDE.md file(s) in place under %s", len(relPaths), cwd),
+		false) {
 		return nil
 	}
 
@@ -864,7 +869,10 @@ func craftView(args []string) error {
 
 // ─── /craft scaffold ─────────────────────────────────────────────────────────
 
-func craftScaffold(args []string) error {
+// craftScaffold is a Registry method (not a plain func) solely so the
+// "craft.scaffold" permission gate can reach r.cfg.Permissions; the no-args
+// template listing below stays ungated (read-only help).
+func (r *Registry) craftScaffold(args []string) error {
 	if len(args) == 0 {
 		fmt.Println()
 		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Available scaffold templates:"))
@@ -952,9 +960,12 @@ func craftScaffold(args []string) error {
 	fmt.Println()
 	gcolor.HEX("#94a3b8").Printf("  target: %s\n\n", cwd)
 
-	if !craftConfirm(fmt.Sprintf("Create %d dir(s) and %d file(s) in %s?", len(dirs), len(files), cwd)) {
-		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — nothing created."))
-		fmt.Println()
+	// Permission gate "craft.scaffold" replaces the old ad-hoc y/N confirm at
+	// the same site, after the create-plan listing above so a Confirm-mode
+	// user decides with the full file list on screen.
+	if !r.permissionGate("craft.scaffold",
+		fmt.Sprintf("create %d dir(s) and %d file(s) in %s", len(dirs), len(files), cwd),
+		false) {
 		return nil
 	}
 	fmt.Println()
@@ -1094,10 +1105,14 @@ func (r *Registry) craftConverge(ctx context.Context) error {
 
 // craftConfirm prints a y/N prompt to stderr and blocks for a line of input on
 // stdin, returning true only for an explicit "y" or "yes" (case-insensitive).
-// Mirrors the confirmation style of plugins.InstallConfirmed (see cmd_plugin.go
-// / internal/plugins/installer.go) but stays file-local: every /craft
-// write/delete path below needs the same guard, and cmd_craft.go is the only
-// file this session is allowed to touch.
+// Mirrors the confirmation style plugins.InstallConfirmed uses internally.
+//
+// Since the permissions gate landed (see Registry.permissionGate in
+// cmd_code.go), this helper no longer guards the FILE-writing craft actions —
+// adr, claude-md --fix, and scaffold now flow through permissionGate with
+// keys "craft.<action>". It remains the guard for gateway-side (remote
+// memory-state) mutations that are not file writes — /craft memory prune and
+// /craft seed elevate — and for the legacy direct-call path of codeUndo().
 func craftConfirm(prompt string) bool {
 	fmt.Fprintf(os.Stderr, "  %s [y/N]: ", prompt)
 	reader := bufio.NewReader(os.Stdin)

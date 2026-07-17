@@ -55,9 +55,26 @@ Settings are loaded from `~/.dojo/settings.json`. A missing file is not an error
     "provider": "",
     "disposition": "balanced",
     "model": ""
+  },
+  "permissions": {
+    "mode": "default",
+    "allowed": ["craft.*", "plugin.install"]
+  },
+  "delegation": {
+    "model": ""
+  },
+  "guardrails": {
+    "enabled": true,
+    "warn_after": 3,
+    "hard_after": 5
+  },
+  "skills": {
+    "external_dirs": [".claude/skills"]
   }
 }
 ```
+
+`permissions`, `delegation`, `guardrails`, and `skills` are covered in detail in [Permissions](#permissions), [Guardrails](#guardrails), [Agents & Orchestration](#agents--orchestration), and [Skills & CAS](#skills--cas) below.
 
 **Environment variable overrides:**
 
@@ -71,6 +88,10 @@ Settings are loaded from `~/.dojo/settings.json`. A missing file is not an error
 | `DOJO_SKILLS_PATH`     | default skill dir for `/skill package-all` |
 | `DOJO_PROTOCOL_DISABLED` | any non-empty value disables the genius protocol (`protocol.enabled`) |
 | `DOJO_PROTOCOL_PATH`   | `protocol.path` — explicit override doc, takes precedence over `./DOJO.md` |
+| `DOJO_PERMISSIONS_MODE` | `permissions.mode` — `default`, `allowlist`, or `yolo` |
+| `DOJO_DELEGATION_MODEL` | `delegation.model` — default model for `/agent dispatch` and `/agent chat` |
+
+`guardrails` and `skills.external_dirs` have no environment override (not requested for this release).
 
 ## Requirements
 
@@ -145,8 +166,8 @@ Type a message without `/` to chat with the gateway. Use slash commands for stru
 | Command                                      | Description                                               |
 |----------------------------------------------|-----------------------------------------------------------|
 | `/agent ls`                                  | List agents from gateway + recently used local agents     |
-| `/agent dispatch [mode] <msg>`               | Create agent and stream response                          |
-| `/agent chat <id> <msg>`                     | Chat with an existing agent by ID                         |
+| `/agent dispatch [mode] [--model <name>] <msg>` | Create agent and stream response                        |
+| `/agent chat [--model <name>] <id> <msg>`    | Chat with an existing agent by ID                          |
 | `/agent info <id>`                           | Show agent detail: disposition, channels, config          |
 | `/agent channels <id>`                       | List bound channels for an agent                          |
 | `/agent bind <id> <channel>`                 | Bind a channel to an agent                                |
@@ -155,6 +176,8 @@ Type a message without `/` to chat with the gateway. Use slash commands for stru
 | `/workflow <name> [input-json]`              | Execute a named workflow and stream progress              |
 | `/pilot`                                     | Live SSE event dashboard (Ctrl+C to stop)                 |
 | `/pilot plain`                               | Live event stream in plain text                           |
+
+**Per-dispatch model override:** `--model <name>` (or `--model=<name>`, either form works anywhere in the argument list) beats `delegation.model` in `~/.dojo/settings.json` (env `DOJO_DELEGATION_MODEL`), which beats the Gateway's own default. When a model is in effect, a `model: <name> (flag|delegation default)` line prints just before the response streams. `/model ls` shows the delegation default when one is set. The Gateway may not honor the field yet — the CLI sends it regardless, as forward compatibility.
 
 ### Memory & Seeds
 
@@ -191,6 +214,8 @@ Session IDs follow the format `dojo-cli-YYYYMMDD-HHmmss` when created via `/sess
 | `/skill tags`                        | List all CAS tags (name, version, ref)                   |
 | `/skill package-all [dir]`           | Walk a directory for SKILL.md files and push all to CAS  |
 
+`/skill ls` appends a supplementary **External (read-only)** section (silent when empty) discovered from `skills.external_dirs` (default `[".claude/skills"]`) — `SKILL.md` files from foreign agent ecosystems (Claude Code, Cursor, etc.), recognized at `<dir>/SKILL.md` and `<dir>/<child>/SKILL.md`, with `~` expansion. `/skill get ext:<name>` forces external resolution; a plain `/skill get <name>` falls back to external only when the gateway CAS lookup misses. External skills are read-only reference material — `package-all` never walks `skills.external_dirs`.
+
 ### Projects
 
 | Command                                     | Description                                              |
@@ -226,10 +251,12 @@ Track statuses: `pending`, `in-progress`, `completed`, `blocked`.
 | Command                   | Description                                             |
 |---------------------------|---------------------------------------------------------|
 | `/plugin ls`              | List installed plugins with skill count and hook rules  |
-| `/plugin install <url>`   | Clone a plugin from a git URL into `~/.dojo/plugins/`  |
-| `/plugin rm <name>`       | Remove an installed plugin                              |
+| `/plugin install <url>`   | Clone a plugin from a git URL into `~/.dojo/plugins/` (gated: `plugin.install`) |
+| `/plugin rm <name>`       | Remove an installed plugin (gated: `plugin.rm`)         |
 | `/hooks ls`               | List loaded hook rules from all plugins                 |
-| `/hooks fire <event>`     | Manually fire a hook event (for testing)                |
+| `/hooks fire <event>`     | Manually fire a hook event (for testing), e.g. `/hooks fire SessionStart` |
+
+See [Plugin System](#plugin-system) below for the `hooks.json` format, blocking hooks, and the `UserPromptSubmit` event; see [Permissions](#permissions) for what the gates above mean.
 
 ### Protocol & Harnesses
 
@@ -292,21 +319,72 @@ See [Genius Protocol](#genius-protocol) below for how the protocol doc is resolv
 | `/code build`                   | Run `go build ./...`                              |
 | `/code vet`                     | Run `go vet ./...`                                |
 | `/code gate`                    | Run the full build gate: build + test + vet       |
-| `/code undo`                    | Preview unstaged changes to tracked files, then revert on confirmation |
+| `/code undo`                    | Preview unstaged changes to tracked files, then revert (gated: `code.undo`) |
+
+### Craft Workbench
+
+`/craft` is the DojoCraft practitioner workbench — strategic thinking, codebase intelligence, and memory curation in one command group.
+
+| Command                              | Description                                                        |
+|---------------------------------------|----------------------------------------------------------------------|
+| `/craft`                              | Show the `/craft` subcommand list                                   |
+| `/craft adr <title>`                  | Stream an ADR from the gateway, write it to `decisions/NNN-slug.md` (gated: `craft.adr`) |
+| `/craft scout <tension>`              | Tension → routes → synthesis → decision, streamed from the gateway  |
+| `/craft claude-md`                    | Analyse every `CLAUDE.md` under cwd (depth ≤ 3) for gaps, contradictions, and stale rules |
+| `/craft claude-md --fix`              | Same analysis, then rewrite the flagged files in place (gated: `craft.claude-md`) |
+| `/craft memory ls`                    | List Gateway memory entries                                         |
+| `/craft memory add <text>`            | Store a new memory entry                                            |
+| `/craft memory rm <id>`               | Delete a memory entry by ID                                         |
+| `/craft memory prune [type]`          | Preview and confirm-delete memories, optionally filtered by type    |
+| `/craft memory search <query>`        | Search memory entries                                               |
+| `/craft seed ls`                      | List memory garden seeds                                            |
+| `/craft seed harvest`                 | Alias for `seed ls` — no distinct curation logic yet                |
+| `/craft seed plant <text>`            | Plant a new seed                                                    |
+| `/craft seed search <query>`          | Search seeds locally by name/content                                |
+| `/craft seed elevate [target]`        | Promote a seed (or freeform text) to durable memory, with confirm   |
+| `/craft view [path]`                  | Codebase overview: top-level tree, go.mod, entry points, source/test file counts, git status |
+| `/craft scaffold`                     | List available scaffold templates                                   |
+| `/craft scaffold <template>`          | Create a project layout from a template (gated: `craft.scaffold`)    |
+| `/craft converge`                     | Git + memory health report: RED/YELLOW/GREEN signal                 |
+
+Templates for `/craft scaffold`: `go-service`, `fullstack`, `orchestration`, `plugin`, `minimal`.
+
+`craft.adr`, `craft.claude-md` (the `--fix` write path only — plain analysis is ungated), and `craft.scaffold` go through the permissions gate — see [Permissions](#permissions). `/craft memory prune` and `/craft seed elevate` keep their own y/N confirm instead: they mutate Gateway-side memory state, not local files, and sit outside this wave's gates.
 
 ## Directory Structure
 
 ```
 cli/
-├── cmd/           # Cobra command tree
+├── cmd/dojo/            # Entrypoint (main.go): flags, one-shot mode, REPL launch
 ├── internal/
-│   ├── repl/      # Interactive REPL and TUI panels
-│   ├── client/    # Gateway HTTP + SSE client
-│   ├── plugin/    # Plugin loader and hook runner
-│   ├── skill/     # Skill and CAS commands
-│   └── spirit/    # Belt, XP, achievements, koans
-├── desktop/       # Desktop app (Wails v2 + Svelte 5)
-└── scripts/       # Install and release scripts
+│   ├── activity/        # Timestamped NDJSON activity log (~/.dojo/activity.log)
+│   ├── art/             # ASCII art assets
+│   ├── artifacts/       # Skill output + workflow result store (~/.dojo/projects/)
+│   ├── bootstrap/       # First-run setup: ~/.dojo dir, plugins, MCP config, seeds
+│   ├── client/          # Gateway HTTP + SSE client
+│   ├── commands/        # Slash command Registry + Dispatch (own dispatcher, not Cobra)
+│   ├── config/          # ~/.dojo/settings.json loader/validator + disposition presets
+│   ├── guardrail/       # Advisory REPL circuit breaker (warn/hard-stop on repeat failures)
+│   ├── guide/           # Interactive step-by-step feature guides + XP
+│   ├── hooks/           # Runs hook rules from loaded plugins
+│   ├── ioutilx/         # Filesystem utilities not in the stdlib
+│   ├── mdrender/        # Markdown document rendering for the terminal
+│   ├── orchestration/   # DAG execution plans: built-in templates + heuristic NL parsing
+│   ├── permissions/     # Action-permission gate (silent / confirm / refuse)
+│   ├── plugins/         # Plugin scanner + git-based installer
+│   ├── project/         # Project lifecycle: phases, tracks, decisions, artifacts
+│   ├── protocol/        # Injects the "genius protocol" doctrine into chat/agent turns
+│   ├── providers/       # Static provider/model catalog + direct gateway-bypass chat clients
+│   ├── repl/            # Interactive REPL and TUI panels
+│   ├── skills/          # Skill and CAS commands, semantic clustering
+│   ├── spirit/          # Belt, XP, achievements, koans
+│   ├── state/           # Session/agent state across REPL invocations (~/.dojo/state.json)
+│   ├── telemetry/       # Batched async telemetry sink (SSE events to D1 ingest API)
+│   ├── trace/           # Lightweight HTTP tracing for the gateway client
+│   └── tui/             # Bubbletea terminal UI dashboards
+├── desktop/             # Desktop app (Wails v2 + Svelte 5) — HIBERNATED
+├── scripts/             # Install and release scripts
+└── docs/                # Audits, improvement plans, testing-loop notes
 ```
 
 ## Desktop App
@@ -388,33 +466,105 @@ Or drop a `DOJO.md` file in the project root (or `~/.dojo/DOJO.md` for a machine
 
 Plugins extend the CLI with hook rules and skills. Place plugin directories under `~/.dojo/plugins/` (or the path configured in `plugins.path`), or use `/plugin install` to clone from a git URL.
 
-Each plugin directory must contain a `plugin.json` manifest:
+Each plugin directory must contain a `plugin.json` manifest, checked at `.claude-plugin/plugin.json` first, then the plugin root:
 
 ```json
 {
   "name": "my-plugin",
   "version": "1.0.0",
-  "hooks": [
+  "description": ""
+}
+```
+
+Hook rules live in a separate `hooks/hooks.json` file inside the plugin directory, keyed by event name:
+
+```json
+{
+  "PreCommand": [
     {
-      "event": "session.start",
-      "type": "command",
-      "command": "/usr/local/bin/my-hook"
+      "matcher": "craft*",
+      "if": "",
+      "blocking": true,
+      "hooks": [
+        { "type": "command", "command": "/usr/local/bin/my-hook" }
+      ]
     }
   ]
 }
 ```
 
+A Claude-Code-style wrapped file (`{"hooks": {"<Event>": [...]}}`) is also accepted; its event names are translated where a dojo equivalent exists (`PreToolUse`→`PreCommand`, `PostToolUse`→`PostCommand`, `SubagentStop`→`PostAgent`; `SessionStart`/`SessionEnd` pass through unchanged) and skipped with a log line otherwise (`Notification`, `UserPromptSubmit`, `Stop`, and `PreCompact` have no dojo equivalent when they arrive via the wrapped schema).
+
+Event names dojo-cli itself fires: `PreCommand`, `PostCommand`, `PostSkill`, `PostAgent`, `SessionStart`, `SessionEnd`, `UserPromptSubmit`.
+
+`matcher` is a glob matched against the command name (leading `/` stripped, so `"garden*"` matches both `/garden ls` and `garden ls`); empty or `"*"` matches everything. `if` is `""`/`"true"` (always fire), `"false"` (never), or an environment variable name (fires when it's set and non-empty).
+
+**Blocking hooks.** Set `"blocking": true` on a rule to let a failing hook veto the action it guards. Only a `command`-type hook can actually block — a non-zero exit or error aborts the caller; `http` hooks are fire-and-forget by design, and `prompt`/`agent` hook types are not implemented and print a one-time-per-plugin stderr warning instead of silently no-op'ing. Blocking has effect on exactly two events:
+
+- **`PreCommand`** — a blocked slash command never dispatches.
+- **`UserPromptSubmit`** — fires on free-text chat input before anything is sent to the Gateway; a block returns you to the prompt with nothing sent. This event has no command name to match against, so its rules match the literal string `"chat"`. The chat text itself rides in the `DOJO_PROMPT` environment variable for command hooks (truncated to 4096 bytes) — delivered via the process environment, never shell-interpolated, so metacharacters in your message are inert.
+
+`PostCommand`, `SessionStart`, and `SessionEnd` hooks always run log-only, regardless of `blocking`.
+
+A blocked action prints: `[hooks] blocked by <plugin>/<event>: <reason>`.
+
 Plugin management commands:
 
 ```
 /plugin ls                              # list installed plugins
-/plugin install https://github.com/...  # clone a plugin from git
-/plugin rm my-plugin                    # remove an installed plugin
+/plugin install https://github.com/...  # clone a plugin from git (gated: plugin.install)
+/plugin rm my-plugin                    # remove an installed plugin (gated: plugin.rm)
 /hooks ls                               # list all hook rules
-/hooks fire session.start               # manually fire a hook event
+/hooks fire SessionStart                # manually fire a hook event
 ```
 
 Plugins are rescanned live after install and remove operations — no restart needed.
+
+## Permissions
+
+Risky actions — file writes, plugin install/remove, working-tree reverts — go through a permission gate before they run. Configure the strategy under `permissions` in `~/.dojo/settings.json`:
+
+| Mode        | Behavior                                                                    |
+|-------------|--------------------------------------------------------------------------------|
+| `default`   | Prompt per action (`allow <action>? <detail> [y/N]`) unless it matches `permissions.allowed`. A non-interactive context (no TTY) refuses instead of hanging. |
+| `allowlist` | Silently allow actions matching `permissions.allowed`; deny everything else, with a pointer to settings. |
+| `yolo`      | Allow everything, no prompts. Prints one warning to stderr per process.         |
+
+`permissions.allowed` is a list of dot-path patterns matched against an action name: exact (`"plugin.install"`), trailing-star glob (`"craft.*"`), or a bare `"*"` for everything.
+
+Gated actions this release:
+
+| Action            | Command                                             |
+|--------------------|------------------------------------------------------|
+| `code.undo`        | `/code undo`                                         |
+| `plugin.install`   | `/plugin install`                                     |
+| `plugin.rm`        | `/plugin rm`                                          |
+| `craft.adr`        | `/craft adr` (the file write)                        |
+| `craft.claude-md`  | `/craft claude-md --fix` (the write path only — plain analysis is ungated) |
+| `craft.scaffold`   | `/craft scaffold <template>`                          |
+
+`/craft memory prune` and `/craft seed elevate` keep their own y/N confirm — they mutate Gateway-side memory state, not local files, and sit outside this gate for now.
+
+Override the mode for one run with `DOJO_PERMISSIONS_MODE`, or use the `--yolo` flag (sets `yolo` in memory only for that run — never persisted to `settings.json` — and prints a loud stderr warning). A denied or declined action prints a one-line message naming both escape hatches: add the action (or a covering glob) to `permissions.allowed`, or re-run with `--yolo`.
+
+## Guardrails
+
+An advisory circuit breaker watches for repeated, identical failures and escalates a one-line notice — it never blocks or refuses an action, only gets louder. Inspired by Hermes' `tool_loop_guardrails`.
+
+Two independent trackers share the same `guardrails` settings:
+
+- **Slash commands** — consecutive failures of the same command, keyed by command name plus its first subcommand token (`/code test` and `/code build` count as separate streaks).
+- **Chat-stream tool calls** — consecutive failures of the same tool with the same error signature during a direct (non-`/agent`) chat turn.
+
+A success resets that streak to zero. Configure in `~/.dojo/settings.json`:
+
+| Key                     | Default | Meaning                                                              |
+|--------------------------|---------|------------------------------------------------------------------------|
+| `guardrails.enabled`     | `true`  | Master on/off switch                                                    |
+| `guardrails.warn_after`  | `3`     | Consecutive failures before the first notice                          |
+| `guardrails.hard_after`  | `5`     | Consecutive failures before the escalated notice (repeats every time the streak is at or past this count) |
+
+No environment override is provided for this section.
 
 ## Dojo Spirit
 

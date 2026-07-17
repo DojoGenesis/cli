@@ -4,6 +4,26 @@ All notable changes to the Dojo CLI are documented here.
 
 This project adheres to [Keep a Changelog v1.1.0](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## 2026-07-17 — Hooks, Permissions, Delegation Routing, Guardrails, External Skills
+
+### Added
+
+- feat(hooks): blocking hooks — per-rule `"blocking": true` in `hooks/hooks.json`; only `command`-type hooks can veto (an `http` hook is fire-and-forget by design, and `prompt`/`agent` hook types are unimplemented and now print a once-per-plugin stderr warning instead of a silent no-op)
+- feat(hooks): new `UserPromptSubmit` event fires on free-text chat input before it reaches the Gateway, matched against the literal command `"chat"`; blocking takes effect there and at `PreCommand` only — `PostCommand`/`SessionStart`/`SessionEnd` stay log-only regardless of a rule's `blocking` flag. The prompt text rides to command hooks via `DOJO_PROMPT` (truncated to 4096 bytes, delivered through the process environment, never shell-interpolated)
+- feat(permissions): new action-permission gate (`internal/permissions/`) — `permissions.mode` (`default` / `allowlist` / `yolo`; env `DOJO_PERMISSIONS_MODE`; `--yolo` flag forces yolo in-memory for the run with a loud stderr warning) and `permissions.allowed` (exact, `craft.*`-style glob, or bare `*` dot-path patterns) gate `code.undo`, `plugin.install`, `plugin.rm`, `craft.adr`, `craft.claude-md` (the `--fix` write path only), and `craft.scaffold`
+- feat(agent): per-dispatch model override — `/agent dispatch` and `/agent chat` accept `--model <name>` / `--model=<name>` in any position; precedence is flag > `delegation.model` (env `DOJO_DELEGATION_MODEL`) > Gateway default, printed as `model: <name> (flag|delegation default)` before the stream; `/model ls` shows the delegation default when set
+- feat(guardrail): advisory circuit breaker (`internal/guardrail/`) — escalating one-line notices (never blocking) after `guardrails.warn_after` (default 3) / `guardrails.hard_after` (default 5) consecutive identical failures of a slash command or a same-signature chat-stream tool call
+- feat(skills): read-only external skill discovery (`internal/skills/external.go`) — `skills.external_dirs` (default `[".claude/skills"]`) scanned for `SKILL.md` files from foreign agent ecosystems; `/skill ls` appends an "External (read-only)" section, `/skill get ext:<name>` forces external resolution, plain `/skill get` falls back to external only on a Gateway CAS miss, and `package-all` never sweeps external dirs
+- feat(config): new `permissions` / `delegation` / `guardrails` / `skills` `settings.json` sections, with `DOJO_PERMISSIONS_MODE` / `DOJO_DELEGATION_MODEL` env overrides that are never persisted back to `settings.json`
+
+### Docs
+
+- docs: document the `/craft` command suite (previously undocumented) and the six capabilities above in README; extend the `Configuration` example with the four new settings.json sections; correct a stale `plugin.json`/`hooks.json` example in Plugin System that predated the `hooks/hooks.json` file split
+
+Inspired by Claude Code (hooks/permissions/model-override), Hermes fleet (loop guardrails, delegation lane), and Charm's Crush (permission tiers, Agent Skills interop).
+
+---
+
 ## [Unreleased]
 
 ### Added
