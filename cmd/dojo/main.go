@@ -33,6 +33,7 @@ func main() {
 		flagSession     = flag.String("session", "", "Resume a specific session ID instead of the most recent one (implies --resume; see /session ls)")
 		flagJSON        = flag.Bool("json", false, "Output JSON lines in one-shot mode (for scripted pipelines)")
 		flagPlain       = flag.Bool("plain", false, "Plain text output (no ANSI colors, for piped/CI usage)")
+		flagYolo        = flag.Bool("yolo", false, "Skip all permission prompts for this run (dangerous; never persisted to settings.json)")
 	)
 	flag.Parse()
 
@@ -80,6 +81,14 @@ func main() {
 	}
 	if *flagDisposition != "" {
 		cfg.Defaults.Disposition = *flagDisposition
+	}
+	if *flagYolo {
+		// In-memory only for this run — cfg.Save() is never called on this
+		// path, and nothing here mutates settings.json, so the override can
+		// never leak to disk the way an env-sourced field could (see
+		// envOverride and Config.Save() in internal/config/config.go).
+		cfg.Permissions.Mode = "yolo"
+		fmt.Fprintln(os.Stderr, "dojo: YOLO mode: all permission prompts skipped")
 	}
 
 	// Ensure ~/.dojo exists

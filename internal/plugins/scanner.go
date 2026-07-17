@@ -26,6 +26,14 @@ type HookRule struct {
 	Matcher string
 	If      string
 	Hooks   []HookDef
+	// Blocking marks this rule as requiring synchronous completion (as
+	// opposed to the per-HookDef Async flag, which controls fire-and-forget
+	// vs. block-until-done for one individual hook action within the rule).
+	// Field only for now: Fire() (internal/hooks/runner.go) does not yet
+	// read it, and loadHooks below does not yet populate it from
+	// hooks.json's "blocking" key — both are left to whoever implements the
+	// blocking-hook behavior.
+	Blocking bool `json:"blocking,omitempty"`
 }
 
 // HookDef is an individual hook action within a rule.
