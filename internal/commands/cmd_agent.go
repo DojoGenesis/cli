@@ -30,19 +30,25 @@ func (r *Registry) agentCmd() Command {
 
 			switch sub {
 			case "dispatch":
-				// /agent dispatch [mode] <msg...>
-				// mode is optional — defaults to "balanced"
+				// /agent dispatch [mode] [--model <name>|--model=<name>] <msg...>
+				// mode is optional — defaults to "balanced"; --model is
+				// position-independent among the remaining args and is
+				// stripped before mode-detection and message-joining.
 				validModes := map[string]bool{
 					"focused": true, "balanced": true,
 					"exploratory": true, "deliberate": true,
 				}
+				rest, modelFlag, modelFlagSet, flagErr := extractModelFlag(args[1:])
+				if flagErr != nil {
+					return fmt.Errorf("usage: /agent dispatch [mode] [--model <name>] <message>: %w", flagErr)
+				}
 				mode := "balanced"
 				var msgArgs []string
-				if len(args) >= 2 && validModes[args[1]] {
-					mode = args[1]
-					msgArgs = args[2:]
+				if len(rest) >= 1 && validModes[rest[0]] {
+					mode = rest[0]
+					msgArgs = rest[1:]
 				} else {
-					msgArgs = args[1:]
+					msgArgs = rest
 				}
 				if len(msgArgs) == 0 {
 					return fmt.Errorf("usage: /agent dispatch [focused|balanced|exploratory|deliberate] <message>")
@@ -52,8 +58,11 @@ func (r *Registry) agentCmd() Command {
 				// Append explicit completion criteria so agents don't self-terminate prematurely.
 				message = message + "\n\nCompletion requirements: (1) Do not stop after reading files — you must create or modify files to complete the task. (2) After making changes, run `make test` or the relevant test command. (3) Your final response must include the list of files you created or modified. If you cannot complete the task, say why explicitly."
 
+				model, modelSource := r.resolveModel(modelFlag, modelFlagSet)
+
 				fmt.Println()
 				fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  Creating agent (mode: %s)...", mode))
+				printModelLine(model, modelSource)
 
 				wd, wdErr := os.Getwd()
 				if wdErr != nil {
@@ -62,6 +71,7 @@ func (r *Registry) agentCmd() Command {
 				agentResp, err := r.gw.CreateAgent(ctx, client.CreateAgentRequest{
 					WorkspaceRoot: wd,
 					ActiveMode:    mode,
+					Model:         model,
 				})
 				if err != nil {
 					return fmt.Errorf("could not create agent: %w", err)
@@ -95,18 +105,26 @@ func (r *Registry) agentCmd() Command {
 					}
 				}
 
-				return r.streamAgentChat(ctx, agentResp.AgentID, message)
+				return r.streamAgentChat(ctx, agentResp.AgentID, message, model)
 
 			case "chat":
-				// /agent chat <id> <msg...>
-				if len(args) < 3 {
+				// /agent chat [--model <name>|--model=<name>] <id> <msg...>
+				rest, modelFlag, modelFlagSet, flagErr := extractModelFlag(args[1:])
+				if flagErr != nil {
+					return fmt.Errorf("usage: /agent chat [--model <name>] <agent-id> <message>: %w", flagErr)
+				}
+				if len(rest) < 2 {
 					return fmt.Errorf("usage: /agent chat <agent-id> <message>")
 				}
-				agentID := args[1]
-				message := strings.Join(args[2:], " ")
+				agentID := rest[0]
+				message := strings.Join(rest[1:], " ")
+
+				model, modelSource := r.resolveModel(modelFlag, modelFlagSet)
+
 				fmt.Println()
+				printModelLine(model, modelSource)
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  dojo  "))
-				chatErr := r.streamAgentChat(ctx, agentID, message)
+				chatErr := r.streamAgentChat(ctx, agentID, message, model)
 
 				// Update last_used for this agent.
 				if st, loadErr := state.Load(); loadErr == nil {
@@ -259,13 +277,78 @@ func (r *Registry) agentCmd() Command {
 	}
 }
 
+// resolveModel implements the /agent dispatch and /agent chat model
+// precedence: an explicit --model flag wins, then cfg.Delegation.Model (the
+// workspace's dispatch-time default), then "" — meaning the Gateway picks
+// its own default and Model is omitted from the JSON body via `omitempty`.
+// source is a human-readable label for printModelLine ("flag" or
+// "delegation default"); it is "" whenever model is "" too, so callers can
+// pass both straight through without an extra check.
+func (r *Registry) resolveModel(flagValue string, flagSet bool) (model, source string) {
+	if flagSet {
+		return flagValue, "flag"
+	}
+	if r.cfg.Delegation.Model != "" {
+		return r.cfg.Delegation.Model, "delegation default"
+	}
+	return "", ""
+}
+
+// printModelLine prints the one-line dim/info banner /agent dispatch and
+// /agent chat show before streaming begins, naming which model the
+// precedence resolved to. No-op when model is "" — the Gateway default was
+// left alone, so there is nothing to announce.
+func printModelLine(model, source string) {
+	if model == "" {
+		return
+	}
+	fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  model: %s (%s)", model, source))
+}
+
+// extractModelFlag scans args for a "--model <value>" or "--model=<value>"
+// flag anywhere in the slice — position-independent among the mode token
+// and message words — and returns args with every occurrence of the flag
+// (and, for the two-token form, its paired value) removed. present reports
+// whether the flag was seen at all; when given more than once, the last
+// occurrence's value wins, matching ordinary flag-parsing convention. err is
+// non-nil only when an occurrence carries an empty value — a bare trailing
+// "--model" with nothing after it, or "--model=" with nothing after the "="
+// — in which case the caller must surface err as a usage error and not
+// dispatch.
+func extractModelFlag(args []string) (rest []string, value string, present bool, err error) {
+	rest = make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--model":
+			if i+1 >= len(args) {
+				return nil, "", true, fmt.Errorf("--model requires a value")
+			}
+			present = true
+			value = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--model="):
+			v := strings.TrimPrefix(a, "--model=")
+			if v == "" {
+				return nil, "", true, fmt.Errorf("--model= requires a value")
+			}
+			present = true
+			value = v
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return rest, value, present, nil
+}
+
 // streamAgentChat sends a message to an agent and streams the SSE response.
 // Thinking and tool-call events are rendered in dim colors; text is printed inline.
-func (r *Registry) streamAgentChat(ctx context.Context, agentID, message string) error {
+func (r *Registry) streamAgentChat(ctx context.Context, agentID, message, model string) error {
 	req := client.AgentChatRequest{
 		Message: message,
 		UserID:  r.cfg.Auth.UserID,
 		Stream:  true,
+		Model:   model,
 	}
 
 	err := r.gw.AgentChatStream(ctx, agentID, req, func(chunk client.SSEChunk) {

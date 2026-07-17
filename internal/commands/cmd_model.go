@@ -65,6 +65,7 @@ func (r *Registry) modelList(ctx context.Context) error {
 			// Gateway is offline — that's fine, catalog was already shown.
 			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  (gateway unreachable — showing catalog only)"))
 			fmt.Println()
+			r.printDelegationDefault()
 			return nil
 		}
 		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Gateway models (%d)", len(gwModels)))
@@ -77,6 +78,7 @@ func (r *Registry) modelList(ctx context.Context) error {
 			)
 		}
 		fmt.Println()
+		r.printDelegationDefault()
 		return nil
 	}
 
@@ -92,7 +94,25 @@ func (r *Registry) modelList(ctx context.Context) error {
 		fmt.Printf("  %s  %s%s\n", gcolor.HEX("#f4a261").Sprintf("%-20s", p.Name), status, caps)
 	}
 	fmt.Println()
+	r.printDelegationDefault()
 	return nil
+}
+
+// printDelegationDefault appends one line to /model ls output naming the
+// /agent dispatch delegation-model default (cfg.Delegation.Model), when set.
+// This is local config state — independent of gateway connectivity — so
+// modelList calls it from all three of its exit paths (catalog-only,
+// gwModels fallback, and gwProviders), and it is a silent no-op when the
+// delegation default is unset ("").
+func (r *Registry) printDelegationDefault() {
+	if r.cfg.Delegation.Model == "" {
+		return
+	}
+	fmt.Printf("  %s\n", gcolor.HEX("#94a3b8").Sprintf(
+		"delegation default: %s (used by /agent dispatch unless --model is given)",
+		r.cfg.Delegation.Model,
+	))
+	fmt.Println()
 }
 
 func (r *Registry) modelSet(ctx context.Context, args []string) error {
