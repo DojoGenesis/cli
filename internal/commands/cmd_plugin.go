@@ -74,12 +74,26 @@ func (r *Registry) pluginList(ctx context.Context) error {
 
 // pluginInstall clones a plugin from a git URL and rescans.
 // A single URL may yield multiple plugins (monorepo case).
-// noConfirm skips the interactive trust prompt (--yes / -y flag).
+//
+// The "plugin.install" permission gate is the single confirmation for this
+// command: it replaced the ad-hoc y/N prompt inside plugins.InstallConfirmed
+// (which is now always called with noConfirm=true — one prompt, never two).
+// noConfirm here (--yes / -y) pre-answers the gate's Confirm case, matching
+// the flag's historical "skip the interactive prompt" contract; it does not
+// override an allowlist-mode Deny. InstallConfirmed itself is retained (it
+// lives in internal/plugins and still prints the security warning banner),
+// but its prompt path is dead from this call site.
 func (r *Registry) pluginInstall(ctx context.Context, gitURL string, noConfirm bool) error {
+	if !r.permissionGate("plugin.install",
+		fmt.Sprintf("clone %s into %s and load its hooks/skills", gitURL, r.cfg.Plugins.Path),
+		noConfirm) {
+		return nil
+	}
+
 	fmt.Println()
 	fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  Cloning %s ...", gitURL))
 
-	results, err := plugins.InstallConfirmed(gitURL, r.cfg.Plugins.Path, noConfirm)
+	results, err := plugins.InstallConfirmed(gitURL, r.cfg.Plugins.Path, true)
 	if err != nil {
 		return fmt.Errorf("plugin install: %w", err)
 	}
@@ -112,8 +126,16 @@ func (r *Registry) pluginInstall(ctx context.Context, gitURL string, noConfirm b
 	return nil
 }
 
-// pluginRemove removes an installed plugin by name and rescans.
+// pluginRemove removes an installed plugin by name and rescans. Gated as
+// "plugin.rm" — removal deletes the plugin directory from disk, and this
+// command historically had no confirmation at all.
 func (r *Registry) pluginRemove(ctx context.Context, name string) error {
+	if !r.permissionGate("plugin.rm",
+		fmt.Sprintf("delete plugin %q from %s", name, r.cfg.Plugins.Path),
+		false) {
+		return nil
+	}
+
 	if err := plugins.Uninstall(name, r.cfg.Plugins.Path); err != nil {
 		return fmt.Errorf("plugin remove: %w", err)
 	}
