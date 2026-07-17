@@ -10,8 +10,10 @@ import (
 	"github.com/DojoGenesis/cli/internal/activity"
 	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/guardrail"
 	"github.com/DojoGenesis/cli/internal/hooks"
 	"github.com/DojoGenesis/cli/internal/plugins"
+	gcolor "github.com/gookit/color"
 )
 
 // Registry maps slash command names to handler functions.
@@ -22,6 +24,18 @@ type Registry struct {
 	plgs    []plugins.Plugin
 	runner  *hooks.Runner
 	session *string // pointer to REPL's active session ID
+
+	// guard counts consecutive per-command failures and escalates advisory
+	// notices (never blocks — see internal/guardrail). Built lazily on first
+	// Dispatch from cfg.Guardrails rather than in New because tests construct
+	// Registry literals directly; nil cfg means disabled. Held for the
+	// Registry lifetime so counts persist across the whole REPL session.
+	guard *guardrail.Tracker
+
+	// advicePrint renders one guardrail advice line. nil means the default
+	// stdout printer (same surface the REPL prints command errors to);
+	// overridable so tests can capture advice without hijacking os.Stdout.
+	advicePrint func(msg string)
 }
 
 // Command is a callable slash command.
@@ -105,6 +119,7 @@ func (r *Registry) Dispatch(ctx context.Context, input string) error {
 			logArgs := redactSecretArgs(name, args)
 			activity.Log(activity.CommandRun, fmt.Sprintf("/%s %s", name, strings.Join(logArgs, " ")))
 		}
+		r.guardAdvise(cmd.Name, args, err)
 		return err
 	}
 	// Alias scan
@@ -116,11 +131,56 @@ func (r *Registry) Dispatch(ctx context.Context, input string) error {
 					logArgs := redactSecretArgs(cmd.Name, args)
 					activity.Log(activity.CommandRun, fmt.Sprintf("/%s %s", name, strings.Join(logArgs, " ")))
 				}
+				// Canonical name, not the typed alias, so every spelling of
+				// the same command feeds one failure streak.
+				r.guardAdvise(cmd.Name, args, err)
 				return err
 			}
 		}
 	}
 	return fmt.Errorf("unknown command /%s — type /help for a list", name)
+}
+
+// guardKey builds the guardrail key for one dispatched command: "cmd:" plus
+// the canonical command name, plus the first subcommand token (lowercased,
+// matching how subcommand matching works elsewhere in this package) when one
+// is present — e.g. "cmd:code test". Keying on the subcommand keeps
+// "/code test" and "/code build" as independent failure streaks.
+func guardKey(name string, args []string) string {
+	key := "cmd:" + name
+	if len(args) > 0 {
+		key += " " + strings.ToLower(args[0])
+	}
+	return key
+}
+
+// guardAdvise records one dispatched command's outcome with the guardrail
+// tracker and prints any resulting advice on its own line. Advisory only:
+// the command's error is returned to the caller untouched by Dispatch, and
+// the advice line goes to stdout — the same surface the REPL prints command
+// errors to (repl.go's `gcolor.Red.Printf("  error: ...")`) — styled with
+// the warning amber used by the renderer's EventWarning.
+func (r *Registry) guardAdvise(name string, args []string, runErr error) {
+	if r.guard == nil {
+		// Lazy build (see Registry.guard doc). Dispatch runs on the single
+		// REPL read-loop goroutine, so an unguarded nil check is safe here;
+		// the Tracker itself is mutex-guarded regardless.
+		if r.cfg == nil {
+			r.guard = guardrail.New(0, 0, false) // nil cfg → disabled
+		} else {
+			g := r.cfg.Guardrails
+			r.guard = guardrail.New(g.WarnAfter, g.HardAfter, g.Enabled)
+		}
+	}
+	adv := r.guard.Record(guardKey(name, args), runErr != nil)
+	if adv.Level == guardrail.None {
+		return
+	}
+	if r.advicePrint != nil {
+		r.advicePrint(adv.Msg)
+		return
+	}
+	fmt.Printf("  %s\n", gcolor.HEX("#f4a261").Sprint(adv.Msg))
 }
 
 func (r *Registry) add(cmd Command) {
