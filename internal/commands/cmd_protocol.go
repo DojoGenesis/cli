@@ -674,7 +674,7 @@ func (r *Registry) protocolInstall(ctx context.Context, name string, noConfirm b
 	fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  Install harness %q", target.ID))
 	fmt.Println(gcolor.HEX("#94a3b8").Sprint("    from: " + src))
 	fmt.Println(gcolor.HEX("#94a3b8").Sprint("    to:   " + dst))
-	if !noConfirm {
+	if !noConfirm && !r.autoConfirmed() {
 		fmt.Print(gcolor.HEX("#e8b04a").Sprint("\n  Continue? [y/N]: "))
 		reader := bufio.NewReader(os.Stdin)
 		answer, _ := reader.ReadString('\n')
