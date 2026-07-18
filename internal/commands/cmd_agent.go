@@ -381,8 +381,30 @@ func (r *Registry) streamAgentChat(ctx context.Context, agentID, message, model 
 		Model:   model,
 	}
 
+	var streamErrMsg string
 	err := r.gw.AgentChatStream(ctx, agentID, req, func(chunk client.SSEChunk) {
 		switch chunk.Event {
+		case "error":
+			// Mid-stream gateway error (rate limit, dead model, agent failure):
+			// capture it so streamAgentChat returns non-nil — headless envelope
+			// ok=false / exit 1 — mirroring /run in cmd_workflow.go. Still emit
+			// the NDJSON error line for a streaming JSON consumer.
+			streamErrMsg = agentNestedField(chunk.Data, "message")
+			if streamErrMsg == "" {
+				var m map[string]any
+				if json.Unmarshal([]byte(chunk.Data), &m) == nil {
+					if e, ok := m["error"].(string); ok {
+						streamErrMsg = e
+					}
+				}
+			}
+			if streamErrMsg == "" {
+				streamErrMsg = truncate(strings.TrimSpace(chunk.Data), 160)
+			}
+			if r.out.JSON() {
+				r.out.Emit(streamEvent{Type: "error", Content: streamErrMsg})
+			}
+			return
 		case "thinking":
 			// Gateway sends: event: thinking / data: {"type":"thinking","data":{"message":"..."},...}
 			msg := agentNestedField(chunk.Data, "message")
@@ -429,6 +451,9 @@ func (r *Registry) streamAgentChat(ctx context.Context, agentID, message, model 
 	if !r.out.JSON() {
 		fmt.Println()
 		fmt.Println()
+	}
+	if streamErrMsg != "" {
+		return fmt.Errorf("agent error: %s", streamErrMsg)
 	}
 	return err
 }

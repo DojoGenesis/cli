@@ -65,8 +65,29 @@ func (r *Registry) workflowCmd() Command {
 			// RunHeadless stdout redirect) instead of the colored human
 			// text; the two are mutually exclusive per event, same as
 			// streamAgentChat in cmd_agent.go.
+			var streamErrMsg string
 			err = r.gw.WorkflowExecutionStream(ctx, resp.RunID, func(chunk client.SSEChunk) {
 				switch chunk.Event {
+				case "error":
+					// Mid-stream gateway error: capture it so /workflow returns
+					// non-nil (headless envelope ok=false / exit 1), mirroring
+					// /run. Still emit the NDJSON error line in JSON mode.
+					streamErrMsg = agentNestedField(chunk.Data, "message")
+					if streamErrMsg == "" {
+						var m map[string]any
+						if json.Unmarshal([]byte(chunk.Data), &m) == nil {
+							if e, ok := m["error"].(string); ok {
+								streamErrMsg = e
+							}
+						}
+					}
+					if streamErrMsg == "" {
+						streamErrMsg = truncate(strings.TrimSpace(chunk.Data), 160)
+					}
+					if r.out.JSON() {
+						r.out.Emit(streamEvent{Type: "error", Content: streamErrMsg})
+					}
+					return
 				case "thinking":
 					if r.out.JSON() {
 						r.out.Emit(streamEvent{Type: "thinking", Content: truncate(chunk.Data, 80)})
@@ -95,6 +116,9 @@ func (r *Registry) workflowCmd() Command {
 			if !r.out.JSON() {
 				fmt.Println()
 				fmt.Println()
+			}
+			if streamErrMsg != "" {
+				return fmt.Errorf("workflow error: %s", streamErrMsg)
 			}
 			return err
 		},
