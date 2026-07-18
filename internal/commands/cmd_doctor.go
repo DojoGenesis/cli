@@ -28,26 +28,47 @@ import (
 
 // ─── /doctor ────────────────────────────────────────────────────────────────
 
+// doctorCheckResult is one structured check outcome, accumulated alongside
+// the human OK/WARN lines so headless JSON mode gets the same information as
+// a per-line structure instead of scraped terminal text.
+type doctorCheckResult struct {
+	Section string `json:"section"`
+	OK      bool   `json:"ok"`
+	Detail  string `json:"detail"`
+}
+
 func (r *Registry) doctorCmd() Command {
 	return Command{
 		Name:  "doctor",
 		Usage: "/doctor",
 		Short: "Read-only diagnostic: gateway, providers, config, plugins/hooks, protocol, harnesses",
 		Run: func(ctx context.Context, args []string) error {
-			fmt.Println()
-			gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Dojo Doctor"))
-			fmt.Println()
-			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  " + r.cfg.Gateway.URL))
-			fmt.Println()
+			if !r.out.JSON() {
+				fmt.Println()
+				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Dojo Doctor"))
+				fmt.Println()
+				fmt.Println(gcolor.HEX("#94a3b8").Sprint("  " + r.cfg.Gateway.URL))
+				fmt.Println()
+			}
 
+			var results []doctorCheckResult
+			var currentSection string
 			warnCount := 0
 			check := func(ok bool, detail string) {
 				if !ok {
 					warnCount++
 				}
+				results = append(results, doctorCheckResult{Section: currentSection, OK: ok, Detail: detail})
+				if r.out.JSON() {
+					return
+				}
 				fmt.Printf("    %s  %s\n", doctorTag(ok), detail)
 			}
 			section := func(name string) {
+				currentSection = name
+				if r.out.JSON() {
+					return
+				}
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#f4a261").Sprint("  " + name))
 				fmt.Println()
@@ -70,6 +91,14 @@ func (r *Registry) doctorCmd() Command {
 
 			section("HARNESSES")
 			r.doctorHarnesses(check)
+
+			if r.out.JSON() {
+				r.out.Data(map[string]any{
+					"checks":   results,
+					"warnings": warnCount,
+				})
+				return nil
+			}
 
 			fmt.Println()
 			if warnCount == 0 {

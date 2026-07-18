@@ -15,9 +15,9 @@ import (
 
 // activityCmd returns the /activity command.
 //
-//   /activity         — show last 10 entries
-//   /activity <n>     — show last n entries
-//   /activity clear   — clear the activity log
+//	/activity         — show last 10 entries
+//	/activity <n>     — show last n entries
+//	/activity clear   — clear the activity log
 func (r *Registry) activityCmd() Command {
 	return Command{
 		Name:    "activity",
@@ -30,6 +30,10 @@ func (r *Registry) activityCmd() Command {
 					return fmt.Errorf("activity clear: %w", err)
 				}
 				fmt.Println()
+				if r.out.JSON() {
+					r.out.Data(map[string]any{"cleared": true})
+					return nil
+				}
 				gcolor.Bold.Print(gcolor.HEX("#7fb88c").Sprint("  Activity log cleared"))
 				fmt.Println()
 				fmt.Println()
@@ -49,6 +53,10 @@ func (r *Registry) activityCmd() Command {
 			}
 
 			fmt.Println()
+			if r.out.JSON() {
+				r.out.Data(entries)
+				return nil
+			}
 			gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Activity log (last %d)", n))
 			fmt.Println()
 			fmt.Println()

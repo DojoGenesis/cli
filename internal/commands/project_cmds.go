@@ -29,6 +29,26 @@ import (
 //	/project track set <id> <status>          — update track status
 //	/project decision <text>                  — record a decision
 //	/project artifact <type> <file> <content> — save an artifact
+
+// ─── JSON result types (headless mode) ──────────────────────────────────────
+
+// ProjectStatusResult is the JSON-mode payload for `/project status`. It
+// embeds the full project record (tracks, decisions, artifacts, activity
+// log) and adds the one derived field — Next — that the human view also
+// shows but which isn't itself a stored Project field.
+type ProjectStatusResult struct {
+	*project.Project
+	Next string `json:"next"`
+}
+
+// ProjectListEntry is one row of the JSON-mode `/project list` payload: the
+// stored project record plus whether it's the active one, which (like Next
+// above) lives in GlobalState rather than on Project itself.
+type ProjectListEntry struct {
+	*project.Project
+	Active bool `json:"active"`
+}
+
 func (r *Registry) projectCmd() Command {
 	return Command{
 		Name:    "project",
@@ -37,7 +57,7 @@ func (r *Registry) projectCmd() Command {
 		Short:   "Project lifecycle — phases, tracks, decisions, artifacts",
 		Run: func(ctx context.Context, args []string) error {
 			if len(args) == 0 {
-				return projectStatus(nil)
+				return r.projectStatus(nil)
 			}
 
 			sub := strings.ToLower(args[0])
@@ -47,11 +67,11 @@ func (r *Registry) projectCmd() Command {
 			case "init", "new", "create":
 				return projectInit(rest)
 			case "status", "st":
-				return projectStatus(rest)
+				return r.projectStatus(rest)
 			case "switch":
 				return projectSwitch(rest)
 			case "list", "ls":
-				return projectList(rest)
+				return r.projectList(rest)
 			case "archive":
 				return projectArchive(rest)
 			case "phase":
@@ -108,7 +128,7 @@ func projectInit(args []string) error {
 
 // ─── /project status ──────────────────────────────────────────────────────────
 
-func projectStatus(args []string) error {
+func (r *Registry) projectStatus(args []string) error {
 	p, err := resolveProjectArg(args)
 	if err != nil {
 		return err
@@ -117,6 +137,11 @@ func projectStatus(args []string) error {
 		fmt.Println()
 		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  No active project. Run /project init <name> to create one."))
 		fmt.Println()
+		return nil
+	}
+
+	if r.out.JSON() {
+		r.out.Data(ProjectStatusResult{Project: p, Next: p.SuggestNext()})
 		return nil
 	}
 
@@ -244,7 +269,7 @@ func projectSwitch(args []string) error {
 
 // ─── /project list ────────────────────────────────────────────────────────────
 
-func projectList(args []string) error {
+func (r *Registry) projectList(args []string) error {
 	includeArchived := false
 	for _, a := range args {
 		if a == "--all" {
@@ -260,6 +285,15 @@ func projectList(args []string) error {
 	gs, err := project.LoadGlobalState()
 	if err != nil {
 		return fmt.Errorf("project list: load state: %w", err)
+	}
+
+	if r.out.JSON() {
+		entries := make([]ProjectListEntry, len(projects))
+		for i, p := range projects {
+			entries[i] = ProjectListEntry{Project: p, Active: p.ID == gs.ActiveProjectID}
+		}
+		r.out.Data(entries)
+		return nil
 	}
 
 	fmt.Println()

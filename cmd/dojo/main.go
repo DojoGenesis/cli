@@ -338,7 +338,11 @@ func newHeadlessRegistry(cfg *config.Config, gw *client.Client) *commands.Regist
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dojo: plugin scan: %s\n", err)
 	}
-	var session string
+	// Seed a session id the way the chat one-shot path does (main's ChatRequest
+	// uses dojo-oneshot-<nano>). Commands that carry a session to the gateway —
+	// /run orchestration, /agent, /workflow — send *r.session; an empty string
+	// makes the gateway reject the request with "session_id is required".
+	session := fmt.Sprintf("dojo-headless-%d", time.Now().UnixNano())
 	return commands.New(cfg, gw, plgs, &session)
 }
 

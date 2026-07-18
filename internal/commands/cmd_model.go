@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/DojoGenesis/cli/internal/activity"
+	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/providers"
 	gcolor "github.com/gookit/color"
 )
@@ -42,6 +43,66 @@ func (r *Registry) modelCmd() Command {
 	}
 }
 
+// ─── JSON result types (headless mode) ──────────────────────────────────────
+
+// ModelCatalogModel is one statically-known model within a provider, in the
+// JSON-mode `/model ls` catalog. providers.KnownModel carries no JSON tags
+// (it's a REPL-only display type), so this is the small tagged projection.
+type ModelCatalogModel struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	Notes       string `json:"notes,omitempty"`
+}
+
+// ModelCatalogEntry is one provider's row in the JSON-mode `/model ls`
+// catalog — the structured equivalent of providers.FormatProviderTable's
+// human table, including the same "n/a" / "set" / "not set" key status.
+type ModelCatalogEntry struct {
+	ID          string              `json:"id"`
+	DisplayName string              `json:"display_name"`
+	KeyStatus   string              `json:"key_status"` // "n/a" | "set" | "not set"
+	Models      []ModelCatalogModel `json:"models"`
+}
+
+// ModelListResult is the JSON-mode payload for `/model ls` (and bare
+// `/model`). GatewayProviders/GatewayModels are mutually exclusive — the
+// gateway's /v1/providers is tried first, /v1/models is a fallback, and
+// both are empty when the gateway is unreachable.
+type ModelListResult struct {
+	Catalog          []ModelCatalogEntry `json:"catalog"`
+	GatewayReachable bool                `json:"gateway_reachable"`
+	GatewayProviders []client.Provider   `json:"gateway_providers,omitempty"`
+	GatewayModels    []client.Model      `json:"gateway_models,omitempty"`
+	DelegationModel  string              `json:"delegation_model,omitempty"`
+}
+
+// modelCatalogEntries builds the JSON-mode catalog rows from providers.Catalog,
+// mirroring providers.FormatProviderTable's key-status logic exactly.
+func modelCatalogEntries(keys providers.APIKeys) []ModelCatalogEntry {
+	entries := make([]ModelCatalogEntry, 0, len(providers.Catalog))
+	for _, p := range providers.Catalog {
+		keyStatus := "n/a"
+		if p.EnvKey != "" {
+			if keys.KeyForProvider(p.ID) != "" {
+				keyStatus = "set"
+			} else {
+				keyStatus = "not set"
+			}
+		}
+		models := make([]ModelCatalogModel, 0, len(p.Models))
+		for _, m := range p.Models {
+			models = append(models, ModelCatalogModel{ID: m.ID, DisplayName: m.DisplayName, Notes: m.Notes})
+		}
+		entries = append(entries, ModelCatalogEntry{
+			ID:          p.ID,
+			DisplayName: p.DisplayName,
+			KeyStatus:   keyStatus,
+			Models:      models,
+		})
+	}
+	return entries
+}
+
 func (r *Registry) modelList(ctx context.Context) error {
 	// Always show static provider catalog first.
 	keys := providers.LoadAPIKeys()
@@ -63,9 +124,25 @@ func (r *Registry) modelList(ctx context.Context) error {
 		gwModels, err2 := r.gw.Models(ctx)
 		if err2 != nil {
 			// Gateway is offline — that's fine, catalog was already shown.
+			if r.out.JSON() {
+				r.out.Data(ModelListResult{
+					Catalog:         modelCatalogEntries(keys),
+					DelegationModel: r.cfg.Delegation.Model,
+				})
+				return nil
+			}
 			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  (gateway unreachable — showing catalog only)"))
 			fmt.Println()
 			r.printDelegationDefault()
+			return nil
+		}
+		if r.out.JSON() {
+			r.out.Data(ModelListResult{
+				Catalog:          modelCatalogEntries(keys),
+				GatewayReachable: true,
+				GatewayModels:    gwModels,
+				DelegationModel:  r.cfg.Delegation.Model,
+			})
 			return nil
 		}
 		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Gateway models (%d)", len(gwModels)))
@@ -79,6 +156,16 @@ func (r *Registry) modelList(ctx context.Context) error {
 		}
 		fmt.Println()
 		r.printDelegationDefault()
+		return nil
+	}
+
+	if r.out.JSON() {
+		r.out.Data(ModelListResult{
+			Catalog:          modelCatalogEntries(keys),
+			GatewayReachable: true,
+			GatewayProviders: gwProviders,
+			DelegationModel:  r.cfg.Delegation.Model,
+		})
 		return nil
 	}
 

@@ -16,6 +16,15 @@ import (
 
 // ─── /sensei ────────────────────────────────────────────────────────────────
 
+// SenseiResult is the JSON-mode payload for `/sensei`.
+type SenseiResult struct {
+	Koan     string `json:"koan"`
+	Belt     string `json:"belt"`
+	Rank     int    `json:"rank"`
+	Unlocked int    `json:"koans_unlocked"`
+	Total    int    `json:"koans_total"`
+}
+
 func (r *Registry) senseiCmd() Command {
 	return Command{
 		Name:    "sensei",
@@ -32,6 +41,17 @@ func (r *Registry) senseiCmd() Command {
 			koan := spirit.RandomKoan(belt.Rank, time.Now())
 			unlocked := spirit.KoanCount(belt.Rank)
 			total := spirit.TotalKoans()
+
+			if r.out.JSON() {
+				r.out.Data(SenseiResult{
+					Koan:     koan,
+					Belt:     belt.Name,
+					Rank:     belt.Rank,
+					Unlocked: unlocked,
+					Total:    total,
+				})
+				return nil
+			}
 
 			fmt.Println()
 			fmt.Print(art.SmallBonsaiString())
@@ -50,6 +70,37 @@ func (r *Registry) senseiCmd() Command {
 
 // ─── /card ──────────────────────────────────────────────────────────────────
 
+// CardBelt is the belt projection used in CardResult — spirit.Belt carries no
+// JSON tags (it's a REPL-only display type, and its Threshold isn't
+// meaningful outside the belt ladder itself), so this is the small tagged
+// subset an agent needs.
+type CardBelt struct {
+	Rank  int    `json:"rank"`
+	Name  string `json:"name"`
+	Title string `json:"title"`
+}
+
+// CardAchievement is one unlocked achievement in the JSON-mode `/card`
+// payload. spirit.Achievement carries an unexported `check` func field (which
+// json.Marshal would simply skip) but no JSON tags on the rest, hence the
+// small tagged projection here.
+type CardAchievement struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Icon        string `json:"icon"`
+}
+
+// CardResult is the JSON-mode payload for `/card`.
+type CardResult struct {
+	Spirit       spirit.SpiritState `json:"spirit"`
+	Belt         CardBelt           `json:"belt"`
+	NextBelt     *CardBelt          `json:"next_belt,omitempty"`
+	ProgressPct  float64            `json:"progress_pct"`
+	XPToNext     int                `json:"xp_to_next,omitempty"`
+	Achievements []CardAchievement  `json:"achievements"`
+}
+
 func (r *Registry) cardCmd() Command {
 	return Command{
 		Name:    "card",
@@ -64,9 +115,27 @@ func (r *Registry) cardCmd() Command {
 
 			sp := st.Spirit
 			belt := spirit.CurrentBelt(sp.XP)
-			next, _ := spirit.NextBelt(sp.XP)
+			next, xpToNext := spirit.NextBelt(sp.XP)
 			pct := spirit.ProgressPercent(sp.XP)
 			achievements := spirit.UnlockedAchievements(&sp)
+
+			if r.out.JSON() {
+				result := CardResult{
+					Spirit:       sp,
+					Belt:         CardBelt{Rank: belt.Rank, Name: belt.Name, Title: belt.Title},
+					ProgressPct:  pct,
+					Achievements: make([]CardAchievement, len(achievements)),
+				}
+				if next != nil {
+					result.NextBelt = &CardBelt{Rank: next.Rank, Name: next.Name, Title: next.Title}
+					result.XPToNext = xpToNext
+				}
+				for i, a := range achievements {
+					result.Achievements[i] = CardAchievement{ID: a.ID, Name: a.Name, Description: a.Description, Icon: a.Icon}
+				}
+				r.out.Data(result)
+				return nil
+			}
 
 			// XP display
 			var xpLine string

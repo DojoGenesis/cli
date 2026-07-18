@@ -3,7 +3,10 @@ package plugins
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
@@ -15,6 +18,45 @@ import (
 type InstallResult struct {
 	Name string
 	Path string
+}
+
+// InstallPolicy controls the integrity checks InstallConfirmedWithPolicy
+// enforces before (source allowlist) and after (hash pin) cloning an
+// external plugin. Installed plugins run arbitrary command-hook shell (see
+// internal/hooks), so "eyeball the URL + y/N" is not, by itself, a
+// meaningful trust boundary — this is the minimal-but-real check ahead of
+// full artifact signing (out of scope here).
+type InstallPolicy struct {
+	// AllowedSources lists "host/owner" origins a plugin's git URL must
+	// match — e.g. "github.com/DojoGenesis". Matching is case-insensitive
+	// and exact (no wildcards); see DefaultInstallPolicy for the house
+	// default. Ignored when AllowAnySource is true.
+	AllowedSources []string
+	// AllowAnySource disables the source allowlist entirely. This is a
+	// separate, explicitly-named opt-out — it is NEVER implied by
+	// InstallConfirmed's noConfirm/--yes, which only pre-answers the
+	// interactive y/N prompt. A caller has to deliberately set this field
+	// to bypass the allowlist.
+	AllowAnySource bool
+	// ExpectedSHA256 optionally pins the installed plugin tree to a known
+	// content digest (see HashPluginTree). Empty skips the pin check. When
+	// set and a clone yields more than one plugin (the monorepo case),
+	// EVERY resulting plugin must match — the pin is meant for a single,
+	// known-good artifact (a root repo or a GitHub subdirectory URL), not
+	// an "any of these" match across an unrelated set.
+	ExpectedSHA256 string
+}
+
+// DefaultInstallPolicy returns the house allowlist: first-party DojoGenesis
+// and TresPies-source origins only. Callers needing a broader or narrower
+// policy build their own InstallPolicy and call InstallConfirmedWithPolicy
+// directly; InstallConfirmed (the pre-existing entry point) always applies
+// this default so the real /plugin install call path is protected without
+// any caller-side change.
+func DefaultInstallPolicy() InstallPolicy {
+	return InstallPolicy{
+		AllowedSources: []string{"github.com/DojoGenesis", "github.com/TresPies-source"},
+	}
 }
 
 // Install clones a git URL and installs one or more plugins into destDir.
@@ -40,9 +82,33 @@ func Install(gitURL, destDir string) ([]InstallResult, error) {
 // It prints a security warning to stderr listing the URL, then — unless
 // noConfirm is true — prompts the user for explicit y/n confirmation before
 // proceeding. Pass noConfirm=true to skip the prompt (e.g. --yes flag).
+//
+// This is now a thin wrapper over InstallConfirmedWithPolicy using
+// DefaultInstallPolicy() — additive: the signature and behavior for any
+// already-allowlisted source are unchanged, but every call now also passes
+// through the source-allowlist gate (Rider C2). Callers that need a
+// different policy (a wider allowlist, AllowAnySource, or a sha256 pin) call
+// InstallConfirmedWithPolicy directly.
 func InstallConfirmed(gitURL, destDir string, noConfirm bool) ([]InstallResult, error) {
+	return InstallConfirmedWithPolicy(gitURL, destDir, noConfirm, DefaultInstallPolicy())
+}
+
+// InstallConfirmedWithPolicy is InstallConfirmed with an explicit
+// InstallPolicy. It prints the same security warning, then enforces the
+// policy's source allowlist UNCONDITIONALLY — before the y/N prompt and
+// regardless of noConfirm — since noConfirm/--yes only pre-answers the
+// confirmation question, never the integrity gate. On success, when
+// policy.ExpectedSHA256 is set, every installed result's tree is hashed
+// (HashPluginTree) and compared; a mismatch removes everything Install just
+// wrote and returns an error rather than leaving a partially-verified
+// plugin on disk.
+func InstallConfirmedWithPolicy(gitURL, destDir string, noConfirm bool, policy InstallPolicy) ([]InstallResult, error) {
 	fmt.Fprintf(os.Stderr, "\n  WARNING: Installing plugin from external source. Verify trust before proceeding.\n")
 	fmt.Fprintf(os.Stderr, "  URL: %s\n\n", gitURL)
+
+	if err := checkSourceAllowed(gitURL, policy); err != nil {
+		return nil, err
+	}
 
 	if !noConfirm {
 		fmt.Fprint(os.Stderr, "  Continue? [y/N]: ")
@@ -54,7 +120,140 @@ func InstallConfirmed(gitURL, destDir string, noConfirm bool) ([]InstallResult, 
 		}
 	}
 
-	return Install(gitURL, destDir)
+	results, err := Install(gitURL, destDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if policy.ExpectedSHA256 != "" {
+		if err := verifyPinnedHash(results, policy.ExpectedSHA256); err != nil {
+			for _, res := range results {
+				_ = os.RemoveAll(res.Path)
+			}
+			return nil, err
+		}
+	}
+
+	return results, nil
+}
+
+// checkSourceAllowed enforces policy's source allowlist ahead of any clone —
+// refusing a non-allowlisted origin here means a malicious or unvetted git
+// URL never reaches exec.Command("git", "clone", ...). A URL that parses
+// with no host at all (a local filesystem path, e.g. from a dev workflow
+// installing a plugin already on disk) is let through: the allowlist exists
+// to vet third-party REMOTE origins, and a bare local path carries no
+// supply-chain risk of that kind — the caller already has whatever access
+// to it that installing would grant. A URL that fails to parse at all is
+// refused (fail closed): it cannot be verified as either a safe local path
+// or an allowlisted remote origin.
+func checkSourceAllowed(gitURL string, policy InstallPolicy) error {
+	if policy.AllowAnySource {
+		return nil
+	}
+	host, owner, parsed := sourceOrigin(gitURL)
+	if !parsed {
+		return fmt.Errorf("plugin install refused: could not parse source %q (set InstallPolicy.AllowAnySource to override)", gitURL)
+	}
+	if host == "" {
+		return nil // local filesystem path — no remote origin to vet
+	}
+	candidate := host
+	if owner != "" {
+		candidate = host + "/" + owner
+	}
+	for _, allowed := range policy.AllowedSources {
+		if strings.EqualFold(candidate, allowed) {
+			return nil
+		}
+	}
+	return fmt.Errorf("plugin install refused: source %q is not in the allowlist (%s) — pass an InstallPolicy with AllowAnySource, or an expanded AllowedSources, to override",
+		candidate, strings.Join(policy.AllowedSources, ", "))
+}
+
+// sourceOrigin extracts the (host, owner) pair from a plugin git URL for
+// allowlist matching, e.g. "https://github.com/DojoGenesis/plugins.git" ->
+// ("github.com", "DojoGenesis"). owner is always the first path segment,
+// which is correct for both a root repo URL and the
+// "/tree/{branch}/{path}" subdirectory form parseGitHubSubdirURL handles —
+// the owner sits before "/tree/" either way, so no special-casing of that
+// shape is needed here. parsed is false only when normalizeURL's result
+// fails to parse as a URL at all (see checkSourceAllowed for how the two
+// failure/no-host cases are treated differently).
+func sourceOrigin(gitURL string) (host, owner string, parsed bool) {
+	u, err := url.Parse(normalizeURL(gitURL))
+	if err != nil {
+		return "", "", false
+	}
+	if u.Host == "" {
+		return "", "", true
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) > 0 {
+		owner = parts[0]
+	}
+	return u.Host, owner, true
+}
+
+// HashPluginTree computes a deterministic sha256 digest over a plugin
+// directory's file contents and relative paths, for InstallPolicy's
+// ExpectedSHA256 pin. filepath.WalkDir visits entries in lexical order, and
+// each file's relative path (as a NUL-separated, slash-normalized prefix) is
+// hashed ahead of its content, so neither a reordered walk nor a
+// same-content-different-name file can produce a matching digest by
+// accident. Skips the same VCS/cache cruft the install/copy paths already
+// ignore (.git, .DS_Store, __pycache__) so the pin survives incidental
+// clone artifacts rather than breaking on them.
+func HashPluginTree(dir string) (string, error) {
+	h := sha256.New()
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		name := d.Name()
+		if name == ".git" || name == ".DS_Store" || name == "__pycache__" {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return relErr
+		}
+		data, readErr := os.ReadFile(path) //nolint:gosec // path walks a just-cloned plugin tree under our own destDir
+		if readErr != nil {
+			return readErr
+		}
+		// Writing to a hash never errors; discard explicitly for errcheck.
+		_, _ = fmt.Fprintf(h, "%s\x00", filepath.ToSlash(rel))
+		_, _ = h.Write(data)
+		_, _ = h.Write([]byte{0})
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// verifyPinnedHash hashes each installed plugin's tree and compares it
+// against policy's ExpectedSHA256 pin (case-insensitive hex compare).
+func verifyPinnedHash(results []InstallResult, expected string) error {
+	expected = strings.TrimSpace(expected)
+	for _, res := range results {
+		got, err := HashPluginTree(res.Path)
+		if err != nil {
+			return fmt.Errorf("hash %s for sha256 pin check: %w", res.Path, err)
+		}
+		if !strings.EqualFold(got, expected) {
+			return fmt.Errorf("sha256 pin mismatch for %s: got %s, want %s", res.Name, got, expected)
+		}
+	}
+	return nil
 }
 
 // Uninstall removes a plugin directory.

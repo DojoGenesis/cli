@@ -103,9 +103,16 @@ func (r *Registry) appsCmd() Command {
 				return nil
 
 			default: // ls
+				if len(args) > 0 && sub != "ls" {
+					return fmt.Errorf("unknown subcommand %q — see /help", args[0])
+				}
 				apps, err := r.gw.ListApps(ctx)
 				if err != nil {
 					return fmt.Errorf("could not list apps: %w", err)
+				}
+				if r.out.JSON() {
+					r.out.Data(apps)
+					return nil
 				}
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  MCP Apps (%d)\n\n", len(apps)))

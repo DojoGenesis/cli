@@ -56,6 +56,10 @@ func (r *Registry) dispositionList() error {
 		return err
 	}
 	presets := config.MergeConfigProfiles(r.cfg.DispositionProfiles, filePresets)
+	if r.out.JSON() {
+		r.out.Data(presets)
+		return nil
+	}
 	fmt.Println()
 	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Disposition presets (%d)", len(presets)))
 	fmt.Println()
@@ -108,6 +112,10 @@ func (r *Registry) dispositionShow(name string) error {
 	presets := config.MergeConfigProfiles(r.cfg.DispositionProfiles, filePresets)
 	for _, p := range presets {
 		if p.Name == name {
+			if r.out.JSON() {
+				r.out.Data(p)
+				return nil
+			}
 			fmt.Println()
 			printKV("name", p.Name)
 			printKV("pacing", p.Pacing)

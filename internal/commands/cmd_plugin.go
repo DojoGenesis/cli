@@ -5,6 +5,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/DojoGenesis/cli/internal/activity"
 	"github.com/DojoGenesis/cli/internal/plugins"
@@ -14,13 +15,21 @@ import (
 // pluginCmd returns the /plugin command with subcommands:
 //
 //	/plugin ls            — list installed plugins
-//	/plugin install <url> — clone a plugin from a git URL
+//	/plugin install <url> [--yes] [--sha256=<hex>] [--allow-any-source]
+//	                       — clone a plugin from a git URL
 //	/plugin rm <name>     — remove an installed plugin
+//
+// install's trailing flags (any order, after the URL):
+//
+//	--yes / -y          — skip the y/N confirmation (never the integrity gate below)
+//	--sha256=<hex>      — pin the installed tree to a known-good digest (plugins.HashPluginTree)
+//	--allow-any-source  — disable the source allowlist (Rider C2); a separate, deliberate
+//	                      opt-out — never implied by --yes
 func (r *Registry) pluginCmd() Command {
 	return Command{
 		Name:    "plugin",
 		Aliases: []string{"plugins"},
-		Usage:   "/plugin [ls|install <url>|rm <name>]",
+		Usage:   "/plugin [ls|install <url> [--yes] [--sha256=<hex>] [--allow-any-source]|rm <name>]",
 		Short:   "Manage installed plugins",
 		Run: func(ctx context.Context, args []string) error {
 			if len(args) == 0 || args[0] == "ls" {
@@ -31,8 +40,19 @@ func (r *Registry) pluginCmd() Command {
 				if len(args) < 2 {
 					return fmt.Errorf("usage: /plugin install <git-url>")
 				}
-				noConfirm := len(args) > 2 && (args[2] == "--yes" || args[2] == "-y")
-				return r.pluginInstall(ctx, args[1], noConfirm)
+				var noConfirm, allowAnySource bool
+				var sha256Pin string
+				for _, a := range args[2:] {
+					switch {
+					case a == "--yes" || a == "-y":
+						noConfirm = true
+					case a == "--allow-any-source":
+						allowAnySource = true
+					case strings.HasPrefix(a, "--sha256="):
+						sha256Pin = strings.TrimPrefix(a, "--sha256=")
+					}
+				}
+				return r.pluginInstall(ctx, args[1], noConfirm, allowAnySource, sha256Pin)
 			case "rm", "remove", "uninstall":
 				if len(args) < 2 {
 					return fmt.Errorf("usage: /plugin rm <name>")
@@ -83,7 +103,19 @@ func (r *Registry) pluginList(ctx context.Context) error {
 // override an allowlist-mode Deny. InstallConfirmed itself is retained (it
 // lives in internal/plugins and still prints the security warning banner),
 // but its prompt path is dead from this call site.
-func (r *Registry) pluginInstall(ctx context.Context, gitURL string, noConfirm bool) error {
+//
+// allowAnySource and sha256Pin surface plugins.InstallPolicy's two integrity
+// knobs (Rider C2): allowAnySource disables the source allowlist entirely —
+// a separate, explicitly-named flag, never implied by noConfirm/--yes — and
+// sha256Pin, when non-empty, pins the installed tree to a known-good digest
+// (plugins.HashPluginTree), rolling back the install on a mismatch. Neither
+// knob is needed for the default path: InstallConfirmed (and therefore this
+// call, when both are zero-valued) already applies the house allowlist via
+// plugins.DefaultInstallPolicy.
+func (r *Registry) pluginInstall(ctx context.Context, gitURL string, noConfirm, allowAnySource bool, sha256Pin string) error {
+	if err := r.headlessRefuse("install plugin"); err != nil {
+		return err
+	}
 	if !r.permissionGate("plugin.install",
 		fmt.Sprintf("clone %s into %s and load its hooks/skills", gitURL, r.cfg.Plugins.Path),
 		noConfirm) {
@@ -93,7 +125,11 @@ func (r *Registry) pluginInstall(ctx context.Context, gitURL string, noConfirm b
 	fmt.Println()
 	fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  Cloning %s ...", gitURL))
 
-	results, err := plugins.InstallConfirmed(gitURL, r.cfg.Plugins.Path, true)
+	policy := plugins.DefaultInstallPolicy()
+	policy.AllowAnySource = allowAnySource
+	policy.ExpectedSHA256 = sha256Pin
+
+	results, err := plugins.InstallConfirmedWithPolicy(gitURL, r.cfg.Plugins.Path, true, policy)
 	if err != nil {
 		return fmt.Errorf("plugin install: %w", err)
 	}

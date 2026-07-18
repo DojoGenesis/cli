@@ -84,6 +84,58 @@ func craftHelp() {
 	fmt.Println()
 }
 
+// ─── JSON result types (headless dispatch) ──────────────────────────────────
+//
+// One struct per /craft list/get subcommand that loops printing rows in
+// Human mode — so a headless JSON dispatch (r.out.JSON()) gets a typed
+// payload via r.out.Data(...) instead of the scraped-text fallback. See
+// internal/output for the Envelope these become the `data` field of.
+
+// craftADRResult is the JSON-mode payload for a successfully written /craft adr.
+type craftADRResult struct {
+	Number  int    `json:"number"`
+	Title   string `json:"title"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+// craftScoutResult is the JSON-mode payload for /craft scout.
+type craftScoutResult struct {
+	Tension string `json:"tension"`
+	Content string `json:"content"`
+}
+
+// craftMemoryListResult is the JSON-mode payload for /craft memory ls.
+type craftMemoryListResult struct {
+	Count    int             `json:"count"`
+	Memories []client.Memory `json:"memories"`
+}
+
+// craftMemorySearchResult is the JSON-mode payload for /craft memory search.
+type craftMemorySearchResult struct {
+	Query   string          `json:"query"`
+	Count   int             `json:"count"`
+	Results []client.Memory `json:"results"`
+}
+
+// craftSeedListResult is the JSON-mode payload shared by /craft seed ls,
+// /craft seed harvest (currently an honestly-labelled alias of ls), and the
+// no-args listing branch of /craft seed elevate — all three route through
+// craftPrintSeedList, which sets this via the package-level curEmitter (see
+// printKV in cmd_help.go for the same free-function pattern).
+type craftSeedListResult struct {
+	Count int           `json:"count"`
+	Seeds []client.Seed `json:"seeds"`
+}
+
+// craftSeedSearchResult is the JSON-mode payload for /craft seed search.
+type craftSeedSearchResult struct {
+	Query   string        `json:"query"`
+	Matched int           `json:"matched"`
+	Total   int           `json:"total"`
+	Seeds   []client.Seed `json:"seeds"`
+}
+
 // ─── /craft adr ──────────────────────────────────────────────────────────────
 
 func (r *Registry) craftADR(ctx context.Context, args []string) error {
@@ -154,6 +206,13 @@ Be concise and precise. Focus on the decision, not the technology overview.`, ne
 	// Permission gate "craft.adr" replaces the old ad-hoc y/N confirm at the
 	// same site: the write is the risky part, so the generated ADR streams to
 	// screen regardless and only the file write is gated (one prompt max).
+	// Headless callers get a clean refusal instead of a silent decline —
+	// checked before the gate so a scripted run never falls through to
+	// ConfirmInteractive's no-TTY false (which would otherwise report success
+	// having written nothing).
+	if err := r.headlessRefuse("write ADR file"); err != nil {
+		return err
+	}
 	if !r.permissionGate("craft.adr", "write "+path, false) {
 		return nil
 	}
@@ -163,6 +222,11 @@ Be concise and precise. Focus on the decision, not the technology overview.`, ne
 	}
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return fmt.Errorf("could not write ADR: %w", err)
+	}
+
+	if r.out.JSON() {
+		r.out.Data(craftADRResult{Number: nextNum, Title: title, Path: path, Content: content})
+		return nil
 	}
 
 	fmt.Println()
@@ -233,10 +297,13 @@ Be direct. Prefer action over exploration. Assume the operator has limited atten
 		Stream:    true,
 	}
 
-	_, err := r.craftStream(ctx, systemPrompt, req)
+	content, err := r.craftStream(ctx, systemPrompt, req)
 	fmt.Println()
 	if err != nil {
 		return fmt.Errorf("gateway error: %w", err)
+	}
+	if r.out.JSON() {
+		r.out.Data(craftScoutResult{Tension: tension, Content: content})
 	}
 	return nil
 }
@@ -380,6 +447,11 @@ Be specific. Do not suggest generic "add more documentation".`
 	// at the same site. Only the --fix write path is gated — the analysis
 	// above is read-only and prints for every mode, exactly like a run
 	// without --fix.
+	// Headless callers get a clean refusal instead of a silent decline —
+	// checked before the gate, same as /craft adr.
+	if err := r.headlessRefuse("rewrite CLAUDE.md files"); err != nil {
+		return err
+	}
 	if !r.permissionGate("craft.claude-md",
 		fmt.Sprintf("rewrite %d CLAUDE.md file(s) in place under %s", len(relPaths), cwd),
 		false) {
@@ -415,6 +487,10 @@ func (r *Registry) craftMemory(ctx context.Context, args []string) error {
 		memories, err := r.gw.Memories(ctx)
 		if err != nil {
 			return fmt.Errorf("could not fetch memories: %w", err)
+		}
+		if r.out.JSON() {
+			r.out.Data(craftMemoryListResult{Count: len(memories), Memories: memories})
+			return nil
 		}
 		fmt.Println()
 		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Memory (%d)\n\n", len(memories)))
@@ -505,6 +581,12 @@ func (r *Registry) craftMemory(ctx context.Context, args []string) error {
 		}
 		fmt.Println()
 
+		// Headless callers get a clean refusal instead of blocking on stdin —
+		// checked before the y/N prompt (one prompt maximum: this replaces it
+		// rather than running alongside it).
+		if err := r.headlessRefuse("delete memory entries"); err != nil {
+			return err
+		}
 		if !craftConfirm(fmt.Sprintf("Delete these %d memory entries?", len(target))) {
 			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — nothing pruned."))
 			fmt.Println()
@@ -541,6 +623,10 @@ func (r *Registry) craftMemory(ctx context.Context, args []string) error {
 		results, err := r.gw.SearchMemories(ctx, query)
 		if err != nil {
 			return fmt.Errorf("could not search memories: %w", err)
+		}
+		if r.out.JSON() {
+			r.out.Data(craftMemorySearchResult{Query: query, Count: len(results), Results: results})
+			return nil
 		}
 		fmt.Println()
 		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Memory Search: %q (%d results)\n\n", query, len(results)))
@@ -635,6 +721,10 @@ func (r *Registry) craftSeed(ctx context.Context, args []string) error {
 				matched = append(matched, s)
 			}
 		}
+		if r.out.JSON() {
+			r.out.Data(craftSeedSearchResult{Query: query, Matched: len(matched), Total: len(allSeeds), Seeds: matched})
+			return nil
+		}
 		fmt.Println()
 		gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Seed Search: %q (%d of %d)\n\n", query, len(matched), len(allSeeds)))
 		if len(matched) == 0 {
@@ -663,6 +753,10 @@ func (r *Registry) craftSeed(ctx context.Context, args []string) error {
 			fmt.Println()
 			gcolor.HEX("#94a3b8").Printf("  %d seeds in garden\n\n", len(seeds))
 			if len(seeds) == 0 {
+				if r.out.JSON() {
+					r.out.Data(craftSeedListResult{Count: 0})
+					return nil
+				}
 				fmt.Println(gcolor.HEX("#94a3b8").Sprint("  No seeds to elevate."))
 				fmt.Println()
 				return nil
@@ -696,6 +790,12 @@ func (r *Registry) craftSeed(ctx context.Context, args []string) error {
 		gcolor.HEX("#94a3b8").Printf("  source: %s\n", elevateSource)
 		fmt.Printf("  %s\n\n", gcolor.White.Sprint(truncate(elevateText, 100)))
 
+		// Headless callers get a clean refusal instead of blocking on stdin —
+		// checked before the y/N prompt (one prompt maximum: this replaces it
+		// rather than running alongside it).
+		if err := r.headlessRefuse("store durable memory"); err != nil {
+			return err
+		}
 		if !craftConfirm("Store this as durable memory?") {
 			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — nothing elevated."))
 			fmt.Println()
@@ -963,6 +1063,11 @@ func (r *Registry) craftScaffold(args []string) error {
 	// Permission gate "craft.scaffold" replaces the old ad-hoc y/N confirm at
 	// the same site, after the create-plan listing above so a Confirm-mode
 	// user decides with the full file list on screen.
+	// Headless callers get a clean refusal instead of a silent decline —
+	// checked before the gate, same as /craft adr and /craft claude-md.
+	if err := r.headlessRefuse("scaffold project files"); err != nil {
+		return err
+	}
 	if !r.permissionGate("craft.scaffold",
 		fmt.Sprintf("create %d dir(s) and %d file(s) in %s", len(dirs), len(files), cwd),
 		false) {
@@ -1149,8 +1254,19 @@ func craftSlug(title string) string {
 // craftPrintSeedList prints a seed listing in the shared /craft seed table
 // format, or an empty-garden hint when there are none. Shared by `seed ls`
 // and `seed harvest`, which — per the fix below — is now an honestly-labelled
-// alias for ls rather than a silent one.
+// alias for ls rather than a silent one, and by the no-args listing branch of
+// `seed elevate`.
+//
+// Under a headless JSON dispatch it records the full seed list into the
+// result envelope's `data` instead of printing — consulting the
+// package-level curEmitter rather than taking a *Registry, the same
+// free-function pattern printKV uses (see cmd_help.go), since this is shared
+// by three call sites with no receiver of their own to thread through.
 func craftPrintSeedList(seeds []client.Seed) {
+	if curEmitter.JSON() {
+		curEmitter.Data(craftSeedListResult{Count: len(seeds), Seeds: seeds})
+		return
+	}
 	if len(seeds) == 0 {
 		fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Garden is empty. Use /craft seed plant <text> to add a seed."))
 		fmt.Println()
@@ -1234,6 +1350,14 @@ func (r *Registry) craftStream(ctx context.Context, systemPrompt string, req cli
 		}
 		if chunk.Event == "error" {
 			streamErrMsg = chunk.Data
+			// Mirrors internal/repl/renderer.go RenderJSON: EventError DOES
+			// flow through to a scripted consumer rather than being dropped
+			// silently, so a headless caller streaming NDJSON sees the
+			// failure the instant it happens instead of only at process
+			// exit via the terminal Envelope's `error` field.
+			if r.out.JSON() {
+				r.out.Emit(map[string]string{"type": "error", "content": chunk.Data})
+			}
 			return
 		}
 		// Parse delta payload using encoding/json for correct Unicode/escape handling.
@@ -1241,14 +1365,25 @@ func (r *Registry) craftStream(ctx context.Context, systemPrompt string, req cli
 			Delta string `json:"delta"`
 		}
 		if jsonErr := json.Unmarshal([]byte(chunk.Data), &delta); jsonErr == nil && delta.Delta != "" {
-			fmt.Print(delta.Delta)
 			out.WriteString(delta.Delta)
+			if r.out.JSON() {
+				// NDJSON line per token — same {type,content} shape as the
+				// chat renderer's RenderJSON, so one client parser covers
+				// both /agent chat streaming and /craft adr|scout|claude-md.
+				r.out.Emit(map[string]string{"type": "text", "content": delta.Delta})
+			} else {
+				fmt.Print(delta.Delta)
+			}
 			return
 		}
 		// Fallback: print raw data for non-delta events (content, etc.).
 		if chunk.Event == "" || chunk.Event == "message" || chunk.Event == "delta" {
-			fmt.Print(chunk.Data)
 			out.WriteString(chunk.Data)
+			if r.out.JSON() {
+				r.out.Emit(map[string]string{"type": "text", "content": chunk.Data})
+			} else {
+				fmt.Print(chunk.Data)
+			}
 		}
 	})
 	if err == nil && streamErrMsg != "" && out.Len() == 0 {

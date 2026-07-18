@@ -4,6 +4,36 @@ All notable changes to the Dojo CLI are documented here.
 
 This project adheres to [Keep a Changelog v1.1.0](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## 2026-07-18 — Agent-Navigable & Headless (v1.1)
+
+The whole 35-command surface is now runnable non-interactively with a uniform,
+machine-parseable contract — the CLI is a scriptable tool surface, not just a REPL.
+
+### Added
+
+- feat(headless): `dojo --one-shot "/cmd …"` now **runs the slash command** through the same dispatcher the REPL uses, instead of chatting the literal string to a model. All ~35 commands are reachable from a script, an agent, or CI
+- feat(output): `--json` emits a stable **`{ok, command, data, error}` envelope** per command; streaming commands (`/run`, `/agent`, `/workflow`, `/pilot`) emit **NDJSON** lines as they go, then a terminal envelope. New `internal/output` seam; `printKV`-based commands yield structured `data` automatically
+- feat(discovery): `dojo --commands` prints a machine-readable command catalog (name/aliases/short/usage), generated from the registry — the entry point for an agent discovering the surface (`--json` for the array form)
+- feat(cli): exit-code fidelity — `0` ok · `1` runtime/gateway error · `2` usage (unknown command, bad config) · `130` cancel
+- feat(tools): `/tools <name>` — inspect a single tool's input schema (unblocks `/apps call` from blind-guessing JSON)
+- feat(run): `/run --plan <file>` — submit a hand-authored `ExecutionPlan` (JSON) to the orchestrator (no NL parsing, no chat fallback)
+- feat(memory): `/trail edit <id> <text>` — edit a memory entry (previously only add/rm/search); `/snapshot export <id> [path]` — write a snapshot to a file
+- feat(skill): CAS version pinning — `/skill get <name>@<ver>` and `package-all <dir> [ver]` (previously always `latest`)
+- feat(hooks): native `prompt` and `agent` hook types now execute against the Gateway (advisory-only — they run and log, only `command` hooks can veto); the Gateway client is injected into the hook runner
+- feat(plugins): plugin-install integrity — source allowlist (DojoGenesis / TresPies-source by default; `--allow-any-source` to override) + optional `--sha256=<hex>` content pin; never bypassed by `--yes`
+
+### Changed
+
+- Commands that block on interactive confirmation (`/plugin install`, `/protocol install`, `/craft` prune/elevate/scaffold, `/code undo`) now **refuse cleanly** in headless mode instead of hanging on stdin (override with `--yolo`)
+- `/warroom` and `/bloom` (pure TUIs) return an "unsupported in headless mode" envelope instead of launching a broken alt-screen; `/home` and `/pilot` fall back to their plain paths
+- Unknown subcommands on `/agent`, `/apps`, `/garden`, `/hooks`, `/snapshot` now **error** instead of silently running `ls`
+
+### Fixed
+
+- `/run` (and streaming commands) headlessly seed a session id, and a mid-stream gateway error now propagates to `ok:false` / exit 1 instead of silently reporting success
+
+---
+
 ## 2026-07-17 — Hooks, Permissions, Delegation Routing, Guardrails, External Skills
 
 ### Added

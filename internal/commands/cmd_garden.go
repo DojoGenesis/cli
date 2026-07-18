@@ -32,6 +32,10 @@ func (r *Registry) gardenCmd() Command {
 				if err != nil {
 					return fmt.Errorf("could not fetch garden stats: %w", err)
 				}
+				if r.out.JSON() {
+					r.out.Data(stats)
+					return nil
+				}
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Garden Stats"))
 				fmt.Println()
@@ -75,6 +79,10 @@ func (r *Registry) gardenCmd() Command {
 				if err != nil {
 					return fmt.Errorf("could not search memories: %w", err)
 				}
+				if r.out.JSON() {
+					r.out.Data(results)
+					return nil
+				}
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Search results (%d)\n\n", len(results)))
 				if len(results) == 0 {
@@ -103,13 +111,20 @@ func (r *Registry) gardenCmd() Command {
 				fmt.Println(gcolor.HEX("#7fb88c").Sprint("  Seed deleted"))
 				fmt.Println()
 
-			default: // ls — also catches unrecognized subcommands (e.g. the
-				// former "harvest" verb, which was a silent no-op alias for
-				// this same branch; dropped rather than documented as if it
-				// were a distinct, intentional action).
+			default: // ls (bare /garden, or explicit /garden ls). Unrecognized
+				// subcommands (e.g. the former "harvest" verb) used to fall
+				// through silently to this same branch — now they error
+				// instead of pretending to be a distinct, intentional action.
+				if len(args) > 0 && sub != "ls" {
+					return fmt.Errorf("unknown subcommand %q — see /help", args[0])
+				}
 				seeds, err := r.gw.Seeds(ctx)
 				if err != nil {
 					return fmt.Errorf("could not fetch seeds: %w", err)
+				}
+				if r.out.JSON() {
+					r.out.Data(seeds)
+					return nil
 				}
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Seeds (%d)\n\n", len(seeds)))

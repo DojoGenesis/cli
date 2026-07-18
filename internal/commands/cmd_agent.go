@@ -229,7 +229,7 @@ func (r *Registry) agentCmd() Command {
 				fmt.Println()
 				return nil
 
-			default: // ls
+			case "ls":
 				agents, err := r.gw.Agents(ctx)
 				if err != nil {
 					return fmt.Errorf("could not fetch agents: %w", err)
@@ -272,6 +272,17 @@ func (r *Registry) agentCmd() Command {
 				}
 				fmt.Println()
 				return nil
+
+			default:
+				// D1 — an unrecognized subcommand used to fall silently
+				// into "ls" (matching Go's zero-value switch semantics for
+				// any unmatched string). That hid typos from the caller —
+				// especially costly for a headless/agent caller with no
+				// human watching the output to notice the mismatch. Bare
+				// "/agent" still lists (sub defaults to "ls" above, which
+				// the "ls" case handles), so only a real unrecognized
+				// token reaches here.
+				return fmt.Errorf("unknown subcommand %q — see /help", args[0])
 			}
 		},
 	}
@@ -341,8 +352,27 @@ func extractModelFlag(args []string) (rest []string, value string, present bool,
 	return rest, value, present, nil
 }
 
+// streamEvent is the NDJSON line shape emitted by chat-like streaming
+// commands (/agent chat, /agent dispatch via streamAgentChat; /workflow and
+// /run's chat fallback in cmd_workflow.go) in headless JSON mode. It
+// deliberately mirrors internal/repl.RenderEvent's RenderJSON() output
+// ({type, content, meta}) so a scripted caller parses one event shape
+// whether it drove the REPL's --one-shot chat path or one of these
+// command-specific streams. Content/Meta are omitempty because most event
+// types carry only one or the other (e.g. tool_call has no content, text
+// has no meta).
+type streamEvent struct {
+	Type    string            `json:"type"`
+	Content string            `json:"content,omitempty"`
+	Meta    map[string]string `json:"meta,omitempty"`
+}
+
 // streamAgentChat sends a message to an agent and streams the SSE response.
-// Thinking and tool-call events are rendered in dim colors; text is printed inline.
+// Human mode: thinking and tool-call events are rendered in dim colors, text
+// is printed inline. Headless JSON mode: each event becomes one streamEvent
+// NDJSON line via r.out.Emit instead — the two are mutually exclusive per
+// event (matching how printKV/colorStatus branch), not layered, so a JSON
+// dispatch's captured-stdout fallback never fills up with duplicate ANSI text.
 func (r *Registry) streamAgentChat(ctx context.Context, agentID, message, model string) error {
 	req := client.AgentChatRequest{
 		Message: message,
@@ -359,29 +389,47 @@ func (r *Registry) streamAgentChat(ctx context.Context, agentID, message, model 
 			if msg == "" {
 				msg = truncate(chunk.Data, 80)
 			}
+			if r.out.JSON() {
+				r.out.Emit(streamEvent{Type: "thinking", Content: msg})
+				return
+			}
 			fmt.Print(gcolor.HEX("#94a3b8").Sprint("\n  [Thinking] " + msg))
 		case "tool_call", "tool_invoked":
 			name := agentNestedField(chunk.Data, "tool")
 			if name == "" {
 				name = truncate(chunk.Data, 60)
 			}
+			if r.out.JSON() {
+				r.out.Emit(streamEvent{Type: "tool_call", Meta: map[string]string{"tool": name}})
+				return
+			}
 			fmt.Print(gcolor.HEX("#457b9d").Sprintf("\n  [Tool: %s]", name))
 		case "tool_result", "tool_completed":
-			// absorbed into the response
+			// absorbed into the response — nothing rendered in either mode
 		case "response_chunk":
 			// Gateway sends: event: response_chunk / data: {"type":"response_chunk","data":{"content":"..."},...}
 			if text := agentNestedField(chunk.Data, "content"); text != "" {
+				if r.out.JSON() {
+					r.out.Emit(streamEvent{Type: "text", Content: text})
+					return
+				}
 				fmt.Print(text)
 			}
 		default:
 			if text := agentExtractText(chunk.Data); text != "" {
+				if r.out.JSON() {
+					r.out.Emit(streamEvent{Type: "text", Content: text})
+					return
+				}
 				fmt.Print(text)
 			}
 		}
 	})
 
-	fmt.Println()
-	fmt.Println()
+	if !r.out.JSON() {
+		fmt.Println()
+		fmt.Println()
+	}
 	return err
 }
 

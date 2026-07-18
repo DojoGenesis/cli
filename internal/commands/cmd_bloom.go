@@ -25,6 +25,15 @@ func (r *Registry) bloomCmd() Command {
 		Usage:   "/bloom",
 		Short:   "Watch your bonsai grow — animated zen garden",
 		Run: func(ctx context.Context, args []string) error {
+			// /bloom has no plain-text fallback — it IS the fullscreen
+			// animated TUI. A headless JSON dispatch (or any non-interactive
+			// run) has no terminal to paint an alt-screen Bubbletea program
+			// into, so refuse cleanly instead of hanging or spraying
+			// screen-control bytes into a JSON stream.
+			if r.out.JSON() || r.headless {
+				return fmt.Errorf("/bloom is interactive-only and unsupported in headless mode")
+			}
+
 			st, err := state.Load()
 			if err != nil {
 				return fmt.Errorf("loading state: %w", err)

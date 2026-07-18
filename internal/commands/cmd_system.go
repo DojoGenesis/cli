@@ -101,6 +101,14 @@ func (r *Registry) homeCmd() Command {
 				return r.homePlain(ctx)
 			}
 
+			// Headless (JSON dispatch, or any non-interactive run) has no
+			// terminal to paint an alt-screen TUI into -- route to the same
+			// plain overview "/home plain" uses instead of launching
+			// Bubbletea, which would hang or corrupt the dispatch.
+			if r.out.JSON() || r.headless {
+				return r.homePlain(ctx)
+			}
+
 			// Default: Bubbletea TUI panel
 			model := tui.NewHomeModel(r.cfg, r.gw, *r.session, len(r.plgs))
 			p := tea.NewProgram(model, tea.WithAltScreen())
@@ -110,6 +118,22 @@ func (r *Registry) homeCmd() Command {
 	}
 }
 
+// homeSnapshot is /home's structured JSON payload -- one typed object
+// instead of scraping the aligned key/value table homePlain prints below.
+// Agent/seed counts and their fetch errors are mutually exclusive per field
+// (an errored fetch has no count), mirroring the human view's "unavailable"
+// vs. count display.
+type homeSnapshot struct {
+	Gateway       string `json:"gateway"`
+	GatewayStatus string `json:"gateway_status"`
+	AgentCount    int    `json:"agent_count,omitempty"`
+	AgentsError   string `json:"agents_error,omitempty"`
+	SeedCount     int    `json:"seed_count,omitempty"`
+	SeedsError    string `json:"seeds_error,omitempty"`
+	Plugins       int    `json:"plugins"`
+	Session       string `json:"session"`
+}
+
 func (r *Registry) homePlain(ctx context.Context) error {
 	h, err := r.gw.Health(ctx)
 	if err != nil {
@@ -117,6 +141,27 @@ func (r *Registry) homePlain(ctx context.Context) error {
 	}
 	agents, agentErr := r.gw.Agents(ctx)
 	seeds, seedErr := r.gw.Seeds(ctx)
+
+	if r.out.JSON() {
+		snap := homeSnapshot{
+			Gateway:       r.cfg.Gateway.URL,
+			GatewayStatus: h.Status,
+			Plugins:       len(r.plgs),
+			Session:       *r.session,
+		}
+		if agentErr != nil {
+			snap.AgentsError = agentErr.Error()
+		} else {
+			snap.AgentCount = len(agents)
+		}
+		if seedErr != nil {
+			snap.SeedsError = seedErr.Error()
+		} else {
+			snap.SeedCount = len(seeds)
+		}
+		r.out.Data(snap)
+		return nil
+	}
 
 	fmt.Println()
 	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Dojo Workspace"))
@@ -151,6 +196,13 @@ func (r *Registry) settingsCmd() Command {
 		Short:   "Show active config and settings, or manage provider keys and disposition profiles",
 		Run: func(ctx context.Context, args []string) error {
 			if len(args) == 0 {
+				if r.out.JSON() {
+					data := effectiveSettingsData(r.cfg.EffectiveString())
+					data["config_file"] = config.SettingsPath()
+					data["plugins_loaded"] = fmt.Sprintf("%d", len(r.plgs))
+					r.out.Data(data)
+					return nil
+				}
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Active Settings"))
 				fmt.Println()
@@ -165,6 +217,10 @@ func (r *Registry) settingsCmd() Command {
 			sub := strings.ToLower(args[0])
 			switch sub {
 			case "effective":
+				if r.out.JSON() {
+					r.out.Data(effectiveSettingsData(r.cfg.EffectiveString()))
+					return nil
+				}
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Effective Configuration"))
 				fmt.Println()
@@ -213,6 +269,24 @@ func (r *Registry) settingsCmd() Command {
 	}
 }
 
+// effectiveSettingsData parses cfg.EffectiveString()'s "key = value" lines
+// into a map for JSON mode. It reuses the exact same rendering the human
+// path already prints — including its gateway-token masking (EffectiveString
+// never puts the raw token in the string) — rather than re-deriving values
+// from cfg directly, so a headless caller can never see a field the human
+// view redacts.
+func effectiveSettingsData(effective string) map[string]string {
+	out := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimRight(effective, "\n"), "\n") {
+		k, v, ok := strings.Cut(line, " = ")
+		if !ok {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // settingsProfile handles /settings profile [ls|set <name>|show <name>|create <name> ...]
 // Delegates to the disposition handlers so both /disposition and /settings profile
 // operate on the same state.
@@ -245,6 +319,17 @@ func (r *Registry) settingsProfile(args []string) error {
 
 // ─── /hooks ─────────────────────────────────────────────────────────────────
 
+// hookRuleInfo is one row of /hooks ls's structured JSON payload — one hook
+// callback within one plugin's rule, flattened out of the nested
+// plugin -> rule -> hook loop the human table below renders.
+type hookRuleInfo struct {
+	Plugin string `json:"plugin"`
+	Event  string `json:"event"`
+	Type   string `json:"type"`
+	Target string `json:"target"` // whichever of command/prompt/URL the hook carries
+	Async  bool   `json:"async"`
+}
+
 func (r *Registry) hooksCmd() Command {
 	return Command{
 		Name:  "hooks",
@@ -269,7 +354,37 @@ func (r *Registry) hooksCmd() Command {
 				fmt.Println(gcolor.HEX("#7fb88c").Sprint("  done"))
 				fmt.Println()
 
-			default: // ls
+			case "ls":
+				if r.out.JSON() {
+					// Initialized (not `var rows []hookRuleInfo`) so a
+					// no-hooks workspace serializes as `[]`, not `null` — a
+					// JSON list consumer should never have to special-case
+					// null vs. empty for "nothing here".
+					rows := []hookRuleInfo{}
+					for _, p := range r.plgs {
+						for _, rule := range p.HookRules {
+							for _, h := range rule.Hooks {
+								target := h.Command
+								if target == "" {
+									target = h.Prompt
+								}
+								if target == "" {
+									target = h.URL
+								}
+								rows = append(rows, hookRuleInfo{
+									Plugin: p.Name,
+									Event:  rule.Event,
+									Type:   h.Type,
+									Target: target,
+									Async:  h.Async,
+								})
+							}
+						}
+					}
+					r.out.Data(rows)
+					return nil
+				}
+
 				// Count total rules
 				totalRules := 0
 				for _, p := range r.plgs {
@@ -318,6 +433,14 @@ func (r *Registry) hooksCmd() Command {
 					}
 				}
 				fmt.Println()
+
+			default:
+				// D1 — an unrecognized subcommand used to fall silently into
+				// "ls" (same failure mode fixed in /agent — see cmd_agent.go).
+				// Bare "/hooks" still lists (sub defaults to "ls" above,
+				// which the "ls" case handles), so only a real unrecognized
+				// token reaches here.
+				return fmt.Errorf("unknown subcommand %q — see /help", args[0])
 			}
 			return nil
 		},

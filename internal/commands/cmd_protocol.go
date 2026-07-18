@@ -438,6 +438,16 @@ func (r *Registry) protocolEdit(ctx context.Context) error {
 		return nil
 	}
 
+	// Past this point we hand the terminal to a subprocess (cmd.Stdin =
+	// os.Stdin below) — fine in the REPL, but a headless dispatch has no
+	// real terminal to hand over, so it would either hang or misbehave
+	// against whatever stdin actually is. Refuse cleanly instead, unless
+	// --yolo. The "no $EDITOR/$VISUAL" guidance above stays available
+	// headlessly since it never touches a subprocess.
+	if err := r.headlessRefuse("edit protocol doc"); err != nil {
+		return err
+	}
+
 	// $EDITOR/$VISUAL may carry arguments (e.g. "code --wait") — split on
 	// whitespace rather than treating the whole string as one binary name, the
 	// way a shell would locate the program vs. its flags. No shell is
@@ -569,6 +579,16 @@ func (r *Registry) protocolInstall(ctx context.Context, name string, noConfirm b
 		fmt.Println(gcolor.HEX("#e8b04a").Sprintf("  %s already installed at %s — remove it first to reinstall", target.ID, dst))
 		fmt.Println()
 		return nil
+	}
+
+	// Past this point the only remaining branch either prompts on stdin (no
+	// noConfirm) or copies a plugin tree unattended (noConfirm) — both need
+	// interactive confirmation somewhere in the loop, so a headless caller
+	// without --yolo is refused here rather than either hanging on stdin or
+	// installing unattended. The gates above (unratified, no local plugin,
+	// already installed) are informational and stay available headlessly.
+	if err := r.headlessRefuse("install protocol harness"); err != nil {
+		return err
 	}
 
 	fmt.Println()
