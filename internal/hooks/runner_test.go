@@ -3,6 +3,7 @@ package hooks
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/plugins"
 )
 
@@ -22,7 +24,7 @@ func TestNew_NilPlugins_DoesNotPanic(t *testing.T) {
 			t.Fatalf("New(nil) panicked: %v", r)
 		}
 	}()
-	r := New(nil)
+	r := New(nil, nil)
 	if r == nil {
 		t.Fatal("New(nil) returned nil runner")
 	}
@@ -32,7 +34,7 @@ func TestNew_PluginsWithNoHooks_Works(t *testing.T) {
 	ps := []plugins.Plugin{
 		{Name: "empty-plugin", Version: "1.0", HookRules: nil},
 	}
-	r := New(ps)
+	r := New(ps, nil)
 	if r == nil {
 		t.Fatal("New() returned nil")
 	}
@@ -60,7 +62,7 @@ func TestFire_UnknownEvent_NoError(t *testing.T) {
 			},
 		},
 	}
-	r := New(ps)
+	r := New(ps, nil)
 	err := r.Fire(context.Background(), "NonExistentEvent", nil)
 	if err != nil {
 		t.Errorf("Fire() with unknown event returned unexpected error: %v", err)
@@ -94,7 +96,7 @@ func TestFire_CommandHook_ExecutesScript(t *testing.T) {
 		},
 	}
 
-	r := New(ps)
+	r := New(ps, nil)
 	err := r.Fire(context.Background(), EventPreCommand, map[string]any{"command": "/help"})
 	if err != nil {
 		t.Fatalf("Fire() returned error: %v", err)
@@ -133,7 +135,7 @@ func TestFire_SessionStartHook_ExecutesScript(t *testing.T) {
 		},
 	}
 
-	r := New(ps)
+	r := New(ps, nil)
 	err := r.Fire(context.Background(), EventSessionStart, map[string]any{"session": "dojo-cli-test", "resumed": false})
 	if err != nil {
 		t.Fatalf("Fire() returned error: %v", err)
@@ -173,7 +175,7 @@ func TestFire_AsyncHook_ReturnsBeforeCompletion(t *testing.T) {
 		},
 	}
 
-	r := New(ps)
+	r := New(ps, nil)
 
 	start := time.Now()
 	err := r.Fire(context.Background(), EventPostCommand, nil)
@@ -226,7 +228,7 @@ func TestFire_CancelledContext_AsyncHookNotStarted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately before firing
 
-	r := New(ps)
+	r := New(ps, nil)
 	err := r.Fire(ctx, EventPreCommand, nil)
 	if err != nil {
 		t.Fatalf("Fire() with cancelled context returned error: %v", err)
@@ -260,7 +262,7 @@ func TestFire_NonCommandHooks_Skipped(t *testing.T) {
 			},
 		},
 	}
-	r := New(ps)
+	r := New(ps, nil)
 	err := r.Fire(context.Background(), EventPreCommand, nil)
 	if err != nil {
 		t.Errorf("Fire() with non-command hooks returned error: %v", err)
@@ -290,7 +292,7 @@ func TestFire_CaseInsensitiveEventMatch(t *testing.T) {
 		},
 	}
 
-	r := New(ps)
+	r := New(ps, nil)
 	// Fire with the canonical constant (different case)
 	err := r.Fire(context.Background(), EventPreCommand, nil) // "PreCommand"
 	if err != nil {
@@ -339,7 +341,7 @@ func TestFireHTTPHook(t *testing.T) {
 		},
 	}
 
-	r := New(ps)
+	r := New(ps, nil)
 	err := r.Fire(context.Background(), EventPostCommand, payload)
 	if err != nil {
 		t.Fatalf("Fire() returned error: %v", err)
@@ -376,7 +378,7 @@ func TestFirePromptHook(t *testing.T) {
 		},
 	}
 
-	r := New(ps)
+	r := New(ps, nil)
 	err := r.Fire(context.Background(), EventPreCommand, nil)
 	if err != nil {
 		t.Errorf("Fire() with prompt hook returned error: %v", err)
@@ -402,12 +404,117 @@ func TestFireAgentHook(t *testing.T) {
 		},
 	}
 
-	r := New(ps)
+	r := New(ps, nil)
 	err := r.Fire(context.Background(), EventPostSkill, nil)
 	if err != nil {
 		t.Errorf("Fire() with agent hook returned error: %v", err)
 	}
 	// Side effect is stdout output — no assertion needed beyond no error.
+}
+
+// ─── Prompt/agent hooks with a real gateway client (the load-bearing gap) ────
+//
+// The four tests above (TestFire_NonCommandHooks_Skipped, TestFirePromptHook,
+// TestFireAgentHook, TestWarnUnimplemented_OncePerPluginType) all build a
+// Runner via New(ps, nil) — no gateway wired in — and pin the pre-existing
+// warn-and-skip fallback. The two tests below wire a real *client.Client
+// backed by an httptest server and prove the hook actually reaches the
+// gateway: ChatStream for "prompt", CreateAgent + AgentChatStream for
+// "agent" — and that neither can block the caller even from inside a
+// Blocking:true rule.
+
+// TestFirePromptHook_WithGateway_CallsChatStream proves a "prompt" hook with a
+// wired gateway client sends h.Prompt (templated via renderPrompt) to
+// POST /v1/chat and buffers the streamed response, and that it never blocks
+// the caller — even inside a Blocking:true rule, since only "command" hooks
+// reach FireChecked's Blocking branch.
+func TestFirePromptHook_WithGateway_CallsChatStream(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "data: {\"text\":\"hi from the gateway\"}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	gw := client.New(srv.URL, "", "5s")
+	ps := []plugins.Plugin{
+		{
+			Name: "prompt-live",
+			HookRules: []plugins.HookRule{
+				{
+					Event:    EventPreCommand,
+					Blocking: true, // proves a prompt hook can't block even when the rule says Blocking
+					Hooks:    []plugins.HookDef{{Type: "prompt", Prompt: "summarize {{.command}}"}},
+				},
+			},
+		},
+	}
+	r := New(ps, gw)
+
+	res := r.FireChecked(context.Background(), EventPreCommand, map[string]any{"command": "/deploy"})
+	if res.Blocked {
+		t.Fatalf("a prompt hook must never block, even in a Blocking rule: %+v", res)
+	}
+	if res.Err != nil {
+		t.Errorf("FireChecked returned unexpected Err: %v", res.Err)
+	}
+	if gotBody == nil {
+		t.Fatal("gateway never received the /v1/chat request — prompt hook did not call ChatStream")
+	}
+	if gotBody["message"] != "summarize /deploy" {
+		t.Errorf("gateway received message %q, want %q (renderPrompt should have templated {{.command}})", gotBody["message"], "summarize /deploy")
+	}
+}
+
+// TestFireAgentHook_WithGateway_CreatesAgentAndChats proves an "agent" hook
+// with a wired gateway client performs the two-step dispatch — CreateAgent
+// then AgentChatStream — and buffers the streamed response.
+func TestFireAgentHook_WithGateway_CreatesAgentAndChats(t *testing.T) {
+	var chatBody map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/gateway/agents", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"agent_id":"agent-123","status":"ready"}`))
+	})
+	mux.HandleFunc("/v1/gateway/agents/agent-123/chat", func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(body, &chatBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "data: {\"content\":\"agent reply\"}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	gw := client.New(srv.URL, "", "5s")
+	ps := []plugins.Plugin{
+		{
+			Name: "agent-live",
+			HookRules: []plugins.HookRule{
+				{
+					Event: EventPostSkill,
+					Hooks: []plugins.HookDef{{Type: "agent", Prompt: "handle this"}},
+				},
+			},
+		},
+	}
+	r := New(ps, gw)
+
+	err := r.Fire(context.Background(), EventPostSkill, nil)
+	if err != nil {
+		t.Fatalf("Fire() returned error: %v", err)
+	}
+	if chatBody == nil {
+		t.Fatal("gateway never received the agent chat request — agent hook did not reach AgentChatStream")
+	}
+	if chatBody["message"] != "handle this" {
+		t.Errorf("agent chat received message %q, want %q", chatBody["message"], "handle this")
+	}
 }
 
 // ─── Matcher glob ─────────────────────────────────────────────────────────────
@@ -433,7 +540,7 @@ func TestMatcherGlob(t *testing.T) {
 		},
 	}
 
-	r := New(ps)
+	r := New(ps, nil)
 
 	// Should match: command starts with "garden"
 	err := r.Fire(context.Background(), EventPreCommand, map[string]any{"command": "/garden ls"})
@@ -480,7 +587,7 @@ func TestIfConditionFalse(t *testing.T) {
 		},
 	}
 
-	r := New(ps)
+	r := New(ps, nil)
 	err := r.Fire(context.Background(), EventPreCommand, nil)
 	if err != nil {
 		t.Fatalf("Fire() returned error: %v", err)
@@ -562,7 +669,7 @@ func TestIfConditionEnvVar(t *testing.T) {
 		},
 	}
 
-	r := New(ps)
+	r := New(ps, nil)
 
 	// Env var NOT set → hook should not fire.
 	_ = os.Unsetenv(envVar)

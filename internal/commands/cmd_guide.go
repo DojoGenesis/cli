@@ -44,10 +44,43 @@ func (r *Registry) guideCmd() Command {
 
 // ─── subcommand handlers ─────────────────────────────────────────────────────
 
+// GuideListEntry is one row of the JSON-mode `/guide ls` payload. guide.Guide
+// itself carries no JSON tags (it's a REPL-only display type), so this is the
+// small tagged projection an agent can parse.
+type GuideListEntry struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Short       string `json:"short,omitempty"`
+	Steps       int    `json:"steps"`
+	Completed   bool   `json:"completed"`
+	Active      bool   `json:"active"`
+	CurrentStep int    `json:"current_step,omitempty"` // 1-based; only meaningful when Active
+}
+
 func guideLs() error {
 	st, err := state.Load()
 	if err != nil {
 		return fmt.Errorf("loading state: %w", err)
+	}
+
+	if curEmitter.JSON() {
+		entries := make([]GuideListEntry, 0, len(guide.All))
+		for _, g := range guide.All {
+			e := GuideListEntry{
+				ID:        g.ID,
+				Title:     g.Title,
+				Short:     g.Short,
+				Steps:     len(g.Steps),
+				Completed: guide.IsCompleted(st, g.ID),
+				Active:    st.Guide.Active == g.ID,
+			}
+			if e.Active {
+				e.CurrentStep = st.Guide.Step + 1
+			}
+			entries = append(entries, e)
+		}
+		curEmitter.Data(entries)
+		return nil
 	}
 
 	fmt.Println()

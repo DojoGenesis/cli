@@ -57,17 +57,17 @@ type telemetryCostRow struct {
 }
 
 type telemetryProviderRow struct {
-	Provider     string  `json:"provider"`
-	TotalCost    float64 `json:"total_cost"`
-	TotalTokenIn int64   `json:"total_tokens_in"`
-	TotalTokenOut int64  `json:"total_tokens_out"`
-	Count        int     `json:"count"`
+	Provider      string  `json:"provider"`
+	TotalCost     float64 `json:"total_cost"`
+	TotalTokenIn  int64   `json:"total_tokens_in"`
+	TotalTokenOut int64   `json:"total_tokens_out"`
+	Count         int     `json:"count"`
 }
 
 type telemetryDailyRow struct {
-	Day        string  `json:"day"`
-	TotalCost  float64 `json:"total_cost"`
-	TotalTokens int64  `json:"total_tokens"`
+	Day         string  `json:"day"`
+	TotalCost   float64 `json:"total_cost"`
+	TotalTokens int64   `json:"total_tokens"`
 }
 
 // API response wrapper: GET /api/telemetry/tools returns {"tools": [...]}
@@ -177,6 +177,11 @@ func telemetrySessions(ctx context.Context) error {
 		return fmt.Errorf("parse sessions: %w", err)
 	}
 
+	if curEmitter.JSON() {
+		curEmitter.Data(resp)
+		return nil
+	}
+
 	fmt.Println()
 	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Recent Sessions"))
 	fmt.Println()
@@ -223,6 +228,11 @@ func telemetryCosts(ctx context.Context) error {
 	var costs telemetryCostsResponse
 	if err := json.Unmarshal(data, &costs); err != nil {
 		return fmt.Errorf("parse costs: %w", err)
+	}
+
+	if curEmitter.JSON() {
+		curEmitter.Data(costs)
+		return nil
 	}
 
 	fmt.Println()
@@ -283,6 +293,11 @@ func telemetryTools(ctx context.Context) error {
 		return fmt.Errorf("parse tools: %w", err)
 	}
 
+	if curEmitter.JSON() {
+		curEmitter.Data(resp)
+		return nil
+	}
+
 	fmt.Println()
 	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Tool Usage (7d)"))
 	fmt.Println()
@@ -317,14 +332,19 @@ func telemetryTools(ctx context.Context) error {
 // ─── /telemetry summary ───────────────────────────────────────────────────
 
 func telemetrySummary(ctx context.Context) error {
-	fmt.Println()
-	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Telemetry Summary"))
-	fmt.Println()
-
 	// Fetch all three endpoints
 	sessData, sessErr := telemetryGet(ctx, "/api/telemetry/sessions?limit=5")
 	costsData, costsErr := telemetryGet(ctx, "/api/telemetry/costs?range=7d")
 	toolsData, toolsErr := telemetryGet(ctx, "/api/telemetry/tools?range=7d")
+
+	if curEmitter.JSON() {
+		curEmitter.Data(telemetrySummaryPayload(sessData, sessErr, costsData, costsErr, toolsData, toolsErr))
+		return nil
+	}
+
+	fmt.Println()
+	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprint("  Telemetry Summary"))
+	fmt.Println()
 
 	// Cost overview
 	fmt.Println()
@@ -402,6 +422,45 @@ func telemetrySummary(ctx context.Context) error {
 	fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Use /telemetry <sessions|costs|tools> for detail."))
 	fmt.Println()
 	return nil
+}
+
+// telemetrySummaryPayload assembles the JSON-mode `data` for /telemetry
+// summary from the three raw fetches telemetrySummary already made. Each
+// endpoint is independent: a fetch error for one surfaces as its own
+// "<name>_error" string key rather than failing the whole command — matching
+// the human path, which renders each section's error inline and keeps
+// rendering the other two.
+func telemetrySummaryPayload(sessData []byte, sessErr error, costsData []byte, costsErr error, toolsData []byte, toolsErr error) map[string]any {
+	summary := map[string]any{}
+
+	if costsErr != nil {
+		summary["costs_error"] = costsErr.Error()
+	} else {
+		var costs telemetryCostsResponse
+		if err := json.Unmarshal(costsData, &costs); err == nil {
+			summary["costs"] = costs
+		}
+	}
+
+	if sessErr != nil {
+		summary["sessions_error"] = sessErr.Error()
+	} else {
+		var sessResp telemetrySessionsResponse
+		if err := json.Unmarshal(sessData, &sessResp); err == nil {
+			summary["sessions"] = sessResp.Sessions
+		}
+	}
+
+	if toolsErr != nil {
+		summary["tools_error"] = toolsErr.Error()
+	} else {
+		var toolsResp telemetryToolsResponse
+		if err := json.Unmarshal(toolsData, &toolsResp); err == nil {
+			summary["tools"] = toolsResp.Tools
+		}
+	}
+
+	return summary
 }
 
 // ─── Formatting helpers ───────────────────────────────────────────────────

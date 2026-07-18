@@ -126,6 +126,14 @@ func sessionResumeWarning(id string, hist []state.SessionEntry) string {
 	return fmt.Sprintf("%q not found in local session history", id)
 }
 
+// SessionListEntry is one row of the JSON-mode `/session ls` payload: the
+// stored history entry plus whether it's the REPL's currently active
+// session, which isn't itself a field on state.SessionEntry.
+type SessionListEntry struct {
+	state.SessionEntry
+	Active bool `json:"active"`
+}
+
 // sessionLs lists recent sessions from local history, most-recent-first,
 // marking whichever one is currently active in this REPL. Claude-Code-style
 // `/session ls`.
@@ -135,6 +143,15 @@ func sessionLs(active string) error {
 		return fmt.Errorf("could not load session history: %w", err)
 	}
 	hist := st.History()
+
+	if curEmitter.JSON() {
+		entries := make([]SessionListEntry, len(hist))
+		for i, e := range hist {
+			entries[i] = SessionListEntry{SessionEntry: e, Active: e.ID == active}
+		}
+		curEmitter.Data(entries)
+		return nil
+	}
 
 	fmt.Println()
 	gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Sessions (%d)\n\n", len(hist)))

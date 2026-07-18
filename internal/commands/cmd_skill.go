@@ -34,7 +34,7 @@ func (r *Registry) skillCmd() Command {
 	return Command{
 		Name:    "skill",
 		Aliases: []string{"skills"},
-		Usage:   "/skill [ls [filter]|search <query>|get <name>|inspect <hash>|tags|package-all <dir>]",
+		Usage:   "/skill [ls [filter]|search <query>|get <name>[@ver]|inspect <hash>|tags|package-all <dir> [ver]]",
 		Short:   "List, fetch, or inspect skills from CAS",
 		Run: func(ctx context.Context, args []string) error {
 			sub := "ls"
@@ -52,6 +52,11 @@ func (r *Registry) skillCmd() Command {
 				skills, err := r.gw.SearchSkills(ctx, query)
 				if err != nil {
 					return fmt.Errorf("search failed: %w", err)
+				}
+
+				if r.out.JSON() {
+					r.out.Data(skills)
+					return nil
 				}
 
 				fmt.Println()
@@ -100,12 +105,20 @@ func (r *Registry) skillCmd() Command {
 					}
 					return printExternalSkill(ext)
 				}
-				tag, err := r.gw.CASResolveTag(ctx, name, "latest")
+				// Optional @<version> suffix — e.g. "my-skill@1.2.0". Absent
+				// defaults to "latest", matching the prior hardcoded behavior.
+				baseName, ver, hasVer := strings.Cut(name, "@")
+				if !hasVer {
+					ver = "latest"
+				}
+				tag, err := r.gw.CASResolveTag(ctx, baseName, ver)
 				if err != nil {
 					// Gateway lookup missed: fall back to external skills
 					// (read-only). A miss on both surfaces the existing
-					// gateway error unchanged.
-					if ext := skills.FindExternal(r.externalSkillDirs(), name); ext != nil {
+					// gateway error unchanged. External skills have no
+					// version concept, so the fallback looks up baseName
+					// (the name with any @version suffix stripped).
+					if ext := skills.FindExternal(r.externalSkillDirs(), baseName); ext != nil {
 						return printExternalSkill(ext)
 					}
 					return fmt.Errorf("could not resolve tag %q: %w", name, err)
@@ -114,6 +127,17 @@ func (r *Registry) skillCmd() Command {
 				if err != nil {
 					return fmt.Errorf("could not fetch content for ref %q: %w", tag.Ref, err)
 				}
+
+				if r.out.JSON() {
+					r.out.Data(map[string]any{
+						"name":    tag.Name,
+						"version": tag.Version,
+						"ref":     tag.Ref,
+						"content": string(content),
+					})
+					return nil
+				}
+
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Skill: %s @ %s\n\n", tag.Name, tag.Version))
 				printKV("ref", tag.Ref)
@@ -132,6 +156,12 @@ func (r *Registry) skillCmd() Command {
 				if err != nil {
 					return fmt.Errorf("could not fetch content for ref %q: %w", ref, err)
 				}
+
+				if r.out.JSON() {
+					r.out.Data(map[string]any{"ref": ref, "content": string(content)})
+					return nil
+				}
+
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  CAS ref: %s\n\n", ref))
 				fmt.Println(gcolor.White.Sprint(string(content)))
@@ -144,6 +174,12 @@ func (r *Registry) skillCmd() Command {
 				if err != nil {
 					return fmt.Errorf("could not list CAS tags: %w", err)
 				}
+
+				if r.out.JSON() {
+					r.out.Data(tags)
+					return nil
+				}
+
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  CAS Tags (%d)\n\n", len(tags)))
 				if len(tags) == 0 {
@@ -169,7 +205,7 @@ func (r *Registry) skillCmd() Command {
 				return nil
 
 			case "package-all":
-				// /skill package-all [dir]
+				// /skill package-all [dir] [ver]
 				// Walk a directory for SKILL.md files, put each into CAS, and create tags.
 				// Default source: $DOJO_SKILLS_PATH or current directory.
 				// NOTE: this deliberately walks ONLY its explicit arg or
@@ -180,7 +216,13 @@ func (r *Registry) skillCmd() Command {
 					dir = args[1]
 				}
 				if dir == "" {
-					return fmt.Errorf("usage: /skill package-all <dir>\n  or set DOJO_SKILLS_PATH")
+					return fmt.Errorf("usage: /skill package-all <dir> [ver]\n  or set DOJO_SKILLS_PATH")
+				}
+				// Optional trailing version arg — every packaged skill is
+				// tagged name@ver instead of the hardcoded name@latest.
+				ver := "latest"
+				if len(args) >= 3 {
+					ver = args[2]
 				}
 
 				// Walk for SKILL.md files.
@@ -199,6 +241,10 @@ func (r *Registry) skillCmd() Command {
 				}
 
 				if len(skills) == 0 {
+					if r.out.JSON() {
+						r.out.Data(map[string]any{"succeeded": 0, "failed": 0, "total": 0, "version": ver})
+						return nil
+					}
 					fmt.Println()
 					fmt.Println(gcolor.HEX("#94a3b8").Sprintf("  No SKILL.md files found in %s", dir))
 					fmt.Println()
@@ -216,6 +262,7 @@ func (r *Registry) skillCmd() Command {
 					content, err := os.ReadFile(path)
 					if err != nil {
 						gcolor.HEX("#ef4444").Printf("  [FAIL] %s: %s\n", skillName, err)
+						r.out.Emit(map[string]any{"skill": skillName, "status": "fail", "error": err.Error()})
 						failed++
 						continue
 					}
@@ -227,13 +274,15 @@ func (r *Registry) skillCmd() Command {
 					time.Sleep(250 * time.Millisecond)
 					if err != nil {
 						gcolor.HEX("#ef4444").Printf("  [FAIL] %s: CAS put: %s\n", skillName, err)
+						r.out.Emit(map[string]any{"skill": skillName, "status": "fail", "error": err.Error()})
 						failed++
 						continue
 					}
 
-					// Create tag: name@latest -> ref.
-					if err := r.gw.CASCreateTag(ctx, skillName, "latest", ref); err != nil {
+					// Create tag: name@ver -> ref (ver defaults to "latest").
+					if err := r.gw.CASCreateTag(ctx, skillName, ver, ref); err != nil {
 						gcolor.HEX("#ef4444").Printf("  [FAIL] %s: tag create: %s\n", skillName, err)
+						r.out.Emit(map[string]any{"skill": skillName, "status": "fail", "error": err.Error()})
 						failed++
 						time.Sleep(250 * time.Millisecond)
 						continue
@@ -241,8 +290,16 @@ func (r *Registry) skillCmd() Command {
 					time.Sleep(250 * time.Millisecond)
 
 					gcolor.HEX("#22c55e").Printf("  [OK]   %s → %s\n", skillName, shortRef(ref))
+					r.out.Emit(map[string]any{"skill": skillName, "status": "ok", "ref": shortRef(ref), "version": ver})
 					succeeded++
 				}
+
+				r.out.Data(map[string]any{
+					"succeeded": succeeded,
+					"failed":    failed,
+					"total":     len(skills),
+					"version":   ver,
+				})
 
 				fmt.Println()
 				summary := fmt.Sprintf("  Done: %d succeeded, %d failed", succeeded, failed)
@@ -265,6 +322,28 @@ func (r *Registry) skillCmd() Command {
 				// group correctly regardless of gateway metadata completeness.
 				skillList := skills.EnrichCategories(rawSkills)
 
+				// Filter by name, category, or plugin — computed once, ahead
+				// of both the JSON short-circuit below and the human display
+				// branches further down, so both paths see the same result.
+				displaySkills := skillList
+				if filter != "" {
+					fl := strings.ToLower(filter)
+					var matched []client.Skill
+					for _, s := range skillList {
+						if strings.Contains(strings.ToLower(s.Name), fl) ||
+							strings.Contains(strings.ToLower(s.Category), fl) ||
+							strings.Contains(strings.ToLower(s.Plugin), fl) {
+							matched = append(matched, s)
+						}
+					}
+					displaySkills = matched
+				}
+
+				if r.out.JSON() {
+					r.out.Data(displaySkills)
+					return nil
+				}
+
 				if len(skillList) == 0 {
 					fmt.Println()
 					fmt.Println(gcolor.HEX("#94a3b8").Sprint("  No skills found."))
@@ -280,21 +359,6 @@ func (r *Registry) skillCmd() Command {
 					}
 					r.printExternalSkillsSection()
 					return nil
-				}
-
-				// Filter by name, category, or plugin.
-				displaySkills := skillList
-				if filter != "" {
-					fl := strings.ToLower(filter)
-					var matched []client.Skill
-					for _, s := range skillList {
-						if strings.Contains(strings.ToLower(s.Name), fl) ||
-							strings.Contains(strings.ToLower(s.Category), fl) ||
-							strings.Contains(strings.ToLower(s.Plugin), fl) {
-							matched = append(matched, s)
-						}
-					}
-					displaySkills = matched
 				}
 
 				if err := printSkillsPage(displaySkills, filter, page); err != nil {
@@ -590,6 +654,21 @@ func printExternalSkill(ext *skills.ExternalSkill) error {
 	if err != nil {
 		return fmt.Errorf("could not read external skill %q: %w", ext.Name, err)
 	}
+
+	// This free function has no *Registry receiver (it is shared by the
+	// /skill get ext:<name> case and the gateway-miss fallback), so it
+	// consults the package-level curEmitter the same way printKV does.
+	if curEmitter.JSON() {
+		curEmitter.Data(map[string]any{
+			"name":      ext.Name,
+			"path":      ext.Path,
+			"sourceDir": ext.SourceDir,
+			"external":  true,
+			"content":   string(content),
+		})
+		return nil
+	}
+
 	fmt.Println()
 	fmt.Printf("  %s\n\n", gcolor.HEX("#94a3b8").Sprintf("external skill (read-only): %s", ext.Path))
 	fmt.Println(mdrender.RenderMarkdown(string(content)))

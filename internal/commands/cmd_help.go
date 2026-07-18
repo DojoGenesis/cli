@@ -61,12 +61,13 @@ func (r *Registry) helpCmd() Command {
 					{"/garden rm <id>", "delete a seed", ""},
 					{"/trail", "show memory timeline", ""},
 					{"/trail add <text>", "store a memory entry", ""},
+					{"/trail edit <id> <text>", "edit a memory entry", ""},
 					{"/trail rm <id>", "delete a memory entry", ""},
 					{"/trail search <query>", "search memories", ""},
 					{"/snapshot", "list memory snapshots", "beta"},
 					{"/snapshot save", "save a snapshot of the active session", "beta"},
 					{"/snapshot restore <id>", "restore a snapshot", "beta"},
-					{"/snapshot export <id>", "export a snapshot", "beta"},
+					{"/snapshot export <id> [path]", "export a snapshot (to file if path given)", "beta"},
 					{"/snapshot rm <id>", "delete a snapshot", "beta"},
 				}},
 				{"Workspace", []helpEntry{
@@ -85,6 +86,7 @@ func (r *Registry) helpCmd() Command {
 				}},
 				{"Orchestration", []helpEntry{
 					{"/run <task>", "submit multi-step orchestration plan", ""},
+					{"/run --plan <file>", "run a hand-authored ExecutionPlan (JSON)", ""},
 					{"/workflow <name> [json]", "execute a workflow", ""},
 					{"/warroom [topic]", "split-panel debate: Scout vs Challenger", "beta"},
 					{"/pilot [plain]", "live SSE event stream, Ctrl+C to stop (add 'plain' for text-only)", ""},
@@ -149,6 +151,7 @@ func (r *Registry) helpCmd() Command {
 					{"/activity [n]", "show recent activity log entries", ""},
 					{"/activity clear", "clear the activity log", ""},
 					{"/tools", "list registered MCP tools, grouped by namespace", ""},
+					{"/tools <name>", "show a tool's input schema", ""},
 					{"/doc <id>", "fetch and display a document", "beta"},
 				}},
 				{"Protocol", []helpEntry{
@@ -199,7 +202,17 @@ func (r *Registry) helpCmd() Command {
 // ─── Shared formatting helpers ──────────────────────────────────────────────
 
 // printKV prints a key-value pair: key in cloud-gray, value in white.
+//
+// Under a headless JSON dispatch (curEmitter in JSON mode) it instead records
+// the pair into the result envelope's `data` object — so the ~119 printKV call
+// sites across the command surface yield a structured payload for free, with no
+// per-call-site change. In the REPL/Human path curEmitter is nil and this
+// prints exactly as before.
 func printKV(key, value string) {
+	if curEmitter.JSON() {
+		curEmitter.Field(key, value)
+		return
+	}
 	fmt.Printf("%s%s\n",
 		gcolor.HEX("#94a3b8").Sprintf("  %-24s", key),
 		gcolor.White.Sprint(value),
@@ -215,6 +228,14 @@ func truncate(s string, n int) string {
 }
 
 func colorStatus(s string) string {
+	// In a headless JSON dispatch, return the raw status so it lands in the
+	// envelope's `data` as clean text rather than an ANSI-wrapped string.
+	if curEmitter.JSON() {
+		if s == "" {
+			return "unknown"
+		}
+		return s
+	}
 	switch strings.ToLower(s) {
 	case "ok", "healthy", "active", "running", "ready", "completed":
 		return gcolor.HEX("#7fb88c").Sprint(s) // soft-sage

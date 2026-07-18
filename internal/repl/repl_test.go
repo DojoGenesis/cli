@@ -244,7 +244,7 @@ func TestFireSessionStart_FiresConfiguredHook(t *testing.T) {
 	}
 
 	r := &REPL{
-		runner:  hooks.New(ps),
+		runner:  hooks.New(ps, nil),
 		session: "dojo-cli-test-session",
 		resumed: true,
 	}
@@ -258,7 +258,7 @@ func TestFireSessionStart_FiresConfiguredHook(t *testing.T) {
 func TestFireSessionStart_NoMatchingHooks_NoPanic(t *testing.T) {
 	// A REPL whose runner has no SessionStart rules (the common case — most
 	// plugins don't define one) must be a silent no-op, not a panic.
-	r := &REPL{runner: hooks.New(nil), session: "dojo-cli-test-session"}
+	r := &REPL{runner: hooks.New(nil, nil), session: "dojo-cli-test-session"}
 	r.fireSessionStart(context.Background())
 }
 
@@ -282,7 +282,7 @@ func TestFireSessionEnd_FiresConfiguredHook(t *testing.T) {
 	}
 
 	r := &REPL{
-		runner:  hooks.New(ps),
+		runner:  hooks.New(ps, nil),
 		session: "dojo-cli-test-session",
 	}
 	r.fireSessionEnd()
@@ -299,7 +299,7 @@ func TestFireSessionEnd_NoMatchingHooks_NoPanic(t *testing.T) {
 	// fires against context.Background() internally (see its doc comment:
 	// this is deliberate so it still runs a hook to completion even when
 	// Run()'s own ctx was already cancelled, e.g. the SIGTERM-shutdown case).
-	r := &REPL{runner: hooks.New(nil), session: "dojo-cli-test-session"}
+	r := &REPL{runner: hooks.New(nil, nil), session: "dojo-cli-test-session"}
 	r.fireSessionEnd()
 }
 

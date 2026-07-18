@@ -78,13 +78,42 @@ func (r *Registry) codeCmd() Command {
 			case "diff":
 				return codeDiff(args[1:])
 			case "test":
-				return codeTest(args[1:])
+				// pkgArgs recomputes the same default-package logic codeTest
+				// applies internally, so the JSON step label names the
+				// package actually run rather than a generic placeholder.
+				pkgArgs := args[1:]
+				err := codeTest(pkgArgs)
+				if r.out.JSON() && err == nil {
+					pkg := "./..."
+					if len(pkgArgs) > 0 {
+						pkg = pkgArgs[0]
+					}
+					r.out.Data(codeGateResult{
+						Steps:  []codeGateStep{{Step: "go test " + pkg + " -count=1 -race", Passed: true}},
+						Passed: true,
+					})
+				}
+				return err
 			case "build":
-				return codeBuild()
+				err := codeBuild()
+				if r.out.JSON() && err == nil {
+					r.out.Data(codeGateResult{
+						Steps:  []codeGateStep{{Step: "go build ./...", Passed: true}},
+						Passed: true,
+					})
+				}
+				return err
 			case "vet":
-				return codeVet()
+				err := codeVet()
+				if r.out.JSON() && err == nil {
+					r.out.Data(codeGateResult{
+						Steps:  []codeGateStep{{Step: "go vet ./...", Passed: true}},
+						Passed: true,
+					})
+				}
+				return err
 			case "gate":
-				return codeGate()
+				return r.codeGate()
 			case "undo":
 				// Permission gate: "code.undo" reverts working-tree changes.
 				// Allow (allowlisted / yolo) skips the in-function y/N prompt
@@ -96,7 +125,15 @@ func (r *Registry) codeCmd() Command {
 				if cwdErr != nil || cwd == "" {
 					cwd = "the current directory"
 				}
-				if !r.permissionGate("code.undo", "revert all unstaged changes in "+cwd, false) {
+				// Headless callers get a clean refusal instead of a silent
+				// decline — checked before the gate, same as /craft's
+				// permission-gated writes.
+				// /code undo reverts the whole working tree — stricter than the
+				// other confirm-gated commands: it needs --yolo, not just --yes.
+				if err := r.headlessRefuseStrict("undo file change"); err != nil {
+					return err
+				}
+				if !r.permissionGate("code.undo", "revert all unstaged changes in "+cwd, r.autoConfirmed()) {
 					return nil
 				}
 				return codeUndoPreconfirmed()
@@ -213,8 +250,28 @@ func codeVet() error {
 	return runGoCmd("vet", "./...")
 }
 
+// codeGateStep is one pass/fail record within a /code build|test|vet|gate
+// JSON-mode result.
+type codeGateStep struct {
+	Step   string `json:"step"`
+	Passed bool   `json:"passed"`
+}
+
+// codeGateResult is the JSON-mode payload for /code build, /code test,
+// /code vet, and /code gate — Steps holds one entry per gate that ran (one
+// for a single-step command, up to three for the combined gate), in run
+// order. Only ever emitted on overall success: a failing step's error already
+// carries the failure detail via the envelope's `error` field, and
+// Registry.RunHeadless's envelopeFor discards any Data set on a command that
+// returns a non-nil error — so there is no partial/failed Steps entry to
+// report here.
+type codeGateResult struct {
+	Steps  []codeGateStep `json:"steps"`
+	Passed bool           `json:"passed"`
+}
+
 // codeGate runs the full build gate: build + test + vet.
-func codeGate() error {
+func (r *Registry) codeGate() error {
 	fmt.Println()
 	steps := []struct {
 		label string
@@ -225,6 +282,7 @@ func codeGate() error {
 		{"go vet ./...", codeVet},
 	}
 
+	var passed []codeGateStep
 	for _, step := range steps {
 		gcolor.HEX("#e8b04a").Printf("  Running: %s\n", step.label)
 		if err := step.fn(); err != nil {
@@ -232,9 +290,13 @@ func codeGate() error {
 			return err
 		}
 		gcolor.HEX("#22c55e").Printf("  PASSED: %s\n\n", step.label)
+		passed = append(passed, codeGateStep{Step: step.label, Passed: true})
 	}
 
 	gcolor.Bold.Print(gcolor.HEX("#22c55e").Sprint("  All gates passed.\n\n"))
+	if r.out.JSON() {
+		r.out.Data(codeGateResult{Steps: passed, Passed: true})
+	}
 	return nil
 }
 

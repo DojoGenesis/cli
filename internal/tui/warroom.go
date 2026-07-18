@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -117,7 +118,7 @@ type warRoomChatRequest struct {
 type focusPanel int
 
 const (
-	focusInput      focusPanel = iota
+	focusInput focusPanel = iota
 	focusScout
 	focusChallenger
 )
@@ -129,13 +130,13 @@ type WarRoomModel struct {
 	cursorPos int
 
 	// Two agent panels
-	scoutBuf           *strings.Builder
-	challengerBuf      *strings.Builder
-	scoutLines         []string
-	challengerLines    []string
-	scoutScroll        int
-	challengerScroll   int
-	scoutStreaming     bool
+	scoutBuf            *strings.Builder
+	challengerBuf       *strings.Builder
+	scoutLines          []string
+	challengerLines     []string
+	scoutScroll         int
+	challengerScroll    int
+	scoutStreaming      bool
 	challengerStreaming bool
 
 	// Streaming channels — nil when no active stream.
@@ -686,6 +687,76 @@ func streamAgentToChannel(
 		return
 	}
 	sendMsg(scoutDoneMsg{}, challengerDoneMsg{})
+}
+
+// RunWarRoomHeadless runs the Scout-vs-Challenger debate for one topic without
+// the alt-screen TUI — the entry point a non-interactive caller (a script, an
+// agent, --json) uses. It launches the same two agent streams the interactive
+// model does (streamAgentToChannel, Scout "measured" + Challenger "adversarial"),
+// invokes onChunk(agent, text) as each token arrives, and returns both full
+// transcripts. onChunk may be nil (e.g. plain-text callers that only want the
+// final transcripts). onChunk calls are serialized so a caller writing NDJSON
+// straight to stdout never gets two agents' chunks interleaved mid-write. err is
+// non-nil if either stream failed.
+func RunWarRoomHeadless(
+	ctx context.Context,
+	gatewayURL, gatewayToken, model, provider, sessionID, topic string,
+	onChunk func(agent, text string),
+) (scout string, challenger string, err error) {
+	scoutCh := make(chan tea.Msg, 128)
+	challengerCh := make(chan tea.Msg, 128)
+
+	go streamAgentToChannel(ctx, gatewayURL, gatewayToken, model, provider,
+		sessionID+"-measured", topic, scoutSuffix, "measured", true, scoutCh)
+	go streamAgentToChannel(ctx, gatewayURL, gatewayToken, model, provider,
+		sessionID+"-adversarial", topic, challengerSuffix, "adversarial", false, challengerCh)
+
+	var mu sync.Mutex // serializes onChunk so NDJSON lines never interleave
+	var scoutB, challengerB strings.Builder
+	var scoutErr, challengerErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for msg := range scoutCh {
+			switch m := msg.(type) {
+			case scoutChunkMsg:
+				mu.Lock()
+				scoutB.WriteString(string(m))
+				if onChunk != nil {
+					onChunk("scout", string(m))
+				}
+				mu.Unlock()
+			case scoutErrorMsg:
+				scoutErr = m.err
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for msg := range challengerCh {
+			switch m := msg.(type) {
+			case challengerChunkMsg:
+				mu.Lock()
+				challengerB.WriteString(string(m))
+				if onChunk != nil {
+					onChunk("challenger", string(m))
+				}
+				mu.Unlock()
+			case challengerErrorMsg:
+				challengerErr = m.err
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	err = scoutErr
+	if err == nil {
+		err = challengerErr
+	}
+	return scoutB.String(), challengerB.String(), err
 }
 
 // extractWarRoomText pulls readable text from an SSE data field.

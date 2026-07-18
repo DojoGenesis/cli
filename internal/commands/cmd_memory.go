@@ -5,6 +5,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/DojoGenesis/cli/internal/client"
@@ -16,7 +17,7 @@ import (
 func (r *Registry) trailCmd() Command {
 	return Command{
 		Name:  "trail",
-		Usage: "/trail [add <text>|rm <id>|search <query>]",
+		Usage: "/trail [add <text>|edit <id> <text>|rm <id>|search <query>]",
 		Short: "Show memory timeline or add/remove/search memories",
 		Run: func(ctx context.Context, args []string) error {
 			if len(args) == 0 {
@@ -24,6 +25,10 @@ func (r *Registry) trailCmd() Command {
 				memories, err := r.gw.Memories(ctx)
 				if err != nil {
 					return fmt.Errorf("could not fetch memory trail: %w", err)
+				}
+				if r.out.JSON() {
+					r.out.Data(memories)
+					return nil
 				}
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Memory Trail (%d)\n\n", len(memories)))
@@ -61,6 +66,21 @@ func (r *Registry) trailCmd() Command {
 				}
 				fmt.Println()
 
+			case "edit":
+				// /trail edit <id> <text...>
+				if len(args) < 3 {
+					return fmt.Errorf("usage: /trail edit <id> <text>")
+				}
+				id := args[1]
+				text := strings.Join(args[2:], " ")
+				if err := r.gw.UpdateMemory(ctx, id, client.UpdateMemoryRequest{Content: text}); err != nil {
+					return fmt.Errorf("could not update memory: %w", err)
+				}
+				fmt.Println()
+				fmt.Println(gcolor.HEX("#7fb88c").Sprint("  Memory updated"))
+				printKV("id", id)
+				fmt.Println()
+
 			case "rm":
 				// /trail rm <id>
 				if len(args) < 2 {
@@ -84,6 +104,10 @@ func (r *Registry) trailCmd() Command {
 				if err != nil {
 					return fmt.Errorf("could not search memories: %w", err)
 				}
+				if r.out.JSON() {
+					r.out.Data(results)
+					return nil
+				}
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Search results (%d)\n\n", len(results)))
 				if len(results) == 0 {
@@ -100,7 +124,7 @@ func (r *Registry) trailCmd() Command {
 				fmt.Println()
 
 			default:
-				return fmt.Errorf("unknown trail subcommand %q — use: add, rm, search", sub)
+				return fmt.Errorf("unknown trail subcommand %q — use: add, edit, rm, search", sub)
 			}
 			return nil
 		},
@@ -112,7 +136,7 @@ func (r *Registry) trailCmd() Command {
 func (r *Registry) snapshotCmd() Command {
 	return Command{
 		Name:  "snapshot",
-		Usage: "/snapshot [save|restore <id>|export <id>|rm <id>]",
+		Usage: "/snapshot [save|restore <id>|export <id> [path]|rm <id>]",
 		Short: "List, save, restore, export, or delete memory snapshots",
 		Run: func(ctx context.Context, args []string) error {
 			sub := "ls"
@@ -150,12 +174,36 @@ func (r *Registry) snapshotCmd() Command {
 
 			case "export":
 				if len(args) < 2 {
-					return fmt.Errorf("usage: /snapshot export <id>")
+					return fmt.Errorf("usage: /snapshot export <id> [path]")
 				}
 				id := args[1]
 				data, err := r.gw.ExportSnapshot(ctx, id)
 				if err != nil {
 					return fmt.Errorf("could not export snapshot: %w", err)
+				}
+				if len(args) >= 3 {
+					// A path was given — write to disk instead of dumping to
+					// stdout, which is unusable in the REPL for anything but
+					// tiny snapshots.
+					path := args[2]
+					if err := os.WriteFile(path, data, 0644); err != nil {
+						return fmt.Errorf("could not write snapshot to %q: %w", path, err)
+					}
+					if r.out.JSON() {
+						r.out.Data(map[string]any{"id": id, "path": path, "bytes": len(data)})
+						return nil
+					}
+					fmt.Println()
+					fmt.Println(gcolor.HEX("#7fb88c").Sprint("  Snapshot exported"))
+					printKV("id", id)
+					printKV("path", path)
+					printKV("bytes", fmt.Sprintf("%d", len(data)))
+					fmt.Println()
+					return nil
+				}
+				if r.out.JSON() {
+					r.out.Data(map[string]any{"id": id, "bytes": len(data)})
+					return nil
 				}
 				fmt.Println(string(data))
 
@@ -172,9 +220,16 @@ func (r *Registry) snapshotCmd() Command {
 				fmt.Println()
 
 			default: // ls
+				if len(args) > 0 && sub != "ls" {
+					return fmt.Errorf("unknown subcommand %q — see /help", args[0])
+				}
 				snaps, err := r.gw.ListSnapshots(ctx, *r.session)
 				if err != nil {
 					return fmt.Errorf("could not fetch snapshots: %w", err)
+				}
+				if r.out.JSON() {
+					r.out.Data(snaps)
+					return nil
 				}
 				fmt.Println()
 				gcolor.Bold.Print(gcolor.HEX("#e8b04a").Sprintf("  Snapshots (%d)\n\n", len(snaps)))

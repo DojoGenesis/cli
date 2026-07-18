@@ -2,8 +2,13 @@
 package commands
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,9 +17,23 @@ import (
 	"github.com/DojoGenesis/cli/internal/config"
 	"github.com/DojoGenesis/cli/internal/guardrail"
 	"github.com/DojoGenesis/cli/internal/hooks"
+	"github.com/DojoGenesis/cli/internal/output"
 	"github.com/DojoGenesis/cli/internal/plugins"
 	gcolor "github.com/gookit/color"
 )
+
+// ErrUnknownCommand is the sentinel returned by Dispatch when no command (or
+// alias) matches. Headless callers map it to exit code 2 (usage) rather than 1
+// (runtime); errors.Is(err, ErrUnknownCommand) is the check.
+var ErrUnknownCommand = errors.New("unknown command")
+
+// curEmitter is the output sink for the command currently being dispatched
+// headlessly. It is nil in the REPL/Human path (so the free formatting helpers
+// print exactly as before). RunHeadless sets it for the duration of one
+// dispatch and clears it after. Command dispatch is single-goroutine (the REPL
+// read loop or the one-shot path), so an unsynchronized package var is safe;
+// the Emitter's own state is likewise touched from that one goroutine only.
+var curEmitter *output.Emitter
 
 // Registry maps slash command names to handler functions.
 type Registry struct {
@@ -36,6 +55,21 @@ type Registry struct {
 	// stdout printer (same surface the REPL prints command errors to);
 	// overridable so tests can capture advice without hijacking os.Stdout.
 	advicePrint func(msg string)
+
+	// out is the structured output sink for the current headless dispatch, or
+	// nil in the REPL/Human path. Set + cleared by RunHeadless. Command methods
+	// that want to emit a rich typed payload call r.out.Data(...)/Field(...);
+	// the free helpers (printKV, colorStatus) consult the package curEmitter.
+	out *output.Emitter
+
+	// headless is true while a command runs under RunHeadless (no TTY, no
+	// interactive stdin). Commands that would block on a y/N confirmation call
+	// r.headlessRefuse(...) to fail cleanly instead of hanging a script.
+	headless bool
+
+	// assumeYes records explicit --yes consent for this run (set by SetAssumeYes).
+	// It lets confirmation-gated commands run headlessly without the blunt --yolo.
+	assumeYes bool
 }
 
 // Command is a callable slash command.
@@ -55,7 +89,7 @@ func New(cfg *config.Config, gw *client.Client, plgs []plugins.Plugin, session *
 		gw:      gw,
 		cmds:    make(map[string]Command),
 		plgs:    plgs,
-		runner:  hooks.New(plgs),
+		runner:  hooks.New(plgs, gw),
 		session: session,
 	}
 	r.register()
@@ -138,7 +172,7 @@ func (r *Registry) Dispatch(ctx context.Context, input string) error {
 			}
 		}
 	}
-	return fmt.Errorf("unknown command /%s — type /help for a list", name)
+	return fmt.Errorf("%w /%s — type /help for a list", ErrUnknownCommand, name)
 }
 
 // guardKey builds the guardrail key for one dispatched command: "cmd:" plus
@@ -185,6 +219,184 @@ func (r *Registry) guardAdvise(name string, args []string, runErr error) {
 
 func (r *Registry) add(cmd Command) {
 	r.cmds[cmd.Name] = cmd
+}
+
+// ─── Headless / JSON dispatch ───────────────────────────────────────────────
+
+// RunHeadless dispatches input in JSON mode and returns the result Envelope. It
+// is the non-interactive counterpart to Dispatch: same routing, guardrail, and
+// activity logging, but the command's output is captured into a structured
+// {ok, command, data, error} envelope instead of streamed as human text.
+//
+// input is the command line WITHOUT the leading "/", identical to Dispatch.
+//
+// Mechanism: os.Stdout (and gcolor's writer) are redirected to a pipe for the
+// duration of the handler so that any direct fmt.Printf a not-yet-converted
+// command emits does not corrupt the JSON stream — it is captured and, if the
+// command produced no structured data, surfaced as a {"text": …} fallback. The
+// Emitter keeps the real stdout, so a streaming command's Emit(...) NDJSON lines
+// bypass the redirect and appear live before this terminal envelope.
+func (r *Registry) RunHeadless(ctx context.Context, input string) output.Envelope {
+	real := os.Stdout
+	em := output.New(output.JSON, real)
+
+	rp, wp, err := os.Pipe()
+	if err != nil {
+		// Can't set up capture — fall back to running without the redirect so
+		// the command still executes; stray stdout may interleave, but the
+		// envelope is still emitted.
+		r.out, curEmitter, r.headless = em, em, true
+		derr := r.Dispatch(ctx, input)
+		r.out, curEmitter, r.headless = nil, nil, false
+		return envelopeFor(input, em, "", derr)
+	}
+
+	os.Stdout = wp
+	gcolor.SetOutput(wp)
+	r.out, curEmitter, r.headless = em, em, true
+
+	// Drain the pipe concurrently so a chatty command cannot deadlock on a full
+	// pipe buffer while it is still writing.
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() { _, _ = io.Copy(&buf, rp); close(done) }()
+
+	derr := r.Dispatch(ctx, input)
+
+	_ = wp.Close()
+	<-done
+	_ = rp.Close()
+	os.Stdout = real
+	gcolor.SetOutput(real)
+	r.out, curEmitter, r.headless = nil, nil, false
+
+	return envelopeFor(input, em, buf.String(), derr)
+}
+
+// envelopeFor assembles the terminal Envelope from a dispatch outcome.
+func envelopeFor(input string, em *output.Emitter, captured string, err error) output.Envelope {
+	env := output.Envelope{
+		Command: commandName(input),
+		OK:      err == nil,
+		Data:    em.Payload(captured),
+	}
+	if err != nil {
+		env.Data = nil
+		env.Error = &output.Err{Code: errCode(err), Message: cleanErr(err)}
+	}
+	return env
+}
+
+// errCode maps an error to a stable, machine-branchable slug. Unknown commands
+// are a usage error (exit 2); everything else is a runtime error (exit 1).
+func errCode(err error) string {
+	if errors.Is(err, ErrUnknownCommand) {
+		return "unknown_command"
+	}
+	return "error"
+}
+
+// cleanErr strips the leading "unknown command " sentinel prefix so the
+// envelope message reads naturally (the code already carries the class).
+func cleanErr(err error) string {
+	msg := err.Error()
+	return strings.TrimPrefix(msg, "unknown command ")
+}
+
+// commandName returns the command token (first field, lowercased) from a
+// dispatch input, for the envelope's `command` field. Multi-word commands keep
+// only the head — e.g. "skill get foo" → "skill".
+func commandName(input string) string {
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.ToLower(parts[0])
+}
+
+// SetAssumeYes records explicit non-interactive consent for the whole run — the
+// `--yes` flag. It lets confirmation-gated commands (delete, undo, install, …)
+// run headlessly: headlessRefuse then passes, and because the command is past
+// that gate in headless mode, autoConfirmed() reports the prompt pre-answered.
+// It is scoped per invocation (never persisted), and narrower than --yolo, which
+// also skips the permissions gate.
+func (r *Registry) SetAssumeYes(b bool) { r.assumeYes = b }
+
+// SetHeadless marks the registry as running a non-interactive one-shot dispatch.
+// RunHeadless sets this for --json runs; the plain (non-JSON) one-shot path calls
+// it explicitly so commands take their headless branch — plain-text output,
+// refuse stdin prompts — instead of launching an alt-screen TUI or hanging on a
+// y/N read as if they were in the REPL.
+func (r *Registry) SetHeadless(b bool) { r.headless = b }
+
+// autoConfirmed reports whether an interactive y/N prompt should be treated as
+// already answered "yes" without reading stdin. True in headless mode (a command
+// only reaches its prompt in headless mode after headlessRefuse let it past,
+// which requires consent), false in the interactive REPL (where the prompt runs
+// for real). The canonical guard is `if !r.autoConfirmed() && !confirm() { … }`.
+func (r *Registry) autoConfirmed() bool { return r.headless }
+
+// headlessRefuse returns a non-nil error when a command that needs interactive
+// confirmation is invoked headlessly WITHOUT consent. Commands call it before any
+// y/N prompt so a scripted caller fails cleanly instead of hanging on stdin.
+// Returns nil in the interactive REPL, or headless under explicit consent —
+// `--yes` (this command only) or `--yolo` (skip all permission prompts).
+func (r *Registry) headlessRefuse(action string) error {
+	if !r.headless {
+		return nil
+	}
+	if r.assumeYes {
+		return nil
+	}
+	if r.cfg != nil && r.cfg.Permissions.Mode == "yolo" {
+		return nil
+	}
+	return fmt.Errorf("refused: %q needs confirmation — re-run with --yes (or --yolo), or in the REPL", action)
+}
+
+// headlessRefuseStrict is headlessRefuse for commands too destructive for the
+// narrower --yes: it requires --yolo (or the REPL). /code undo reverts the whole
+// working tree — the kind of scriptable loaded gun that should not fire on a
+// per-run --yes a caller might set broadly. --yes alone is refused here.
+func (r *Registry) headlessRefuseStrict(action string) error {
+	if !r.headless {
+		return nil
+	}
+	if r.cfg != nil && r.cfg.Permissions.Mode == "yolo" {
+		return nil
+	}
+	return fmt.Errorf("refused: %q reverts uncommitted changes — re-run with --yolo, or in the REPL (--yes is not enough)", action)
+}
+
+// ─── Discovery ──────────────────────────────────────────────────────────────
+
+// CommandInfo is the machine-readable descriptor of one command, emitted by
+// `dojo --commands`. It is the serializable projection of Command (the Run func
+// is omitted). Args/subcommands are not structured — they live in the free-text
+// Usage string today.
+type CommandInfo struct {
+	Name    string   `json:"name"`
+	Aliases []string `json:"aliases,omitempty"`
+	Short   string   `json:"short"`
+	Usage   string   `json:"usage"`
+}
+
+// Commands returns every registered command as a CommandInfo, sorted by name —
+// the single source of truth for the command catalog (help, completions, and
+// `--commands` discovery should all derive from this rather than drift as
+// hand-maintained lists).
+func (r *Registry) Commands() []CommandInfo {
+	out := make([]CommandInfo, 0, len(r.cmds))
+	for _, c := range r.cmds {
+		out = append(out, CommandInfo{
+			Name:    c.Name,
+			Aliases: c.Aliases,
+			Short:   c.Short,
+			Usage:   c.Usage,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────

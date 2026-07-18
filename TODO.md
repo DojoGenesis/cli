@@ -65,7 +65,7 @@ Client layer complete:
 Command layer (MVP):
 
 - [x] `/run <task>` -- routes through ChatStream; gateway handles orchestration internally (`cmd_workflow.go` lines 85-127)
-- [ ] DAG status polling with live node display (not needed for MVP -- gateway handles internally)
+- [x] DAG status polling with live node display -- shipped as `pollDAGUntilTerminal` (`cmd_workflow.go` line 263); the "not needed for MVP" note here was stale
 
 ---
 
