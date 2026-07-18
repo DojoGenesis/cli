@@ -128,7 +128,9 @@ func (r *Registry) codeCmd() Command {
 				// Headless callers get a clean refusal instead of a silent
 				// decline — checked before the gate, same as /craft's
 				// permission-gated writes.
-				if err := r.headlessRefuse("undo file change"); err != nil {
+				// /code undo reverts the whole working tree — stricter than the
+				// other confirm-gated commands: it needs --yolo, not just --yes.
+				if err := r.headlessRefuseStrict("undo file change"); err != nil {
 					return err
 				}
 				if !r.permissionGate("code.undo", "revert all unstaged changes in "+cwd, r.autoConfirmed()) {

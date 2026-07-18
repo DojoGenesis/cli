@@ -354,6 +354,20 @@ func (r *Registry) headlessRefuse(action string) error {
 	return fmt.Errorf("refused: %q needs confirmation — re-run with --yes (or --yolo), or in the REPL", action)
 }
 
+// headlessRefuseStrict is headlessRefuse for commands too destructive for the
+// narrower --yes: it requires --yolo (or the REPL). /code undo reverts the whole
+// working tree — the kind of scriptable loaded gun that should not fire on a
+// per-run --yes a caller might set broadly. --yes alone is refused here.
+func (r *Registry) headlessRefuseStrict(action string) error {
+	if !r.headless {
+		return nil
+	}
+	if r.cfg != nil && r.cfg.Permissions.Mode == "yolo" {
+		return nil
+	}
+	return fmt.Errorf("refused: %q reverts uncommitted changes — re-run with --yolo, or in the REPL (--yes is not enough)", action)
+}
+
 // ─── Discovery ──────────────────────────────────────────────────────────────
 
 // CommandInfo is the machine-readable descriptor of one command, emitted by
