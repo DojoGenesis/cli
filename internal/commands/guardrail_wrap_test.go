@@ -120,8 +120,8 @@ func TestDispatchGuardrail_SubcommandKeysIndependent(t *testing.T) {
 
 	// Bare command (no args) keys as just "cmd:boom".
 	r2, printed2, _ := guardTestSetup(cfg)
-	r2.Dispatch(context.Background(), "boom")
-	r2.Dispatch(context.Background(), "boom")
+	_ = r2.Dispatch(context.Background(), "boom")
+	_ = r2.Dispatch(context.Background(), "boom")
 	if len(*printed2) != 1 || (*printed2)[0] != warnMsg("cmd:boom", 2) {
 		t.Fatalf("bare-command advice = %q; want exactly [%q]", *printed2, warnMsg("cmd:boom", 2))
 	}
@@ -135,8 +135,8 @@ func TestDispatchGuardrail_AliasSharesCanonicalKey(t *testing.T) {
 	}
 	r, printed, _ := guardTestSetup(cfg)
 
-	r.Dispatch(context.Background(), "boom go") // canonical: streak 1
-	r.Dispatch(context.Background(), "b go")    // alias: same key, streak 2 → warn
+	_ = r.Dispatch(context.Background(), "boom go") // canonical: streak 1
+	_ = r.Dispatch(context.Background(), "b go")    // alias: same key, streak 2 → warn
 	if len(*printed) != 1 || (*printed)[0] != warnMsg("cmd:boom go", 2) {
 		t.Fatalf("advice = %q; want exactly [%q] (alias must share the canonical key)", *printed, warnMsg("cmd:boom go", 2))
 	}

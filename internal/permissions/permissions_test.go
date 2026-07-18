@@ -21,14 +21,14 @@ func captureStderr(f func()) string {
 	}
 	os.Stderr = w
 	f()
-	w.Close()
+	_ = w.Close()
 	os.Stderr = old
 
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, r); err != nil {
 		panic(err)
 	}
-	r.Close()
+	_ = r.Close()
 	return buf.String()
 }
 
@@ -42,14 +42,14 @@ func captureStdout(f func()) string {
 	}
 	os.Stdout = w
 	f()
-	w.Close()
+	_ = w.Close()
 	os.Stdout = old
 
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, r); err != nil {
 		panic(err)
 	}
-	r.Close()
+	_ = r.Close()
 	return buf.String()
 }
 
@@ -198,13 +198,13 @@ func withNonTTYStdin(t *testing.T, body string, f func()) {
 			t.Fatalf("write to pipe: %v", err)
 		}
 	}
-	w.Close()
+	_ = w.Close()
 
 	old := os.Stdin
 	os.Stdin = r
 	defer func() {
 		os.Stdin = old
-		r.Close()
+		_ = r.Close()
 	}()
 
 	f()
