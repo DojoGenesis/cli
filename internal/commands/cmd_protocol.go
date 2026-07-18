@@ -38,6 +38,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -272,7 +273,7 @@ func (r *Registry) protocolCmd() Command {
 			case "show":
 				return r.protocolShow()
 			case "edit":
-				return r.protocolEdit(ctx)
+				return r.protocolEditDispatch(ctx, args[1:])
 			case "harnesses", "harness", "ls", "list":
 				return r.protocolHarnesses()
 			case "install", "add":
@@ -469,6 +470,84 @@ func (r *Registry) protocolEdit(ctx context.Context) error {
 	fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Changes take effect next session — the protocol resolves once at session start."))
 	fmt.Println()
 	return nil
+}
+
+// protocolEditDispatch routes /protocol edit. With --content it writes the
+// overlay directly — no $EDITOR, no subprocess, no stdin block — so the doc is
+// editable headlessly. Without --content it falls through to the interactive
+// editor flow (protocolEdit), byte-for-byte unchanged.
+//
+// Content forms (explicit opt-in only — it NEVER auto-reads stdin, which would
+// hang a headless caller whose stdin isn't a real terminal):
+//
+//	--content <text...>   space form; joins the remaining args (the dispatcher's
+//	                      tokenizer has no quoting, so this is single-line only)
+//	--content=<text>      inline form
+//	--content -           reads all of stdin (Unix convention) — the way to pipe
+//	--content=-           a real multi-line protocol doc
+func (r *Registry) protocolEditDispatch(ctx context.Context, args []string) error {
+	content, hasContent, err := parseContentFlag(args)
+	if err != nil {
+		return err
+	}
+	if !hasContent {
+		return r.protocolEdit(ctx) // interactive $EDITOR flow, unchanged
+	}
+
+	cwd, _ := os.Getwd()
+	target, err := protocolResolveEditTarget(cwd, config.DojoDir())
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(target, []byte(content), 0644); err != nil {
+		return fmt.Errorf("write protocol overlay %s: %w", target, err)
+	}
+
+	if r.out.JSON() {
+		r.out.Data(map[string]any{"path": target, "bytes": len(content)})
+		return nil
+	}
+	fmt.Println()
+	fmt.Println(gcolor.HEX("#7fb88c").Sprintf("  Protocol overlay written: %s (%d bytes)", target, len(content)))
+	fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Changes take effect next session — the protocol resolves once at session start."))
+	fmt.Println()
+	return nil
+}
+
+// parseContentFlag extracts a --content value. Returns (content, true, nil) when
+// present, ("", false, nil) when absent. A bare "-" (or "=-") reads stdin; the
+// space form joins the remaining args. See protocolEditDispatch for the forms.
+func parseContentFlag(args []string) (string, bool, error) {
+	for i, a := range args {
+		switch {
+		case a == "--content":
+			rest := args[i+1:]
+			if len(rest) == 0 {
+				return "", false, fmt.Errorf("usage: /protocol edit --content <text|-> ('-' reads stdin)")
+			}
+			if len(rest) == 1 && rest[0] == "-" {
+				return readAllStdin()
+			}
+			return strings.Join(rest, " "), true, nil
+		case strings.HasPrefix(a, "--content="):
+			v := strings.TrimPrefix(a, "--content=")
+			if v == "-" {
+				return readAllStdin()
+			}
+			return v, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// readAllStdin consumes all of stdin as the --content value. Only ever reached
+// via an explicit "-" so a caller can never hang on it by accident.
+func readAllStdin() (string, bool, error) {
+	b, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", false, fmt.Errorf("read --content from stdin: %w", err)
+	}
+	return string(b), true, nil
 }
 
 // ─── harnesses ────────────────────────────────────────────────────────────────
