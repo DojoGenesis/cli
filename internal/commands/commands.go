@@ -66,6 +66,10 @@ type Registry struct {
 	// interactive stdin). Commands that would block on a y/N confirmation call
 	// r.headlessRefuse(...) to fail cleanly instead of hanging a script.
 	headless bool
+
+	// assumeYes records explicit --yes consent for this run (set by SetAssumeYes).
+	// It lets confirmation-gated commands run headlessly without the blunt --yolo.
+	assumeYes bool
 }
 
 // Command is a callable slash command.
@@ -310,18 +314,37 @@ func commandName(input string) string {
 	return strings.ToLower(parts[0])
 }
 
+// SetAssumeYes records explicit non-interactive consent for the whole run — the
+// `--yes` flag. It lets confirmation-gated commands (delete, undo, install, …)
+// run headlessly: headlessRefuse then passes, and because the command is past
+// that gate in headless mode, autoConfirmed() reports the prompt pre-answered.
+// It is scoped per invocation (never persisted), and narrower than --yolo, which
+// also skips the permissions gate.
+func (r *Registry) SetAssumeYes(b bool) { r.assumeYes = b }
+
+// autoConfirmed reports whether an interactive y/N prompt should be treated as
+// already answered "yes" without reading stdin. True in headless mode (a command
+// only reaches its prompt in headless mode after headlessRefuse let it past,
+// which requires consent), false in the interactive REPL (where the prompt runs
+// for real). The canonical guard is `if !r.autoConfirmed() && !confirm() { … }`.
+func (r *Registry) autoConfirmed() bool { return r.headless }
+
 // headlessRefuse returns a non-nil error when a command that needs interactive
-// confirmation is invoked headlessly and YOLO mode is off. Commands call it
-// before any y/N prompt so a scripted caller fails cleanly instead of hanging
-// on stdin. Returns nil in the interactive REPL, or headless under --yolo.
+// confirmation is invoked headlessly WITHOUT consent. Commands call it before any
+// y/N prompt so a scripted caller fails cleanly instead of hanging on stdin.
+// Returns nil in the interactive REPL, or headless under explicit consent —
+// `--yes` (this command only) or `--yolo` (skip all permission prompts).
 func (r *Registry) headlessRefuse(action string) error {
 	if !r.headless {
+		return nil
+	}
+	if r.assumeYes {
 		return nil
 	}
 	if r.cfg != nil && r.cfg.Permissions.Mode == "yolo" {
 		return nil
 	}
-	return fmt.Errorf("refused: %q needs interactive confirmation — re-run in the REPL or with --yolo", action)
+	return fmt.Errorf("refused: %q needs confirmation — re-run with --yes (or --yolo), or in the REPL", action)
 }
 
 // ─── Discovery ──────────────────────────────────────────────────────────────

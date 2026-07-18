@@ -39,6 +39,7 @@ func main() {
 		flagCommands    = flag.Bool("commands", false, "Print the machine-readable command catalog and exit (respects --json)")
 		flagPlain       = flag.Bool("plain", false, "Plain text output (no ANSI colors, for piped/CI usage)")
 		flagYolo        = flag.Bool("yolo", false, "Skip all permission prompts for this run (dangerous; never persisted to settings.json)")
+		flagYes         = flag.Bool("yes", false, "Assume 'yes' to confirmation prompts (lets confirm-gated commands run headless; narrower than --yolo)")
 	)
 	flag.Parse()
 
@@ -135,7 +136,7 @@ func main() {
 		// (Without this, "/health" was sent to a model as literal text.) Bare
 		// text still falls through to the chat stream below, unchanged.
 		if strings.HasPrefix(strings.TrimSpace(*flagOneShot), "/") {
-			os.Exit(runHeadlessCommand(ctx, cfg, gw, strings.TrimSpace(*flagOneShot), *flagJSON, *flagPlain || *flagNoColor))
+			os.Exit(runHeadlessCommand(ctx, cfg, gw, strings.TrimSpace(*flagOneShot), *flagJSON, *flagPlain || *flagNoColor, *flagYes))
 		}
 
 		workspaceRoot, _ := os.Getwd()
@@ -370,8 +371,9 @@ func runCommandCatalog(cfg *config.Config, gw *client.Client, asJSON bool) int {
 // (unknown command). line includes the leading "/". In --json mode the result
 // is a {ok, command, data, error} envelope on stdout; otherwise it runs like
 // the REPL and renders any error to stderr.
-func runHeadlessCommand(ctx context.Context, cfg *config.Config, gw *client.Client, line string, asJSON, plain bool) int {
+func runHeadlessCommand(ctx context.Context, cfg *config.Config, gw *client.Client, line string, asJSON, plain, assumeYes bool) int {
 	reg := newHeadlessRegistry(cfg, gw)
+	reg.SetAssumeYes(assumeYes)
 	input := strings.TrimPrefix(line, "/")
 
 	if asJSON {
