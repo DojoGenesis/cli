@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -11,7 +13,9 @@ import (
 	"time"
 
 	"github.com/DojoGenesis/cli/internal/client"
+	"github.com/DojoGenesis/cli/internal/commands"
 	"github.com/DojoGenesis/cli/internal/config"
+	"github.com/DojoGenesis/cli/internal/plugins"
 	"github.com/DojoGenesis/cli/internal/protocol"
 	"github.com/DojoGenesis/cli/internal/repl"
 	"github.com/DojoGenesis/cli/internal/state"
@@ -31,7 +35,8 @@ func main() {
 		flagCompletion  = flag.String("completion", "", "Generate shell completions (bash|zsh|fish)")
 		flagResume      = flag.Bool("resume", false, "Resume the most recent session instead of starting fresh")
 		flagSession     = flag.String("session", "", "Resume a specific session ID instead of the most recent one (implies --resume; see /session ls)")
-		flagJSON        = flag.Bool("json", false, "Output JSON lines in one-shot mode (for scripted pipelines)")
+		flagJSON        = flag.Bool("json", false, "Output JSON in one-shot/--commands mode (envelope for /commands, JSON-lines for chat; for scripted pipelines)")
+		flagCommands    = flag.Bool("commands", false, "Print the machine-readable command catalog and exit (respects --json)")
 		flagPlain       = flag.Bool("plain", false, "Plain text output (no ANSI colors, for piped/CI usage)")
 		flagYolo        = flag.Bool("yolo", false, "Skip all permission prompts for this run (dangerous; never persisted to settings.json)")
 	)
@@ -66,10 +71,12 @@ func main() {
 		}
 	}
 
-	// Load config
+	// Load config. A config/usage failure exits 2 (vs 1 for a runtime error) so
+	// a scripted caller can tell "you invoked me wrong" from "the run failed".
 	cfg, err := config.Load()
 	if err != nil {
-		fatalf("config error: %s", err)
+		fmt.Fprintf(os.Stderr, "dojo: config error: %s\n", err)
+		os.Exit(2)
 	}
 
 	// Flag overrides
@@ -99,6 +106,14 @@ func main() {
 	// Build gateway client
 	gw := client.New(cfg.Gateway.URL, cfg.Gateway.Token, cfg.Gateway.Timeout)
 
+	// --commands: emit the machine-readable command catalog and exit. This is
+	// pure introspection (no gateway round-trip), the entry point for an agent
+	// discovering the surface before driving it. Generated from the Registry —
+	// one source of truth, not a hand-maintained list.
+	if *flagCommands {
+		os.Exit(runCommandCatalog(cfg, gw, *flagJSON))
+	}
+
 	// One-shot mode: send a single message and exit. Ctrl+C cancels the single
 	// turn and exits.
 	//
@@ -113,6 +128,15 @@ func main() {
 	if *flagOneShot != "" {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
+
+		// A1 — agent-drivability. A one-shot message beginning with "/" is a
+		// slash command, not chat: route it through the same Registry.Dispatch
+		// the REPL uses, so all ~35 commands are reachable non-interactively.
+		// (Without this, "/health" was sent to a model as literal text.) Bare
+		// text still falls through to the chat stream below, unchanged.
+		if strings.HasPrefix(strings.TrimSpace(*flagOneShot), "/") {
+			os.Exit(runHeadlessCommand(ctx, cfg, gw, strings.TrimSpace(*flagOneShot), *flagJSON, *flagPlain || *flagNoColor))
+		}
 
 		workspaceRoot, _ := os.Getwd()
 		req := client.ChatRequest{
@@ -302,6 +326,75 @@ complete -c dojo -f -a "/protocol" -d "KE harness discovery + install"
 		fmt.Fprintf(os.Stderr, "dojo: unknown shell %q (supported: bash, zsh, fish)\n", shell)
 		os.Exit(1)
 	}
+}
+
+// newHeadlessRegistry builds a command Registry for a non-interactive run,
+// mirroring how repl.New constructs it (scan plugins, then commands.New) but
+// without any REPL/TUI/spirit state. The plugin scan is filesystem-only and
+// best-effort — a missing plugins dir is not an error — so a scan failure is
+// logged and execution continues, exactly as the REPL does.
+func newHeadlessRegistry(cfg *config.Config, gw *client.Client) *commands.Registry {
+	plgs, err := plugins.Scan(cfg.Plugins.Path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dojo: plugin scan: %s\n", err)
+	}
+	var session string
+	return commands.New(cfg, gw, plgs, &session)
+}
+
+// runCommandCatalog prints the command catalog (JSON array, or a plain list)
+// and returns the process exit code.
+func runCommandCatalog(cfg *config.Config, gw *client.Client, asJSON bool) int {
+	cmds := newHeadlessRegistry(cfg, gw).Commands()
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(cmds); err != nil {
+			fmt.Fprintf(os.Stderr, "dojo: %s\n", err)
+			return 1
+		}
+		return 0
+	}
+	for _, c := range cmds {
+		fmt.Printf("/%-14s %s\n", c.Name, c.Short)
+	}
+	return 0
+}
+
+// runHeadlessCommand dispatches a single slash command non-interactively and
+// returns the process exit code: 0 ok · 1 runtime/gateway error · 2 usage
+// (unknown command). line includes the leading "/". In --json mode the result
+// is a {ok, command, data, error} envelope on stdout; otherwise it runs like
+// the REPL and renders any error to stderr.
+func runHeadlessCommand(ctx context.Context, cfg *config.Config, gw *client.Client, line string, asJSON, plain bool) int {
+	reg := newHeadlessRegistry(cfg, gw)
+	input := strings.TrimPrefix(line, "/")
+
+	if asJSON {
+		env := reg.RunHeadless(ctx, input)
+		enc := json.NewEncoder(os.Stdout)
+		if err := enc.Encode(env); err != nil {
+			fmt.Fprintf(os.Stderr, "dojo: %s\n", err)
+			return 1
+		}
+		if env.OK {
+			return 0
+		}
+		if env.Error != nil && env.Error.Code == "unknown_command" {
+			return 2
+		}
+		return 1
+	}
+
+	// Human/plain path: same behavior as the REPL, error to stderr + exit code.
+	if err := reg.Dispatch(ctx, input); err != nil {
+		fmt.Fprintf(os.Stderr, "dojo: %s\n", err)
+		if errors.Is(err, commands.ErrUnknownCommand) {
+			return 2
+		}
+		return 1
+	}
+	return 0
 }
 
 func fatalf(format string, args ...any) {

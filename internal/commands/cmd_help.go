@@ -199,7 +199,17 @@ func (r *Registry) helpCmd() Command {
 // ─── Shared formatting helpers ──────────────────────────────────────────────
 
 // printKV prints a key-value pair: key in cloud-gray, value in white.
+//
+// Under a headless JSON dispatch (curEmitter in JSON mode) it instead records
+// the pair into the result envelope's `data` object — so the ~119 printKV call
+// sites across the command surface yield a structured payload for free, with no
+// per-call-site change. In the REPL/Human path curEmitter is nil and this
+// prints exactly as before.
 func printKV(key, value string) {
+	if curEmitter.JSON() {
+		curEmitter.Field(key, value)
+		return
+	}
 	fmt.Printf("%s%s\n",
 		gcolor.HEX("#94a3b8").Sprintf("  %-24s", key),
 		gcolor.White.Sprint(value),
@@ -215,6 +225,14 @@ func truncate(s string, n int) string {
 }
 
 func colorStatus(s string) string {
+	// In a headless JSON dispatch, return the raw status so it lands in the
+	// envelope's `data` as clean text rather than an ANSI-wrapped string.
+	if curEmitter.JSON() {
+		if s == "" {
+			return "unknown"
+		}
+		return s
+	}
 	switch strings.ToLower(s) {
 	case "ok", "healthy", "active", "running", "ready", "completed":
 		return gcolor.HEX("#7fb88c").Sprint(s) // soft-sage
