@@ -57,7 +57,7 @@ func TestFireChecked_BlockingHookFailure_Blocks(t *testing.T) {
 			Hooks:    []plugins.HookDef{{Type: "command", Command: "echo denied >&2; exit 3"}},
 		}},
 	}}
-	r := New(ps)
+	r := New(ps, nil)
 
 	res := r.FireChecked(context.Background(), EventPreCommand, map[string]any{"command": "/deploy"})
 	if !res.Blocked {
@@ -96,7 +96,7 @@ func TestFireChecked_BlockingHookSucceeds_NotBlocked(t *testing.T) {
 		Path:      tmp,
 		HookRules: []plugins.HookRule{{Event: EventPreCommand, Blocking: true, Hooks: []plugins.HookDef{{Type: "command", Command: "touch " + marker}}}},
 	}}
-	r := New(ps)
+	r := New(ps, nil)
 
 	res := r.FireChecked(context.Background(), EventPreCommand, map[string]any{"command": "/ok"})
 	if res.Blocked || res.Err != nil {
@@ -116,7 +116,7 @@ func TestFireChecked_NonBlockingCommandFailure_ContinuesNotBlocked(t *testing.T)
 		Path:      t.TempDir(),
 		HookRules: []plugins.HookRule{{Event: EventPreCommand, Blocking: false, Hooks: []plugins.HookDef{{Type: "command", Command: "exit 1"}}}},
 	}}
-	r := New(ps)
+	r := New(ps, nil)
 
 	res := r.FireChecked(context.Background(), EventPreCommand, map[string]any{"command": "/x"})
 	if res.Blocked {
@@ -135,7 +135,7 @@ func TestFireChecked_BlockingHTTPHook_CannotBlock(t *testing.T) {
 		Name:      "http-block",
 		HookRules: []plugins.HookRule{{Event: EventPreCommand, Blocking: true, Hooks: []plugins.HookDef{{Type: "http", URL: "http://127.0.0.1:0"}}}},
 	}}
-	r := New(ps)
+	r := New(ps, nil)
 
 	res := r.FireChecked(context.Background(), EventPreCommand, map[string]any{"command": "/x"})
 	if res.Blocked {
@@ -152,7 +152,7 @@ func TestFireChecked_BlockingCommandHook_IgnoresAsyncAndBlocks(t *testing.T) {
 		Path:      t.TempDir(),
 		HookRules: []plugins.HookRule{{Event: EventPreCommand, Blocking: true, Hooks: []plugins.HookDef{{Type: "command", Command: "exit 1", Async: true}}}},
 	}}
-	r := New(ps)
+	r := New(ps, nil)
 
 	res := r.FireChecked(context.Background(), EventPreCommand, map[string]any{"command": "/x"})
 	if !res.Blocked {
@@ -178,7 +178,7 @@ func TestFireChecked_UserPromptSubmit_DeliversDojoPromptEnv(t *testing.T) {
 			Hooks:   []plugins.HookDef{{Type: "command", Command: `printf '%s' "$DOJO_PROMPT" > ` + marker}},
 		}},
 	}}
-	r := New(ps)
+	r := New(ps, nil)
 
 	res := r.FireChecked(context.Background(), EventUserPromptSubmit, map[string]any{"command": "chat", "prompt": prompt})
 	if res.Blocked || res.Err != nil {
@@ -210,7 +210,7 @@ func TestFireChecked_UserPromptSubmit_PromptNotShellInterpolated(t *testing.T) {
 			Hooks:   []plugins.HookDef{{Type: "command", Command: `printf '%s' "$DOJO_PROMPT" > ` + marker}},
 		}},
 	}}
-	r := New(ps)
+	r := New(ps, nil)
 
 	res := r.FireChecked(context.Background(), EventUserPromptSubmit, map[string]any{"command": "chat", "prompt": prompt})
 	if res.Blocked || res.Err != nil {
@@ -240,7 +240,7 @@ func TestFireChecked_UserPromptSubmit_TruncatesDojoPrompt(t *testing.T) {
 			Hooks:   []plugins.HookDef{{Type: "command", Command: `printf '%s' "$DOJO_PROMPT" > ` + marker}},
 		}},
 	}}
-	r := New(ps)
+	r := New(ps, nil)
 
 	res := r.FireChecked(context.Background(), EventUserPromptSubmit, map[string]any{"command": "chat", "prompt": big})
 	if res.Blocked || res.Err != nil {
@@ -272,7 +272,7 @@ func TestWarnUnimplemented_OncePerPluginType(t *testing.T) {
 			},
 		}},
 	}}
-	r := New(ps)
+	r := New(ps, nil)
 
 	out := captureStderr(t, func() {
 		_ = r.Fire(context.Background(), EventPreCommand, nil)

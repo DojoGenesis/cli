@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/DojoGenesis/cli/internal/client"
 	"github.com/DojoGenesis/cli/internal/plugins"
 )
 
@@ -35,8 +36,19 @@ const (
 type Runner struct {
 	plugins []plugins.Plugin
 
-	// warned de-dupes the "hook type X is not implemented" warning for the
-	// unimplemented prompt/agent types: keys are "<plugin>\x00<type>", so the
+	// gw is the gateway client prompt/agent hooks dispatch through: ChatStream
+	// for "prompt", CreateAgent + AgentChatStream for "agent" (see runHook,
+	// runPromptHook, runAgentHook). May be nil — every production call site
+	// (internal/commands.New) always passes a real client, but a bare Runner
+	// built by hand (tests, or a hypothetical future no-gateway mode) is still
+	// valid: runPromptHook/runAgentHook guard for nil and fall back to
+	// warnUnimplemented instead of dereferencing it. Never mutated after New,
+	// so it's safe to read from the async hook goroutine without a lock.
+	gw *client.Client
+
+	// warned de-dupes the "hook type X is not implemented" warning that fires
+	// when a prompt/agent hook runs on a Runner with no gateway client wired
+	// in (the nil-gw path above): keys are "<plugin>\x00<type>", so the
 	// warning fires at most once per (plugin, type) for the life of this
 	// Runner rather than on every fire. The REPL builds exactly one Runner per
 	// process (commands.Registry.Runner), so per-Runner is per-process in
@@ -45,9 +57,12 @@ type Runner struct {
 	warned sync.Map
 }
 
-// New creates a Runner from a list of loaded plugins.
-func New(ps []plugins.Plugin) *Runner {
-	return &Runner{plugins: ps}
+// New creates a Runner from a list of loaded plugins and the gateway client
+// that powers prompt/agent hook dispatch. gw may be nil — see the Runner.gw
+// doc comment — in which case prompt/agent hooks fall back to the honest
+// warnUnimplemented no-op instead of panicking on a nil client.
+func New(ps []plugins.Plugin, gw *client.Client) *Runner {
+	return &Runner{plugins: ps, gw: gw}
 }
 
 // FireResult is the classified outcome of FireChecked. The zero value means
@@ -113,8 +128,12 @@ func (r *Runner) Fire(ctx context.Context, event string, payload map[string]any)
 // rule runs to completion (ignoring its Async flag — you cannot block on a
 // fire-and-forget hook) and a non-zero exit returns a Blocked result. An http
 // hook is fire-and-forget by design (runHTTPHook always succeeds, logging any
-// error) and prompt/agent are unimplemented no-ops, so none of those can ever
-// block — even inside a Blocking rule. Like the pre-Blocking Fire(), the first
+// error), and prompt/agent hooks are advisory-only BY DESIGN (runPromptHook /
+// runAgentHook always return nil, whether the gateway call succeeds, fails,
+// or the Runner has no gw wired in at all) — so none of those three types can
+// ever block, even inside a Blocking rule. This is a locked decision, not a
+// gap: an LLM/agent has no natural block signal, and defining one is a
+// separate, larger design. Like the pre-Blocking Fire(), the first
 // command-hook failure short-circuits the remaining rules and hooks.
 func (r *Runner) FireChecked(ctx context.Context, event string, payload map[string]any) FireResult {
 	for _, p := range r.plugins {
@@ -233,14 +252,10 @@ func (r *Runner) runHook(ctx context.Context, h plugins.HookDef, pluginName, plu
 	switch h.Type {
 	case "command":
 		return runCommand(ctx, h.Command, pluginRoot, promptFromPayload(payload))
-	case "prompt", "agent":
-		// prompt/agent dispatch is not implemented. These used to print a
-		// "[hook:prompt] …" / "[hook:agent] …" label to stdout that looked like
-		// the hook had done something — a silent no-op wearing a success mask.
-		// Warn honestly instead, once per (plugin, type) so a hook that fires
-		// every turn doesn't spam the stream.
-		r.warnUnimplemented(pluginName, h.Type)
-		return nil
+	case "prompt":
+		return r.runPromptHook(ctx, h, pluginName, payload)
+	case "agent":
+		return r.runAgentHook(ctx, h, pluginName, payload)
 	case "http":
 		return runHTTPHook(ctx, h.URL, payload)
 	default:
@@ -258,6 +273,149 @@ func (r *Runner) warnUnimplemented(pluginName, hookType string) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[hooks] hook type %q is not implemented; skipping (plugin %s)\n", hookType, pluginName)
+}
+
+// runPromptHook implements the "prompt" hook type: it sends h.Prompt (after
+// renderPrompt's minimal templating) to the gateway's /v1/chat endpoint via
+// ChatStream and buffers the streamed response into a log line. Advisory-only
+// per the locked design (see FireChecked's doc comment) — success, a gateway
+// error, and an empty prompt all return nil here; only a "command" hook can
+// ever veto the caller.
+func (r *Runner) runPromptHook(ctx context.Context, h plugins.HookDef, pluginName string, payload map[string]any) error {
+	if r.gw == nil {
+		// No gateway wired into this Runner (e.g. a bare Runner built by hand
+		// in a test) — fall back to the same honest no-op warning prompt/agent
+		// hooks always got, rather than dereferencing a nil client.
+		r.warnUnimplemented(pluginName, h.Type)
+		return nil
+	}
+
+	promptText := renderPrompt(h.Prompt, payload)
+	if promptText == "" {
+		log.Printf("[hooks] prompt hook (plugin %s): empty prompt — skipping", pluginName)
+		return nil
+	}
+
+	var out strings.Builder
+	err := r.gw.ChatStream(ctx, client.ChatRequest{Message: promptText, Model: h.Model}, func(chunk client.SSEChunk) {
+		out.WriteString(extractHookChunkText(chunk.Data))
+	})
+	if err != nil {
+		// Advisory: log and move on, never surface as a caller-visible error.
+		log.Printf("[hooks] prompt hook (plugin %s): gateway error: %v", pluginName, err)
+		return nil
+	}
+	log.Printf("[hooks] prompt hook (plugin %s): %s", pluginName, truncateForLog(strings.TrimSpace(out.String())))
+	return nil
+}
+
+// runAgentHook implements the "agent" hook type: it creates a scratch agent
+// via CreateAgent, then sends h.Prompt to it via AgentChatStream, buffering
+// the streamed response into a log line — same advisory contract as
+// runPromptHook (never returns a non-nil error; a "command" hook is the only
+// type that can veto the caller).
+//
+// h.Model is forward-compat only: CreateAgentRequest.Model and
+// AgentChatRequest.Model exist on the request types but today's gateway (POST
+// /v1/gateway/agents and POST /v1/gateway/agents/:id/chat) has no model field
+// and silently ignores it — the same caveat internal/client/client.go already
+// documents on ChatRequest.SystemPrompt. Passed through anyway so the day the
+// gateway adds support, a hooks.json "model" key starts working with no
+// dojo-cli change.
+func (r *Runner) runAgentHook(ctx context.Context, h plugins.HookDef, pluginName string, payload map[string]any) error {
+	if r.gw == nil {
+		r.warnUnimplemented(pluginName, h.Type)
+		return nil
+	}
+
+	promptText := renderPrompt(h.Prompt, payload)
+	if promptText == "" {
+		log.Printf("[hooks] agent hook (plugin %s): empty prompt — skipping", pluginName)
+		return nil
+	}
+
+	agentResp, err := r.gw.CreateAgent(ctx, client.CreateAgentRequest{Model: h.Model})
+	if err != nil {
+		log.Printf("[hooks] agent hook (plugin %s): create-agent error: %v", pluginName, err)
+		return nil
+	}
+
+	var out strings.Builder
+	err = r.gw.AgentChatStream(ctx, agentResp.AgentID, client.AgentChatRequest{Message: promptText, Model: h.Model}, func(chunk client.SSEChunk) {
+		out.WriteString(extractHookChunkText(chunk.Data))
+	})
+	if err != nil {
+		log.Printf("[hooks] agent hook (plugin %s): gateway error: %v", pluginName, err)
+		return nil
+	}
+	log.Printf("[hooks] agent hook (plugin %s): %s", pluginName, truncateForLog(strings.TrimSpace(out.String())))
+	return nil
+}
+
+// renderPrompt returns h.Prompt with two minimal, documented placeholders
+// substituted from payload: "{{.command}}" and "{{.prompt}}", matching the
+// only two string fields payload ever actually carries (see
+// matcherMatches/promptFromPayload — most events pass "command", only
+// UserPromptSubmit also carries "prompt"). Deliberately not a text/template
+// parse: plain substring substitution over a two-entry, hardcoded allowlist
+// covers the whole real payload surface without opening up an arbitrary
+// templating contract the data behind it can't back up. A placeholder with no
+// matching payload field, or a nil payload, is left verbatim.
+func renderPrompt(tmpl string, payload map[string]any) string {
+	out := tmpl
+	if payload != nil {
+		if cmd, ok := payload["command"].(string); ok {
+			out = strings.ReplaceAll(out, "{{.command}}", cmd)
+		}
+		if p, ok := payload["prompt"].(string); ok {
+			out = strings.ReplaceAll(out, "{{.prompt}}", p)
+		}
+	}
+	return out
+}
+
+// extractHookChunkText pulls the readable text out of one SSE chunk's data
+// field for a prompt/agent hook's buffered response. Mirrors the extraction
+// the interactive /agent and /run paths already use (agentExtractText in
+// internal/commands/cmd_agent.go) — duplicated rather than imported, because
+// internal/commands imports internal/hooks (commands.New calls hooks.New) and
+// the reverse import would cycle. Gateway chunks are typically
+// {"text|content|message|delta": "..."}; a chunk that isn't JSON, or has none
+// of those keys, is passed through verbatim so no content is silently
+// dropped.
+func extractHookChunkText(data string) string {
+	data = strings.TrimSpace(data)
+	if data == "" || data == "[DONE]" {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(data), &m); err == nil {
+		for _, key := range []string{"text", "content", "message", "delta"} {
+			if v, ok := m[key].(string); ok {
+				return v
+			}
+		}
+		return ""
+	}
+	return data
+}
+
+// maxHookLogChars caps how much of a prompt/agent hook's buffered gateway
+// response reaches the log. These hooks are advisory — logged for
+// visibility, not archived — so an unbounded model response (a paragraph, an
+// essay) would otherwise flood stderr every time a chatty hook fires.
+const maxHookLogChars = 500
+
+// truncateForLog clamps s to maxHookLogChars runes for a hook's log line,
+// appending an ellipsis when it does. Rune-based (unlike truncateBytes, used
+// for the DOJO_PROMPT env-size cap below) because this is for human/log
+// readability, not a hard byte budget.
+func truncateForLog(s string) string {
+	if utf8.RuneCountInString(s) <= maxHookLogChars {
+		return s
+	}
+	r := []rune(s)
+	return string(r[:maxHookLogChars]) + "…"
 }
 
 // promptFromPayload extracts the user prompt an event carries under the

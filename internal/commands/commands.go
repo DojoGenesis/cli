@@ -85,7 +85,7 @@ func New(cfg *config.Config, gw *client.Client, plgs []plugins.Plugin, session *
 		gw:      gw,
 		cmds:    make(map[string]Command),
 		plgs:    plgs,
-		runner:  hooks.New(plgs),
+		runner:  hooks.New(plgs, gw),
 		session: session,
 	}
 	r.register()

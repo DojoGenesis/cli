@@ -32,7 +32,7 @@ func TestFireUserPromptSubmit_BlockingHookVetoesSend(t *testing.T) {
 			Hooks:    []plugins.HookDef{{Type: "command", Command: "exit 1"}},
 		}},
 	}}
-	r := &REPL{runner: hooks.New(ps)}
+	r := &REPL{runner: hooks.New(ps, nil)}
 
 	if !r.fireUserPromptSubmit(context.Background(), "some message") {
 		t.Error("a failing Blocking UserPromptSubmit hook must veto the send (return true)")
@@ -51,7 +51,7 @@ func TestFireUserPromptSubmit_NonBlockingFailureAllowsSend(t *testing.T) {
 			Hooks:   []plugins.HookDef{{Type: "command", Command: "exit 1"}}, // non-blocking
 		}},
 	}}
-	r := &REPL{runner: hooks.New(ps)}
+	r := &REPL{runner: hooks.New(ps, nil)}
 
 	if r.fireUserPromptSubmit(context.Background(), "hello") {
 		t.Error("a non-blocking failure must NOT veto the send (return false)")
@@ -73,7 +73,7 @@ func TestFireUserPromptSubmit_DeliversPromptToHookEnv(t *testing.T) {
 			Hooks:   []plugins.HookDef{{Type: "command", Command: `printf '%s' "$DOJO_PROMPT" > ` + marker}},
 		}},
 	}}
-	r := &REPL{runner: hooks.New(ps)}
+	r := &REPL{runner: hooks.New(ps, nil)}
 
 	if r.fireUserPromptSubmit(context.Background(), msg) {
 		t.Fatal("a clean hook should not veto the send")
@@ -90,7 +90,7 @@ func TestFireUserPromptSubmit_DeliversPromptToHookEnv(t *testing.T) {
 // TestFireUserPromptSubmit_NoHooks_AllowsSend proves the common case (no
 // UserPromptSubmit hooks defined) is a silent pass-through.
 func TestFireUserPromptSubmit_NoHooks_AllowsSend(t *testing.T) {
-	r := &REPL{runner: hooks.New(nil)}
+	r := &REPL{runner: hooks.New(nil, nil)}
 	if r.fireUserPromptSubmit(context.Background(), "hi") {
 		t.Error("with no hooks the send must proceed (return false)")
 	}
@@ -111,7 +111,7 @@ func TestFireUserPromptSubmit_NonChatMatcherDoesNotFire(t *testing.T) {
 			Hooks:   []plugins.HookDef{{Type: "command", Command: "touch " + marker}},
 		}},
 	}}
-	r := &REPL{runner: hooks.New(ps)}
+	r := &REPL{runner: hooks.New(ps, nil)}
 
 	if r.fireUserPromptSubmit(context.Background(), "hello") {
 		t.Fatal("a deploy*-scoped rule should not veto")
