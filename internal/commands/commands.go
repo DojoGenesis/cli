@@ -322,6 +322,13 @@ func commandName(input string) string {
 // also skips the permissions gate.
 func (r *Registry) SetAssumeYes(b bool) { r.assumeYes = b }
 
+// SetHeadless marks the registry as running a non-interactive one-shot dispatch.
+// RunHeadless sets this for --json runs; the plain (non-JSON) one-shot path calls
+// it explicitly so commands take their headless branch — plain-text output,
+// refuse stdin prompts — instead of launching an alt-screen TUI or hanging on a
+// y/N read as if they were in the REPL.
+func (r *Registry) SetHeadless(b bool) { r.headless = b }
+
 // autoConfirmed reports whether an interactive y/N prompt should be treated as
 // already answered "yes" without reading stdin. True in headless mode (a command
 // only reaches its prompt in headless mode after headlessRefuse let it past,

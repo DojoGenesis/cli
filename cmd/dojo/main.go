@@ -392,7 +392,12 @@ func runHeadlessCommand(ctx context.Context, cfg *config.Config, gw *client.Clie
 		return 1
 	}
 
-	// Human/plain path: same behavior as the REPL, error to stderr + exit code.
+	// Human/plain path: render like the REPL, error to stderr + exit code — but
+	// a one-shot dispatch is still non-interactive (no REPL loop, no TTY for an
+	// alt-screen program), so mark it headless. Commands then take their
+	// plain-text headless branch (e.g. /warroom, /bloom) and refuse stdin
+	// prompts instead of hanging or failing to open a TTY.
+	reg.SetHeadless(true)
 	if err := reg.Dispatch(ctx, input); err != nil {
 		fmt.Fprintf(os.Stderr, "dojo: %s\n", err)
 		if errors.Is(err, commands.ErrUnknownCommand) {
