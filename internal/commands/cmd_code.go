@@ -131,7 +131,7 @@ func (r *Registry) codeCmd() Command {
 				if err := r.headlessRefuse("undo file change"); err != nil {
 					return err
 				}
-				if !r.permissionGate("code.undo", "revert all unstaged changes in "+cwd, false) {
+				if !r.permissionGate("code.undo", "revert all unstaged changes in "+cwd, r.autoConfirmed()) {
 					return nil
 				}
 				return codeUndoPreconfirmed()

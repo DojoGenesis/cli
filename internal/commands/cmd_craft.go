@@ -213,7 +213,7 @@ Be concise and precise. Focus on the decision, not the technology overview.`, ne
 	if err := r.headlessRefuse("write ADR file"); err != nil {
 		return err
 	}
-	if !r.permissionGate("craft.adr", "write "+path, false) {
+	if !r.permissionGate("craft.adr", "write "+path, r.autoConfirmed()) {
 		return nil
 	}
 
@@ -454,7 +454,7 @@ Be specific. Do not suggest generic "add more documentation".`
 	}
 	if !r.permissionGate("craft.claude-md",
 		fmt.Sprintf("rewrite %d CLAUDE.md file(s) in place under %s", len(relPaths), cwd),
-		false) {
+		r.autoConfirmed()) {
 		return nil
 	}
 
@@ -587,7 +587,7 @@ func (r *Registry) craftMemory(ctx context.Context, args []string) error {
 		if err := r.headlessRefuse("delete memory entries"); err != nil {
 			return err
 		}
-		if !craftConfirm(fmt.Sprintf("Delete these %d memory entries?", len(target))) {
+		if !r.autoConfirmed() && !craftConfirm(fmt.Sprintf("Delete these %d memory entries?", len(target))) {
 			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — nothing pruned."))
 			fmt.Println()
 			return nil
@@ -796,7 +796,7 @@ func (r *Registry) craftSeed(ctx context.Context, args []string) error {
 		if err := r.headlessRefuse("store durable memory"); err != nil {
 			return err
 		}
-		if !craftConfirm("Store this as durable memory?") {
+		if !r.autoConfirmed() && !craftConfirm("Store this as durable memory?") {
 			fmt.Println(gcolor.HEX("#94a3b8").Sprint("  Cancelled — nothing elevated."))
 			fmt.Println()
 			return nil
@@ -1070,7 +1070,7 @@ func (r *Registry) craftScaffold(args []string) error {
 	}
 	if !r.permissionGate("craft.scaffold",
 		fmt.Sprintf("create %d dir(s) and %d file(s) in %s", len(dirs), len(files), cwd),
-		false) {
+		r.autoConfirmed()) {
 		return nil
 	}
 	fmt.Println()
@@ -1386,7 +1386,11 @@ func (r *Registry) craftStream(ctx context.Context, systemPrompt string, req cli
 			}
 		}
 	})
-	if err == nil && streamErrMsg != "" && out.Len() == 0 {
+	// Any mid-stream gateway error fails the generation — not only when no text
+	// arrived. A partial ADR/scout followed by an error is still a failed run,
+	// and a headless caller must see ok=false (consistent with /run, /agent,
+	// /workflow). Dropping the former `out.Len() == 0` guard is the fix.
+	if err == nil && streamErrMsg != "" {
 		err = fmt.Errorf("gateway stream error: %s", streamErrMsg)
 	}
 	return out.String(), err
